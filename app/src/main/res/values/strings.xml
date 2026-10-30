@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">Acesso Materno - Suporte Remoto Assistivo</string>
+    <string name="accessibility_service_description">Permite que o painel administrativo de suporte envie comandos remotos (toques, deslizes, Voltar, Home) para ajudar a usar o celular. Ative somente se você autoriza o controle remoto assistido deste aparelho.</string>
+
+    <!-- Textos de consentimento informado -->
+    <string name="consent_title">Autorização de Suporte Remoto</string>
+    <string name="consent_accessibility_message">Ao ativar este serviço, você autoriza que o painel administrativo de suporte VISUALIZE e CONTROLE as ações na tela deste aparelho (toques e gestos) para fins de suporte técnico assistivo.\n\nVocê pode desativar a qualquer momento nas Configurações de Acessibilidade.</string>
+    <string name="consent_screen_message">Ao continuar, a tela deste aparelho será CAPTURADA e TRANSMITIDA ao painel administrativo de suporte para fins de suporte técnico assistivo.\n\nUma notificação permanecerá visível na barra de status enquanto a transmissão estiver ativa. Deseja permitir?</string>
+    <string name="consent_accept">Entendo e autorizo</string>
+    <string name="consent_cancel">Cancelar</string>
+</resources>

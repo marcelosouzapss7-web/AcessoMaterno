@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Acesso Materno - Painel de Controle</title>
+    <style>
+        body { background: #111827; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .layout-principal { display: flex; gap: 40px; align-items: flex-start; margin-top: 20px; }
+        .painel-lista { background: #1f2937; padding: 20px; border-radius: 16px; width: 320px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); }
+        
+        .dispositivo-item { background: #374151; padding: 14px; margin-bottom: 12px; border-radius: 8px; text-align: left; display: flex; flex-direction: column; gap: 10px; transition: 0.2s; border: 1px solid #4b5563; }
+        .dispositivo-item.ativo { border: 2px solid #10b981; background: #1f2937; }
+        
+        .dispositivo-topo { display: flex; justify-content: space-between; align-items: center; width: 100%; }
+        .status-dot { width: 10px; height: 10px; background: #10b981; border-radius: 50%; display: inline-block; }
+        
+        .area-emulador { display: flex; flex-direction: column; align-items: center; gap: 20px; }
+        .moldura-celular { width: 340px; height: 680px; background: #000; border: 12px solid #374151; border-radius: 40px; position: relative; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }
+        .moldura-celular::before { content: ''; position: absolute; top: 0; left: 50%; transform: translateX(-50%); width: 140px; height: 20px; background: #374151; border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; z-index: 10; }
+        .tela-conteudo { width: 100%; height: 100%; background: #1f2937; border-radius: 28px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        img { width: 100%; height: 100%; object-fit: cover; }
+        
+        .controles { display: flex; gap: 10px; width: 100%; justify-content: center; }
+        
+        /* Botão mestre centralizado abaixo da imagem - SEMPRE CLICÁVEL */
+        .btn-principal { background: #10b981; color: white; border: none; padding: 14px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; width: 100%; max-width: 340px; font-size: 15px; box-shadow: 0 4px 10px rgba(16,185,129,0.2); transition: 0.2s; text-align: center; }
+        .btn-principal:hover { background: #059669; }
+        
+        /* Botão interno da lista lateral */
+        .btn-nativo { background: #3b82f6; color: white; border: none; padding: 8px 12px; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px; transition: 0.2s; width: 100%; text-align: center; }
+        .btn-nativo:hover { background: #2563eb; }
+        
+        h2 { color: #f3f4f6; margin: 0; }
+        h3 { margin-top: 0; color: #9ca3af; font-size: 16px; border-bottom: 1px solid #4b5563; padding-bottom: 8px; }
+    </style>
+</head>
+<body>
+    <h2>Painel Acesso Materno Central</h2>
+    <p id="link-indicador">Carregando endereço do túnel...</p>
+    
+    <div class="layout-principal">
+        <div class="painel-lista">
+            <h3>📱 Celulares Online</h3>
+            <div id="lista-container">Aguardando sinais...</div>
+        </div>
+
+        <div class="area-emulador">
+            <div class="moldura-celular">
+                <div class="tela-conteudo">
+                    <img id="tela" src="/visualizar-imagem" alt="Aguardando sinal do celular...">
+                </div>
+            </div>
+            <!-- Botão mestre configurado para ficar sempre habilitado -->
+            <div class="controles">
+                <button id="btn-ultimo-dispositivo" class="btn-principal" onclick="abrirUltimoConectado()">
+                    ⚡ Visualizador Nativo (Emulador-MSI)
+                </button>
+            </div>
+
+            <!-- Acoplar/Destacar a janela nativa do scrcpy -->
+            <div class="controles" style="margin-top: 4px;">
+                <button id="btn-janela-scrcpy" class="btn-principal" style="background:#0ea5e9; box-shadow:0 4px 10px rgba(14,165,233,0.2);" onclick="alternarJanelaScrcpy()">
+                    🔲 Destacar Tela
+                </button>
+            </div>
+
+            <!-- Seção de build do APK Android -->
+            <div class="controles" style="margin-top: 4px;">
+                <button id="btn-gerar-apk" class="btn-principal" style="background:#6366f1; box-shadow:0 4px 10px rgba(99,102,241,0.2);" onclick="gerarAPK()">
+                    ⚙️ Gerar APK do Cliente
+                </button>
+            </div>
+            <p id="status-build" style="color:#9ca3af; font-size:13px; min-height:18px; text-align:center; max-width:340px; margin:4px 0 0;"></p>
+        </div>
+    </div>
+
+    <script>
+        let aparelhoSelecionado = null;
+        let quantidadeDispositivosAnterior = -1;
+        document.getElementById('link-indicador').innerText = "Link Ativo: " + window.location.origin;
+
+        // Mantém o fluxo dinâmico da tela
+        function atualizarTela() {
+            document.getElementById('tela').src = "/visualizar-imagem?t=" + new Date().getTime();
+        }
+        setInterval(atualizarTela, 1000);
+
+        // Varre a API e sincroniza dinamicamente os nomes dos aparelhos
+        function carregarDispositivos() {
+            fetch('/lista-dispositivos')
+                .then(res => res.json())
+                .then(data => {
+                    const container = document.getElementById('lista-container');
+                    const botaoMestre = document.getElementById('btn-ultimo-dispositivo');
+                    
+                    aparelhoSelecionado = data.selecionado;
+
+                    // Altera o texto do botão para exibir o último conectado, mas nunca o desativa
+                    if (aparelhoSelecionado) {
+                        botaoMestre.innerText = `⚡ Visualizador Nativo (${aparelhoSelecionado})`;
+                    } else {
+                        botaoMestre.innerText = "⚡ Visualizador Nativo (Emulador-MSI)";
+                    }
+
+                    const chaves = Object.keys(data.dispositivos);
+                    
+                    // Sincronização imediata se houver alteração na lista do servidor
+                    if (chaves.length !== quantidadeDispositivosAnterior || container.innerHTML.includes("Aguardando")) {
+                        container.innerHTML = '';
+                        quantidadeDispositivosAnterior = chaves.length;
+
+                        if (chaves.length === 0) {
+                            container.innerHTML = '<p style="color: #9ca3af; font-size: 14px;">Nenhum dispositivo online.</p>';
+                            return;
+                        }
+
+                        chaves.forEach(nome => {
+                            const item = document.createElement('div');
+                            item.className = 'dispositivo-item';
+                            if (nome === aparelhoSelecionado) {
+                                item.classList.add('ativo');
+                            }
+                            
+                            item.innerHTML = `
+                                <div class="dispositivo-topo">
+                                    <strong>${nome}</strong>
+                                    <span class="status-dot"></span>
+                                </div>
+                                <button class="btn-nativo" onclick="acionarVisualizadorNativo('${nome}', event)">
+                                    Conectar Este
+                                </button>
+                            `;
+                            container.appendChild(item);
+                        });
+                    }
+                })
+                .catch(err => console.error("Erro na varredura de dispositivos:", err));
+        }
+
+        // Frequência rápida de 400ms para capturar o clique do Android Studio na mesma hora
+        setInterval(carregarDispositivos, 400);
+        carregarDispositivos();
+
+        // Abre um item específico clicado na lista lateral
+        function acionarVisualizadorNativo(nome, event) {
+            if (event) event.stopPropagation(); 
+            fetch(`/selecionar-aparelho?nome=${encodeURIComponent(nome)}`)
+                .then(res => res.json())
+                .then(data => {
+                    console.log("Comando enviado para o aparelho alvo:", data.mensagem);
+                    carregarDispositivos();
+                })
+                .catch(err => console.error("Erro na requisição lateral:", err));
+        }
+
+        // ───── Acoplar / Destacar a janela do scrcpy ─────
+        let scrcpyDestacado = false;
+        function alternarJanelaScrcpy() {
+            scrcpyDestacado = !scrcpyDestacado;
+            const btn = document.getElementById('btn-janela-scrcpy');
+            const modo = scrcpyDestacado ? 'destacar' : 'acoplar';
+            btn.innerText = scrcpyDestacado ? '🔳 Acoplar Tela' : '🔲 Destacar Tela';
+            fetch('/janela-scrcpy?modo=' + modo)
+                .then(res => res.json())
+                .then(data => console.log('[PAINEL] Janela scrcpy:', data.modo))
+                .catch(err => console.error('Erro ao alternar janela:', err));
+        }
+
+        // ───── Compilação do APK Android ─────
+        let buildEmAndamento = false;
+
+        function resetBuildBtn() {
+            buildEmAndamento = false;
+            const btn = document.getElementById('btn-gerar-apk');
+            btn.disabled = false;
+            btn.style.opacity = '1';
+        }
+
+        function gerarAPK() {
+            if (buildEmAndamento) return;
+            const btn = document.getElementById('btn-gerar-apk');
+            const status = document.getElementById('status-build');
+            buildEmAndamento = true;
+            btn.disabled = true;
+            btn.style.opacity = '0.6';
+            status.style.color = '#fbbf24';
+            status.innerText = '⏳ Compilando código Android... Aguarde (pode levar alguns minutos).';
+
+            fetch('/compilar-app')
+                .then(res => res.json())
+                .then(() => monitorarBuild())
+                .catch(err => {
+                    status.style.color = '#f87171';
+                    status.innerText = '❌ Erro ao iniciar a compilação: ' + err;
+                    resetBuildBtn();
+                });
+        }
+
+        function monitorarBuild() {
+            const status = document.getElementById('status-build');
+            const timer = setInterval(() => {
+                fetch('/status-build')
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.status === 'compilando' || data.status === 'iniciado') {
+                            status.style.color = '#fbbf24';
+                            status.innerText = '⏳ ' + (data.mensagem || 'Compilando código Android... Aguarde.');
+                        } else if (data.status === 'concluido') {
+                            clearInterval(timer);
+                            status.style.color = '#34d399';
+                            status.innerText = '✅ ' + (data.mensagem || 'Concluído! Pasta aberta.');
+                            resetBuildBtn();
+                        } else if (data.status === 'erro') {
+                            clearInterval(timer);
+                            status.style.color = '#f87171';
+                            status.innerText = '❌ ' + (data.mensagem || 'Falha na compilação.');
+                            resetBuildBtn();
+                        }
+                    })
+                    .catch(() => {});
+            }, 1500);
+        }
+
+        // Função corrigida: Dispara a rota mestre que roda o bloco if/else do seu python
+        function abrirUltimoConectado() {
+            console.log("[PAINEL] Acionando a rota de disparo direto do emulador/túnel.");
+            
+            fetch('/disparar-botao-direto')
+                .then(res => res.json())
+                .then(data => {
+                    console.log("Gatilho direto processado pelo Python:", data.status);
+                })
+                .catch(err => console.error("Erro ao chamar o disparo direto:", err));
+        }
+    </script>
+</body>
+</html>

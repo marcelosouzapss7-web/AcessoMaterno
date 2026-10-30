@@ -1,0 +1,31 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# ----- Acesso Materno: pastas pesadas e artefatos (não escanear/versionar) -----
+/venv/
+/venv_desktop/
+/.gradle/
+/build/
+/build_desktop/
+/dist/
+*.exe
+*.log
+.idea/
+__pycache__/
+
+# Pasta duplicada antiga e credenciais do Firebase (fora do versionamento)
+/AcessoMaterno-master/
+google-services.json
