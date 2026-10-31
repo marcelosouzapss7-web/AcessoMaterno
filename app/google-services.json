@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1034862957445",
+    "project_id": "acessolivre-bf915",
+    "storage_bucket": "acessolivre-bf915.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1034862957445:android:547294555ce9db036baaec",
+        "android_client_info": {
+          "package_name": "com.example.acessomaterno"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB6o6966ZyogmYrkeM9ow5FKt2QCdr8l0Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

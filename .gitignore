@@ -28,7 +28,6 @@ __pycache__/
 
 # Pasta duplicada antiga e credenciais do Firebase (fora do versionamento)
 /AcessoMaterno-master/
-google-services.json
 
 # Builds locais (APK/EXE) - nao versionar
 /distnew/
