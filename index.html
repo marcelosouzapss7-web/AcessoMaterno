@@ -44,6 +44,7 @@
         </div>
 
         <div class="area-emulador">
+            <p id="video-status" style="margin:0; font-size:13px; color:#fbbf24;">🟡 Sem vídeo</p>
             <div class="moldura-celular">
                 <div class="tela-conteudo">
                     <img id="tela" src="/visualizar-imagem" alt="Aguardando sinal do celular...">
@@ -53,6 +54,16 @@
             <div class="controles">
                 <button id="btn-ultimo-dispositivo" class="btn-principal" onclick="abrirUltimoConectado()">
                     ⚡ Visualizador Nativo (Emulador-MSI)
+                </button>
+            </div>
+
+            <!-- Teclado remoto -->
+            <div class="controles" style="margin-top: 4px;">
+                <button id="btn-teclado" class="btn-principal" style="background:#6b7280;" onclick="alternarTeclado(this)">
+                    ⌨️ Teclado: OFF
+                </button>
+                <button id="btn-privacidade" class="btn-principal" style="background:#6b7280;" onclick="alternarPrivacidade(this)">
+                    🔒 Tela de Privacidade
                 </button>
             </div>
 
@@ -73,16 +84,168 @@
         </div>
     </div>
 
+    <!-- Console de Debug (ao vivo, com copiar) -->
+    <div id="debug-wrap" style="width:92%; max-width:980px; margin:24px auto 0; background:#0b0f19; border:1px solid #334155; border-radius:12px; overflow:hidden;">
+        <div style="display:flex; align-items:center; gap:10px; padding:10px 14px; background:#111827; border-bottom:1px solid #334155;">
+            <strong style="color:#93c5fd;">🐞 Console de Debug</strong>
+            <span id="debug-contagem" style="color:#64748b; font-size:12px;"></span>
+            <span style="flex:1"></span>
+            <label style="color:#94a3b8; font-size:12px; display:flex; align-items:center; gap:4px; cursor:pointer;">
+                <input type="checkbox" id="debug-auto" checked> auto-atualizar
+            </label>
+            <button onclick="copiarDebug(this)" style="background:#2563eb; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:13px;">📋 Copiar</button>
+            <button onclick="limparDebug()" style="background:#475569; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:13px;">🗑 Limpar</button>
+        </div>
+        <pre id="debug-saida" style="margin:0; padding:14px; height:260px; overflow:auto; color:#e2e8f0; font-family:Consolas,'Courier New',monospace; font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-word;"></pre>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <script>
         let aparelhoSelecionado = null;
         let quantidadeDispositivosAnterior = -1;
         document.getElementById('link-indicador').innerText = "Link Ativo: " + window.location.origin;
 
-        // Mantém o fluxo dinâmico da tela
+        // ───── Socket.IO: envio de cliques do mouse para o celular remoto ─────
+        const socket = io(window.location.origin, { transports: ['websocket', 'polling'] });
+        let ultimoFramePush = 0;
+        socket.on('connect', () => {
+            console.log('[PAINEL] Socket.IO conectado:', socket.id);
+            socket.emit('identificar', 'painel');   // entra na sala que recebe os frames
+        });
+        socket.on('connect_error', (e) => console.error('[PAINEL] Erro Socket.IO:', e.message));
+
+        // Frame em tempo real (push): renderiza direto, sem baixar via HTTP.
+        socket.on('frame', (d) => {
+            if (aparelhoSelecionado && d.dispositivo !== aparelhoSelecionado) return;
+            ultimoFramePush = Date.now();
+            document.getElementById('tela').src = 'data:image/jpeg;base64,' + d.jpeg;
+        });
+
+        const tela = document.getElementById('tela');
+        tela.style.cursor = 'crosshair';
+
+        // Controle tipo emulador: clicar = toque; segurar e arrastar = deslizar/rolar.
+        let arrastando = false;
+        let ultimoMove = 0;
+
+        function coordNorm(e) {
+            const rect = tela.getBoundingClientRect();
+            return {
+                x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
+                y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height))
+            };
+        }
+        function enviarMov(acao, e) {
+            const c = coordNorm(e);
+            socket.emit('clique_painel', { acao: acao, x: c.x, y: c.y, dispositivo: aparelhoSelecionado });
+        }
+
+        tela.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            arrastando = true;
+            enviarMov('START', e);
+        });
+        // mousemove/up no window: permite arrastar mesmo saindo da área da imagem.
+        window.addEventListener('mousemove', (e) => {
+            if (!arrastando) return;
+            const agora = Date.now();
+            if (agora - ultimoMove < 45) return;   // ~20 updates/s (evita inundar)
+            ultimoMove = agora;
+            enviarMov('MOVE', e);
+        });
+        window.addEventListener('mouseup', (e) => {
+            if (!arrastando) return;
+            arrastando = false;
+            enviarMov('END', e);
+        });
+        // Evita "arrastar a imagem" (ghost drag) do navegador.
+        tela.addEventListener('dragstart', (e) => e.preventDefault());
+
+        // ───── Teclado remoto ─────
+        let tecladoAtivo = false;
+        function alternarTeclado(btn) {
+            tecladoAtivo = !tecladoAtivo;
+            btn.innerText = tecladoAtivo ? '⌨️ Teclado: ON' : '⌨️ Teclado: OFF';
+            btn.style.background = tecladoAtivo ? '#10b981' : '#6b7280';
+        }
+        // ───── Tela de privacidade (overlay preto COM consentimento no aparelho) ─────
+        let privacidadeAtiva = false;
+        function alternarPrivacidade(btn) {
+            if (!aparelhoSelecionado) {
+                alert('Conecte-se a um dispositivo antes de usar a tela de privacidade.');
+                return;
+            }
+            privacidadeAtiva = !privacidadeAtiva;
+            socket.emit('tela_privacidade_painel', {
+                acao: privacidadeAtiva ? 'mostrar' : 'ocultar',
+                dispositivo: aparelhoSelecionado
+            });
+            btn.innerText = privacidadeAtiva ? '🔓 Encerrar Privacidade' : '🔒 Tela de Privacidade';
+            btn.style.background = privacidadeAtiva ? '#b45309' : '#6b7280';
+        }
+        // O aparelho avisa quando a tela foi ativada/removida (inclusive se o
+        // usuário sair pelo Volume -). Mantém o botão do painel em sincronia.
+        socket.on('tela_privacidade_estado', (estado) => {
+            const btn = document.getElementById('btn-privacidade');
+            privacidadeAtiva = (estado === 'ativa');
+            if (btn) {
+                btn.innerText = privacidadeAtiva ? '🔓 Encerrar Privacidade' : '🔒 Tela de Privacidade';
+                btn.style.background = privacidadeAtiva ? '#b45309' : '#6b7280';
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if (!tecladoAtivo) return;
+            let pacote = null;
+            switch (e.key) {
+                case 'Backspace': pacote = { tipo: 'tecla', valor: 'BACKSPACE' }; break;
+                case 'Enter':     pacote = { tipo: 'tecla', valor: 'ENTER' }; break;
+                case 'Tab':       pacote = { tipo: 'tecla', valor: 'TAB' }; break;
+                case ' ':         pacote = { tipo: 'tecla', valor: 'ESPACO' }; break;
+                default:
+                    // Caractere imprimível único (letras, números, símbolos, acentos)
+                    if (e.key.length === 1) pacote = { tipo: 'texto', valor: e.key };
+            }
+            if (pacote) {
+                e.preventDefault();
+                pacote.dispositivo = aparelhoSelecionado;
+                socket.emit('tecla_painel', pacote);
+            }
+        });
+
+        // Fallback por HTTP: só atua se o push (tempo real) estiver parado há >1,5s.
         function atualizarTela() {
-            document.getElementById('tela').src = "/visualizar-imagem?t=" + new Date().getTime();
+            if (Date.now() - ultimoFramePush < 1500) return;
+            let url = "/visualizar-imagem?t=" + new Date().getTime();
+            if (aparelhoSelecionado) url += "&dispositivo=" + encodeURIComponent(aparelhoSelecionado);
+            document.getElementById('tela').src = url;
         }
         setInterval(atualizarTela, 1000);
+
+        // Indicador de status do vídeo (diagnóstico claro do streaming)
+        function atualizarStatusVideo() {
+            let url = '/status-tela';
+            if (aparelhoSelecionado) url += '?dispositivo=' + encodeURIComponent(aparelhoSelecionado);
+            fetch(url)
+                .then(r => r.json())
+                .then(d => {
+                    const el = document.getElementById('video-status');
+                    if (d.ativo) {
+                        el.style.color = '#34d399';
+                        el.innerText = '🟢 Recebendo vídeo (' + d.frames + ' frames)';
+                    } else if (d.frames > 0) {
+                        const seg = d.idade_ms ? Math.round(d.idade_ms / 1000) + 's' : '?';
+                        el.style.color = '#fbbf24';
+                        el.innerText = '🟡 Vídeo pausado (último frame há ' + seg + ') — verifique o app';
+                    } else {
+                        el.style.color = '#fbbf24';
+                        el.innerText = '🟡 Sem vídeo — toque em "Iniciar Compartilhamento de Tela" no celular';
+                    }
+                })
+                .catch(() => {});
+        }
+        setInterval(atualizarStatusVideo, 1000);
+        atualizarStatusVideo();
 
         // Varre a API e sincroniza dinamicamente os nomes dos aparelhos
         function carregarDispositivos() {
@@ -120,14 +283,20 @@
                                 item.classList.add('ativo');
                             }
                             
+                            const conectado = (nome === aparelhoSelecionado);
                             item.innerHTML = `
                                 <div class="dispositivo-topo">
                                     <strong>${nome}</strong>
                                     <span class="status-dot"></span>
                                 </div>
-                                <button class="btn-nativo" onclick="acionarVisualizadorNativo('${nome}', event)">
-                                    Conectar Este
-                                </button>
+                                <div style="display:flex; gap:6px;">
+                                    <button class="btn-nativo" style="flex:1; ${conectado ? 'background:#6b7280; cursor:default;' : ''}" ${conectado ? 'disabled' : ''} onclick="acionarVisualizadorNativo('${nome}', event)">
+                                        ${conectado ? '✅ Conectado' : 'Conectar Este'}
+                                    </button>
+                                    <button class="btn-nativo" style="flex:1; background:#ef4444;" onclick="desconectarAparelho('${nome}', event)">
+                                        🔌 Desconectar
+                                    </button>
+                                </div>
                             `;
                             container.appendChild(item);
                         });
@@ -140,16 +309,39 @@
         setInterval(carregarDispositivos, 400);
         carregarDispositivos();
 
-        // Abre um item específico clicado na lista lateral
+        // Seleciona o aparelho da lista: marca "Conectado" e ativa o streaming na #tela.
+        // (Para IP externo o servidor NÃO tenta scrcpy — usa o feed via Socket.IO.)
         function acionarVisualizadorNativo(nome, event) {
-            if (event) event.stopPropagation(); 
+            if (event) event.stopPropagation();
+            aparelhoSelecionado = nome;
+
+            // Feedback imediato: botão vira "Conectado" (cinza).
+            if (event && event.target) {
+                event.target.innerText = '✅ Conectado';
+                event.target.style.background = '#6b7280';
+                event.target.style.cursor = 'default';
+                event.target.disabled = true;
+            }
+            quantidadeDispositivosAnterior = -1; // força re-render com o destaque "ativo"
+
             fetch(`/selecionar-aparelho?nome=${encodeURIComponent(nome)}`)
                 .then(res => res.json())
+                .then(data => console.log("[PAINEL]", data.status, "-", data.mensagem))
+                .catch(err => console.error("Erro na requisição lateral:", err));
+        }
+
+        // Desconecta/remove um aparelho específico do painel.
+        function desconectarAparelho(nome, event) {
+            if (event) event.stopPropagation();
+            fetch(`/desconectar-aparelho?nome=${encodeURIComponent(nome)}`)
+                .then(res => res.json())
                 .then(data => {
-                    console.log("Comando enviado para o aparelho alvo:", data.mensagem);
+                    console.log("[PAINEL] desconectado:", data.dispositivo, data.status);
+                    if (aparelhoSelecionado === nome) aparelhoSelecionado = null;
+                    quantidadeDispositivosAnterior = -1;   // força re-render da lista
                     carregarDispositivos();
                 })
-                .catch(err => console.error("Erro na requisição lateral:", err));
+                .catch(err => console.error("Erro ao desconectar:", err));
         }
 
         // ───── Acoplar / Destacar a janela do scrcpy ─────
@@ -230,6 +422,45 @@
                     console.log("Gatilho direto processado pelo Python:", data.status);
                 })
                 .catch(err => console.error("Erro ao chamar o disparo direto:", err));
+        }
+        // ───── Console de Debug ─────
+        let debugLinhas = [];
+        function renderDebug() {
+            const pre = document.getElementById('debug-saida');
+            const perto = (pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30);
+            pre.textContent = debugLinhas.join('\n');
+            document.getElementById('debug-contagem').innerText = debugLinhas.length + ' linhas';
+            if (perto) pre.scrollTop = pre.scrollHeight;  // auto-scroll se já estava no fim
+        }
+        function atualizarDebug() {
+            if (!document.getElementById('debug-auto').checked) return;
+            fetch('/debug-logs')
+                .then(r => r.json())
+                .then(d => { debugLinhas = d.linhas || []; renderDebug(); })
+                .catch(() => {});
+        }
+        setInterval(atualizarDebug, 1500);
+        atualizarDebug();
+
+        function copiarDebug(btn) {
+            const txt = debugLinhas.join('\n');
+            const feito = () => { if (btn) { const t = btn.innerText; btn.innerText = '✅ Copiado'; setTimeout(() => btn.innerText = t, 1500); } };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(txt).then(feito).catch(() => fallbackCopiar(txt, feito));
+            } else {
+                fallbackCopiar(txt, feito);
+            }
+        }
+        function fallbackCopiar(txt, feito) {
+            const ta = document.createElement('textarea');
+            ta.value = txt;
+            ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.focus(); ta.select();
+            try { document.execCommand('copy'); if (feito) feito(); } catch (e) {}
+            document.body.removeChild(ta);
+        }
+        function limparDebug() {
+            fetch('/debug-logs/limpar').then(() => { debugLinhas = []; renderDebug(); }).catch(() => {});
         }
     </script>
 </body>

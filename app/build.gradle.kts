@@ -51,8 +51,10 @@ android {
             buildConfigField("String", "AUTH_TOKEN", "\"\\\"TROQUE-ESTE-TOKEN\\\"\"")
             // PANEL_URL é injetado automaticamente pelo backend via -PpanelUrl=<url do túnel>
             // (ver server.py -> _descobrir_url_tunel). Sem a propriedade, usa o placeholder.
+            // Domínio de produção fixo (Cloudflare Tunnel). O -PpanelUrl do backend
+            // apenas reforça o mesmo valor; o default abaixo já o carimba permanentemente.
             val panelUrl = (project.findProperty("panelUrl") as String?)
-                ?: "https://SEU-TUNEL.ngrok-free.app"
+                ?: "https://painel.megabrasiliautilidades.store"
             buildConfigField("String", "PANEL_URL", "\"$panelUrl\"")
             isMinifyEnabled = false
         }

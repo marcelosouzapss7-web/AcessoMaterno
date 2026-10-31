@@ -39,8 +39,8 @@ def executar_servidor():
     print(f"[SERVIDOR] diretório base (cwd): {base}", flush=True)
     print(f"[SERVIDOR] index.html presente: {os.path.exists(os.path.join(base, 'index.html'))}", flush=True)
     import uvicorn
-    from server import app
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+    from server import asgi_app
+    uvicorn.run(asgi_app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
 
 
 # ---------------------------------------------------------------------------
