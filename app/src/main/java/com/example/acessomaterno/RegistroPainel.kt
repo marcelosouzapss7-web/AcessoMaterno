@@ -19,8 +19,10 @@ object RegistroPainel {
     private const val TAG = "RegistroPainel"
 
     private val cliente = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     // Endereço base do painel. Padrão vindo do BuildConfig (10.0.2.2 no debug).

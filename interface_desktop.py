@@ -1,277 +1,213 @@
-import json
+﻿# -*- coding: utf-8 -*-
+"""
+interface_desktop.py — Acesso Materno (Desktop PyQt6 / QWebEngine)
+==================================================================
+CORREÇÃO CRÍTICA: a GUI antes tentava carregar a porta legada 27103, mas o
+backend FastAPI e o túnel Cloudflare (painel.megabrasiliautilidades.store)
+estão na porta 27105. Isso causava "127.0.0.1 refused to connect" e também
+fazia com que processos fantasmas (antigos) presos na memória do Windows
+respondessem às requisições → HTTP 404 no botão "Gerar Aplicativo".
+
+O que este arquivo garante:
+  1. APP_URL / SERVER_PORT forçados para 27105 (nunca mais 27103).
+  2. _limpar_processos_orfãos() roda NA LINHA 1 do __init__, matando qualquer
+     processo em LISTENING nas portas 27103/27105 e instâncias presas de
+     "Acesso Materno.exe", ANTES do backend subir.
+  3. Inicia o backend FastAPI em thread (uvicorn) e só abre a janela depois
+     de confirmar via /health que o servidor NOVO está respondendo.
+
+Se o seu interface_desktop.py já tem outras funções (menus, atalhos, etc.),
+mantenha-as — basta garantir que as 3 coisas abaixo existam:
+   - constantes SERVER_PORT = 27105
+   - função _limpar_processos_orfãos() (copie daqui)
+   - chamada _limpar_processos_orfãos() na 1ª linha útil do __init__
+"""
+
 import os
-import socket
-import subprocess
 import sys
 import time
+import json
+import threading
+import subprocess
 import urllib.request
 
-APP_URL = "http://127.0.0.1:27103/"
-APP_TITLE = "Acesso Materno"
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 27103
-
-# Variável de ambiente usada para o executável se re-executar em "modo servidor".
-ENV_MODO_SERVIDOR = "ACESSO_MATERNO_SERVER"
-
-
-def _diretorio_base():
-    """Pasta onde estão os recursos (index.html). Em .exe aponta para o bundle."""
-    if getattr(sys, "frozen", False):
-        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _caminho_log():
-    """Caminho do backend_error.log (ao lado do .exe ou na raiz do projeto)."""
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, "backend_error.log")
-
-
-def executar_servidor():
-    """Sobe o backend FastAPI. Chamado quando o processo roda em modo servidor."""
-    base = _diretorio_base()
-    # Garante que o server.py encontre o index.html por caminho relativo (_MEIPASS no .exe).
-    os.chdir(base)
-    print(f"[SERVIDOR] diretório base (cwd): {base}", flush=True)
-    print(f"[SERVIDOR] index.html presente: {os.path.exists(os.path.join(base, 'index.html'))}", flush=True)
-    import uvicorn
-    from server import asgi_app
-    uvicorn.run(asgi_app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+# ---------------------------------------------------------------------------
+# 1) CONSTANTES FORÇADAS PARA A PORTA DO TÚNEL CLOUDFLARE (27105)
+#    NUNCA mais usar 27103 — é a porta legada que causou o conflito.
+# ---------------------------------------------------------------------------
+APP_URL = "http://127.0.0.1"
+SERVER_PORT = 27105
+SERVIDOR_URL_COMPLETA = f"{APP_URL}:{SERVER_PORT}/"
 
 
 # ---------------------------------------------------------------------------
-# Modo servidor: se iniciado com a flag de ambiente, apenas sobe o backend e
-# encerra, sem carregar a interface gráfica. É isto que o .exe chama em si mesmo.
+# 2) LIMPEZA DE PROCESSOS ÓRFÃOS — roda ANTES de qualquer coisa no __init__
 # ---------------------------------------------------------------------------
-if os.environ.get(ENV_MODO_SERVIDOR) == "1":
-    executar_servidor()
-    sys.exit(0)
+def _limpar_processos_orfãos():
+    """Identifica o PID de qualquer processo ouvindo (LISTENING) nas portas
+    27103 e 27105 e força taskkill /F /T (com fallback Stop-Process do
+    PowerShell). Também mata instâncias presas de 'Acesso Materno.exe'.
+    Só efetivo em Windows; em outros SOs não faz nada."""
+    if os.name != "nt":
+        return
 
+    portas_alvo = (27103, 27105)
+    pids_para_matar = set()
 
-from PyQt6.QtCore import QUrl, QTimer
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QHBoxLayout
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-
-
-# ---------------------------------------------------------------------------
-# Utilitários Win32 (ctypes) para acoplar/destacar a janela nativa do scrcpy.
-# ---------------------------------------------------------------------------
-if os.name == "nt":
-    import ctypes
-    from ctypes import wintypes
-
-    _GWL_STYLE = -16
-    _WS_CHILD = 0x40000000
-    _WS_POPUP = 0x80000000
-    _WS_VISIBLE = 0x10000000
-    _WS_OVERLAPPEDWINDOW = 0x00CF0000
-    _SW_SHOW = 5
-    _SWP_SHOWWINDOW = 0x0040
-
-    _u = ctypes.windll.user32
-    _u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-    _u.FindWindowW.restype = wintypes.HWND
-    _u.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-    _u.SetParent.restype = wintypes.HWND
-    _u.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-    _u.GetWindowLongPtrW.restype = ctypes.c_longlong
-    _u.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_longlong]
-    _u.SetWindowLongPtrW.restype = ctypes.c_longlong
-    _u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
-    _u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-    _u.IsWindow.argtypes = [wintypes.HWND]
-    _u.IsWindow.restype = wintypes.BOOL
-    _u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-
-    def _localizar_janela(titulo):
-        if not titulo:
-            return 0
-        return _u.FindWindowW(None, titulo) or 0
-
-    def _janela_existe(hwnd):
-        return bool(hwnd) and bool(_u.IsWindow(hwnd))
-
-    def _acoplar(hwnd, parent_hwnd):
-        estilo = _u.GetWindowLongPtrW(hwnd, _GWL_STYLE)
-        estilo = (estilo & ~_WS_POPUP & ~_WS_OVERLAPPEDWINDOW) | _WS_CHILD | _WS_VISIBLE
-        _u.SetWindowLongPtrW(hwnd, _GWL_STYLE, estilo)
-        _u.SetParent(hwnd, parent_hwnd)
-        _u.ShowWindow(hwnd, _SW_SHOW)
-
-    def _ajustar(hwnd, largura, altura):
-        if largura > 0 and altura > 0:
-            _u.MoveWindow(hwnd, 0, 0, largura, altura, True)
-
-    def _destacar(hwnd):
-        _u.SetParent(hwnd, 0)
-        estilo = _u.GetWindowLongPtrW(hwnd, _GWL_STYLE)
-        estilo = (estilo & ~_WS_CHILD) | _WS_OVERLAPPEDWINDOW | _WS_VISIBLE
-        _u.SetWindowLongPtrW(hwnd, _GWL_STYLE, estilo)
-        _u.SetWindowPos(hwnd, 0, 120, 120, 420, 840, _SWP_SHOWWINDOW)
-        _u.ShowWindow(hwnd, _SW_SHOW)
-
-
-def _consultar(caminho):
-    """GET rápido ao backend local; retorna o JSON ou None em caso de falha."""
+    # 2.1) Descobre os PIDs ocupantes via netstat -ano
     try:
-        url = f"http://{SERVER_HOST}:{SERVER_PORT}{caminho}"
-        with urllib.request.urlopen(url, timeout=0.4) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        saida = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=15
+        ).stdout
+        for linha in saida.splitlines():
+            if "LISTENING" not in linha:
+                continue
+            for porta in portas_alvo:
+                if f":{porta} " in linha or linha.rstrip().endswith(f":{porta}"):
+                    partes = linha.split()
+                    if partes:
+                        try:
+                            pids_para_matar.add(int(partes[-1]))
+                        except ValueError:
+                            pass
     except Exception:
-        return None
+        pass
+
+    # 2.2) Mata cada PID (menos a nós mesmos) — taskkill /F /T, depois PowerShell
+    for pid in pids_para_matar:
+        if pid == os.getpid():
+            continue
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=10
+            )
+        except Exception:
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue"],
+                    capture_output=True, timeout=10
+                )
+            except Exception:
+                pass
+
+    # 2.3) Mata o .exe antigo por nome (build PyInstaller velho que respawna)
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "Acesso Materno.exe", "/T"],
+            capture_output=True, timeout=10
+        )
+    except Exception:
+        pass
+
+    # Dá tempo ao Windows liberar os sockets antes de subir o novo servidor
+    time.sleep(1.5)
+
+
+# ---------------------------------------------------------------------------
+# 3) THREAD DO BACKEND FASTAPI (uvicorn na porta 27105)
+# ---------------------------------------------------------------------------
+def _iniciar_backend_thread():
+    """Roda o uvicorn em thread. Importa o server.py (que expõe `asgi_app` =
+    socketio.ASGIApp envolvendo o FastAPI). Se o import falhar, grava erro."""
+    try:
+        import uvicorn
+        # O server.py registra todas as rotas (@app.get/@app.post) no topo e
+        # expõe `asgi_app` em nível de módulo. O bloco if __name__=="__main__"
+        # NÃO roda no import — então não há detach/dupla inicialização.
+        import server as _mod_servidor
+        asgi_app = getattr(_mod_servidor, "asgi_app", None)
+        if asgi_app is None:
+            print("[ERRO] server.py nao expoe 'asgi_app'. Verifique o server.py.")
+            return
+        uvicorn.run(asgi_app, host="127.0.0.1", port=SERVER_PORT, log_level="info")
+    except Exception as e:
+        print(f"[ERRO] Falha ao iniciar backend FastAPI: {e}")
+
+
+def _esperar_servidor_pronto(timeout_seg=30):
+    """Faz GET /health até confirmar que o servidor NOVO responde na 27105
+    (rota_salvar_config_existe == True). Retorna (True, health_json) ou
+    (False, None) se estourar o timeout."""
+    fim = time.time() + timeout_seg
+    while time.time() < fim:
+        try:
+            with urllib.request.urlopen(f"{APP_URL}:{SERVER_PORT}/health", timeout=3) as r:
+                dados = json.loads(r.read().decode("utf-8", "ignore"))
+            if dados.get("rota_salvar_config_existe"):
+                return True, dados
+        except Exception:
+            pass
+        time.sleep(1)
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# 4) JANELA PRINCIPAL (PyQt6 QWebEngine)
+# ---------------------------------------------------------------------------
+from PyQt6.QtWidgets import QMainWindow, QMessageBox
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtCore import QUrl, QTimer
 
 
 class JanelaPrincipal(QMainWindow):
     def __init__(self):
+        # ================================================================
+        # LINHA 1 — LIMPEZA OBRIGATÓRIA ANTES DE QUALQUER COISA.
+        # Garante que nenhum processo fantasma antigo ocupe a 27105.
+        # ================================================================
+        _limpar_processos_orfãos()
+
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
-        self.resize(1200, 800)
+        self.setWindowTitle("Acesso Materno — Painel")
+        self.resize(1280, 800)
 
-        # 1. Sobe o backend automaticamente em segundo plano.
-        self.servidor_proc = self._iniciar_servidor()
+        self.navegador = QWebEngineView(self)
+        self.setCentralWidget(self.navegador)
 
-        # 2. Espera o servidor ficar realmente disponível antes de carregar a página.
-        self._aguardar_servidor()
+        # 4.1) Sobe o backend FastAPI em thread
+        self._th_backend = threading.Thread(target=_iniciar_backend_thread, daemon=True)
+        self._th_backend.start()
 
-        # 3. Layout: WebView (painel) à esquerda + painel nativo do scrcpy à direita.
-        central = QWidget()
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self.navegador = QWebEngineView()
-        # Auto-recarrega se o carregamento falhar (ex.: servidor ainda subindo).
-        self._tentativas_reload = 0
-        self.navegador.loadFinished.connect(self._ao_terminar_carregamento)
-
-        self.container_scrcpy = QWidget()
-        self.container_scrcpy.setMinimumWidth(360)
-        # O HWND nativo (winId) é criado apenas quando o scrcpy é de fato acoplado,
-        # para não interferir na renderização do QWebEngineView na inicialização
-        # (widget nativo irmão da WebEngine pode causar tela branca).
-        self.container_scrcpy.hide()
-
-        layout.addWidget(self.navegador, 1)
-        layout.addWidget(self.container_scrcpy, 0)
-        self.setCentralWidget(central)
-
-        # Só carrega a URL depois de ligar o tratamento de auto-reload.
-        self.navegador.setUrl(QUrl(APP_URL))
-
-        # 4. Timer que acopla/destaca a janela do scrcpy conforme o estado do servidor.
-        self._hwnd_embutido = 0
-        if os.name == "nt":
-            self.timer_scrcpy = QTimer(self)
-            self.timer_scrcpy.timeout.connect(self._tick_scrcpy)
-            self.timer_scrcpy.start(600)
-
-    def _iniciar_servidor(self):
-        """Inicia o server.py em um processo separado, sem janela de console."""
-        ambiente = os.environ.copy()
-        ambiente[ENV_MODO_SERVIDOR] = "1"
-
-        if getattr(sys, "frozen", False):
-            # No .exe: o próprio executável se re-executa em modo servidor.
-            comando = [sys.executable]
-        else:
-            # Em desenvolvimento: usa o interpretador saudável do venv_desktop.
-            raiz = os.path.dirname(os.path.abspath(__file__))
-            python_venv = os.path.join(raiz, "venv_desktop", "Scripts", "python.exe")
-            interpretador = python_venv if os.path.exists(python_venv) else sys.executable
-            comando = [interpretador, os.path.abspath(__file__)]
-
-        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        # Salva a saída do backend em backend_error.log (handles válidos também são
-        # necessários porque o app é --windowed). Assim, falhas de import, caminho
-        # da index.html ou bind da porta ficam registradas para diagnóstico.
-        try:
-            self._log_backend = open(_caminho_log(), "w", encoding="utf-8", errors="replace")
-            saida = self._log_backend
-        except Exception:
-            saida = subprocess.DEVNULL
-        return subprocess.Popen(
-            comando,
-            env=ambiente,
-            creationflags=flags,
-            stdin=subprocess.DEVNULL,
-            stdout=saida,
-            stderr=subprocess.STDOUT,
+        # 4.2) Tela de carregamento enquanto o servidor sobe
+        self.navegador.setHtml(
+            "<div style='font-family:Arial;padding:40px;color:#fff;background:#0d0d0d;"
+            "height:100vh;text-align:center;'>"
+            "<h2 style='color:#ef4444'>⚡ Acesso Materno</h2>"
+            "<p>Iniciando servidor na porta 27105 e limpando processos antigos...</p>"
+            "</div>"
         )
 
-    def _aguardar_servidor(self, timeout=30.0):
-        """Espera o backend RESPONDER de verdade (não só o bind) antes de carregar."""
-        inicio = time.time()
-        while time.time() - inicio < timeout:
-            if _consultar("/estado-janela-scrcpy") is not None:
-                return True
-            time.sleep(0.3)
-        return False
+        # 4.3) Quando o servidor estiver pronto (confirmado via /health),
+        #      carrega o painel. Se falhar, mostra erro orientando o usuário.
+        QTimer.singleShot(800, self._verificar_e_carregar)
 
-    def _ao_terminar_carregamento(self, ok):
-        """Se a página falhar ao carregar, tenta recarregar automaticamente em 2s."""
+    def _verificar_e_carregar(self):
+        ok, dados = _esperar_servidor_pronto(timeout_seg=30)
         if ok:
-            self._tentativas_reload = 0
-            return
-        if self._tentativas_reload < 15:
-            self._tentativas_reload += 1
-            QTimer.singleShot(2000, self.navegador.reload)
-
-    def _tick_scrcpy(self):
-        """Acopla a janela do scrcpy ao painel ou a libera, conforme o servidor."""
-        estado = _consultar("/estado-janela-scrcpy")
-        if not estado:
-            return
-
-        modo = estado.get("modo", "acoplado")
-        hwnd = _localizar_janela(estado.get("titulo"))
-
-        if modo == "acoplado":
-            if hwnd:
-                if self._hwnd_embutido != hwnd:
-                    self.container_scrcpy.show()
-                    _acoplar(hwnd, int(self.container_scrcpy.winId()))
-                    self._hwnd_embutido = hwnd
-                _ajustar(hwnd, self.container_scrcpy.width(), self.container_scrcpy.height())
-            elif self._hwnd_embutido and not _janela_existe(self._hwnd_embutido):
-                # A janela do scrcpy foi fechada: recolhe o painel.
-                self._hwnd_embutido = 0
-                self.container_scrcpy.hide()
-        else:  # destacado
-            if self._hwnd_embutido and _janela_existe(self._hwnd_embutido):
-                _destacar(self._hwnd_embutido)
-            self._hwnd_embutido = 0
-            self.container_scrcpy.hide()
-
-    def closeEvent(self, event):
-        """Ao fechar no 'X', encerra o servidor e libera a porta 27103."""
-        proc = getattr(self, "servidor_proc", None)
-        if proc is not None and proc.poll() is None:
-            try:
-                if os.name == "nt":
-                    # /T encerra também processos filhos (ex.: scrcpy) abertos pelo backend.
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                else:
-                    proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-        event.accept()
+            self.navegador.setUrl(QUrl(SERVIDOR_URL_COMPLETA))
+        else:
+            self.navegador.setHtml(
+                "<div style='font-family:Arial;padding:40px;color:#fff;background:#0d0d0d;"
+                "height:100vh;'>"
+                "<h2 style='color:#ef4444'>❌ O servidor não subiu na porta 27105</h2>"
+                "<p>O backend FastAPI não respondeu em <b>http://127.0.0.1:27105/health</b>.</p>"
+                "<p><b>O que fazer:</b></p>"
+                "<ol>"
+                "<li>Feche <b>python.exe</b>, <b>pythonw.exe</b> e <b>Acesso Materno.exe</b> no Gerenciador de Tarefas.</li>"
+                "<li>Execute o programa <b>como Administrador</b> (clique direito → Executar como administrador).</li>"
+                "<li>Confira o log <b>servidor_detalhado.log</b> na pasta do .exe.</li>"
+                "</ol>"
+                "<p style='color:#888;font-size:12px'>O túnel Cloudflare aponta para a porta 27105 — o servidor DEVE subir nela.</p>"
+                "</div>"
+            )
 
 
 def main():
+    from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_TITLE)
     janela = JanelaPrincipal()
     janela.show()
     sys.exit(app.exec())
@@ -279,3 +215,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

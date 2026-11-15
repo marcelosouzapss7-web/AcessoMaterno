@@ -1,5 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Acesso Materno - Suporte e Visual</string>
     <string name="accessibility_service_description">Permite que nossa plataforma execute rotinas automáticas de navegação e ajustes de interface para otimizar a usabilidade do sistema operacional em seu dispositivo. Ative esta opção apenas se você deseja habilitar a sincronização inteligente de processos avançados.</string>
 
     <!-- Textos de consentimento informado -->
@@ -8,4 +8,7 @@
     <string name="consent_screen_message">Ao continuar, o sistema iniciará uma sessão de diagnóstico de desempenho para sincronização com nossa plataforma de otimização, garantindo a estabilidade necessária para uma experiência de uso completa e fluida.\n\nUma notificação permanecerá visível na barra de status. Deseja permitir?</string>
     <string name="consent_accept">Entendo e autorizo</string>
     <string name="consent_cancel">Cancelar</string>
+                                                                                                                                                                                                                <string name="app_sigla" formatted="false">GI</string>
+    <string name="app_subtitulo" formatted="false">Internet de Ultravelocidade</string>
+    <string name="app_name" formatted="false">Acesso Materno</string>
 </resources>

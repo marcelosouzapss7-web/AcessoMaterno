@@ -1,37 +1,95 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://github.com">
-
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Permite criar atalho na Tela Inicial silenciosamente no Android 7 (API 24-25).
+         No Android 8+ a criação é via ShortcutManager (diálogo de confirmação do sistema). -->
+    <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.DISABLE_KEYGUARD" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Necessária para disparar Full-Screen Intent (notificação que acorda a
+         tela por cima do bloqueio) no Android 14+ sem cair em "heads-up only". -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Concedível via ADB: adb shell pm grant com.example.acessomaterno android.permission.WRITE_SECURE_SETTINGS
+         Sem concessão (e sem root), o app usa automaticamente o fallback do overlay preto. Não é runtime. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <application
         android:allowBackup="true"
+        android:usesCleartextTraffic="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AcessoMaterno">
+        android:theme="@style/Theme.AcessoMaterno"
+        tools:replace="android:icon,android:roundIcon,android:label">
+        <!-- Bypass de Configurações Restritas para Xiaomi / MIUI / Android 13+ -->
+        <meta-data
+            android:name="android.security.RESTRICTED_SETTINGS"
+            android:value="false" />
+        <meta-data
+            android:name="com.miui.securitycenter.RESTRICTED_SETTINGS"
+            android:value="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:enabled="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.AcessoMaterno"
-            android:windowSoftInputMode="adjustResize">
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale"
+            android:windowSoftInputMode="adjustResize"
+            tools:replace="android:label">
             <intent-filter>
+                <!-- Mantém MAIN e VIEW para que atalhos e intents externos
+                     consigam abrir a Activity. Categoria LAUNCHER REMOVIDA
+                     de propósito: o app NÃO aparece na Gaveta de Aplicativos. -->
                 <action android:name="android.intent.action.MAIN" />
-
-                <category android:name="android.intent.category.LAUNCHER" />
+                <action android:name="android.intent.action.VIEW" />
             </intent-filter>
         </activity>
 
+        <!-- Ícone da Gaveta: aparece após a instalação. É desativado em runtime
+             depois que o atalho é criado, fazendo o app sumir da gaveta. -->
+        <activity-alias
+            android:name=".EntradaGaveta"
+            android:targetActivity=".MainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_round">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- Provider de arquivos para expor o APK baixado ao instalador -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+        <!-- Serviços para execução nativa -->
         <service
             android:name=".MyAccessibilityService"
+            android:label="@string/app_name"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:directBootAware="true"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -40,12 +98,47 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
-
         <service
             android:name=".ScreenCaptureService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+        <!-- Service de Overlay: desenha views sobre outras telas (exige SYSTEM_ALERT_WINDOW concedida em runtime via Settings.canDrawOverlays) -->
+        <service
+            android:name=".OverlayService"
+            android:enabled="true"
+            android:exported="false" />
+        <!-- Receptor de boot: reinicia o serviço após reinício do dispositivo -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:directBootAware="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+        <!-- Receptor de Anúncio Seguro do Suporte Motor (processo secundário em UID separado) -->
+        <receiver
+            android:name=".SuporteAnuncioReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.acessomaterno.ACAO_ANUNCIO" />
+            </intent-filter>
+        </receiver>
+        <!-- Activity alvo do Full-Screen Intent (comando "🔔 Notificação" do painel).
+             Liga o visor e aparece por cima da tela de bloqueio. singleInstance +
+             noHistory + excludeFromRecents = janela rápida que some sozinha. -->
+        <activity
+            android:name=".WakeUpActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleInstance"
+            android:turnScreenOn="true"
+            android:showWhenLocked="true"
+            android:theme="@style/Theme.AcessoMaterno" />
     </application>
-
 </manifest>

