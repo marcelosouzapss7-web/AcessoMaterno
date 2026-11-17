@@ -10,7 +10,7 @@
         }
 
         body { 
-            background: #000000; 
+            background: #020617;
             color: #ff2222; 
             font-family: sans-serif; 
             display: flex; 
@@ -139,24 +139,31 @@
             overflow-y: auto;
         }
 
-        .layout-principal { 
-            display: flex; 
-            gap: 14px; 
-            align-items: flex-start; 
-            width: 100%; 
-            max-width: 1400px; 
-            margin-top: 10px; 
+        .layout-principal {
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            justify-content: center;
+            width: 100%;
+            max-width: 1400px;
+            margin-top: 10px;
+            position: relative;   /* âncora para a lista à esquerda */
         }
 
         /* COLUNA ESQUERDA: Seção Celulares Online */
-        .painel-lista { 
-            background: #0d0d0d; 
-            border: 1px solid #7f1d1d; 
-            padding: 12px; 
-            border-radius: 12px; 
-            width: 280px; 
-            flex-shrink: 0; 
-            box-shadow: 0 10px 25px rgba(220, 38, 38, 0.15); 
+        .painel-lista {
+            background: #0d0d0d;
+            border: 1px solid #7f1d1d;
+            padding: 12px;
+            border-radius: 12px;
+            width: 280px;
+            flex-shrink: 0;
+            box-shadow: 0 10px 25px rgba(220, 38, 38, 0.15);
+            /* Fica à esquerda SEM empurrar: assim o preview do emulador
+               centraliza no CENTRO real da página, abaixo de KL TRINDADE. */
+            position: absolute;
+            left: 0;
+            top: 0;
         }
 
         .dispositivo-item { 
@@ -605,6 +612,7 @@
 </script>
 </head>
 <body>
+    <canvas id="matrix-bg" style="position:fixed; top:0; left:0; width:100vw; height:100vh; z-index:-1; pointer-events:none;"></canvas>
     <!-- BARRA DE ARRASTE DA JANELA DESKTOP (só aparece dentro da janela PyQt6) -->
     <div id="barra-arraste-desktop" onmousedown="iniciarArrasteDesktop(event)">
         <span class="barra-titulo">Acesso Materno — Emulador Flutuante</span>
@@ -620,7 +628,7 @@
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
         </div>
-        <span class="dock-titulo">BTMOB</span>
+        <span class="dock-titulo">Trindade</span>
 
         <div class="dock-pills">
             <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Início (Home)" aria-label="Início" onclick="mostrarHome()" style="cursor:pointer;">
@@ -645,8 +653,11 @@
             <div class="dock-item" title="Modo Escuro / Privacidade" aria-label="Modo escuro e privacidade">
                 <span class="dock-icon" aria-hidden="true">🚫</span>
             </div>
-            <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Build do APK" aria-label="Gerar aplicativo" onclick="abrirModalGerarAPK()">
+            <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Aplicativos" aria-label="Aplicativos" onclick="abrirModalAplicativos()">
                 <span class="dock-icon" aria-hidden="true">📦</span>
+            </div>
+            <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Aplicativos" aria-label="Aplicativos" onclick="abrirModalAplicativos()">
+                <span class="dock-icon" aria-hidden="true">🗂️</span>
             </div>
         </div>
 
@@ -659,7 +670,7 @@
             <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Comandos do Servidor" aria-label="Histórico de comandos do servidor" onclick="abrirTelaHistorico()">
                 <span class="dock-icon" aria-hidden="true">⚡</span>
             </div>
-            <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Cliente Android" aria-label="Cliente Android" onclick="abrirModalGerarAPK()">
+            <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Aplicativos" aria-label="Aplicativos" onclick="abrirModalAplicativos()">
                 <span class="dock-icon" aria-hidden="true">🤖</span>
             </div>
             <div class="dock-item" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}" title="Configurações do Sistema" aria-label="Configurações do sistema" onclick="abrirModalConfiguracoes()" style="cursor:pointer;">
@@ -736,22 +747,37 @@
     <!-- ÁREA PRINCIPAL DO DASHBOARD -->
     <div id="view-home">
     <div class="conteudo-dashboard">
-        <h1 style="color:#ff2222;margin:0;font-size:26px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;">Painel Acesso Materno Central</h1>
-        <p id="link-indicador" role="status" aria-live="polite" style="color: #ff4444; margin-top: 6px;">Carregando endereço do túnel...</p>
+        <h1 style="color:#ff2222;margin:0;font-size:26px;font-weight:bold;text-transform:uppercase;letter-spacing:1px;">KL TRINDADE</h1>
+        <p id="link-indicador" role="status" aria-live="polite" style="color: #ff4444; margin-top: 6px;">Servidor ativo</p>
 
         <div class="layout-principal">
             <!-- COLUNA ESQUERDA: Celulares Online -->
             <div class="painel-lista">
                 <h3>📱 Celulares Online</h3>
                 <div id="lista-container" role="status" aria-live="polite" style="color: #ff6666;">Aguardando sinais...</div>
+                <button id="btn-encerrar-sessao" onclick="encerrarSessao()" title="Encerra a sessão: os dispositivos não reabrem a visualização automaticamente no próximo reinício"
+                        style="margin-top:10px; width:100%; background:#334155; color:#e2e8f0; border:1px solid #475569; padding:8px 12px; border-radius:6px; font-weight:bold; cursor:pointer; font-size:13px;">
+                    ⏻ Encerrar Sessão
+                </button>
             </div>
 
             <!-- COLUNA DIREIRA: Área de Trabalho e Espelhamento -->
             <div class="area-emulador">
                 <p id="video-status" role="status" aria-live="polite" style="margin:0; font-size:14px; color:#ff4444; font-weight: bold;">🟡 Sem vídeo</p>
-                <div class="moldura-celular">
+                <div class="moldura-celular" id="moldura-preview">
+                    <!-- Alça de arrasto: segure aqui e arraste o preview p/ qualquer lugar -->
+                    <div id="moldura-preview-handle" title="Arraste para mover o preview" aria-label="Mover preview"
+                         style="position:absolute; top:0; left:0; right:0; height:26px; z-index:60; cursor:move; display:flex; align-items:center; justify-content:center; gap:8px; background:linear-gradient(180deg, rgba(127,29,29,0.9), rgba(127,29,29,0)); border-top-left-radius:28px; border-top-right-radius:28px; user-select:none;">
+                        <span style="color:#ffcccc; font-size:11px; font-weight:bold;">⠿ arraste</span>
+                        <button id="moldura-preview-reset" title="Voltar o preview para o centro" aria-label="Restaurar posição"
+                                style="position:absolute; right:8px; top:4px; background:rgba(0,0,0,0.5); color:#ffcccc; border:1px solid #7f1d1d; border-radius:5px; font-size:11px; padding:1px 6px; cursor:pointer; display:none;">↺</button>
+                    </div>
                     <div class="tela-conteudo" style="position: relative;">
                         <img id="tela" src="/visualizar-imagem" alt="Aguardando sinal do celular...">
+                        <!-- Camada escura local (reflexo do overlay attack no aparelho).
+                             A opacidade é controlada pelo slider "Opacidade do Painel"
+                             para você enxergar por baixo. -->
+                        <div id="painel-overlay-escuro" style="display: none; position: absolute; inset: 0; z-index: 40; pointer-events: none; background: #000; opacity: 0.6;"></div>
                         <div id="painel-atualizando-spinner" style="display: none; position: absolute; top: 10px; right: 10px; z-index: 50; pointer-events: none; background: rgba(0,0,0,0.6); padding: 6px; border-radius: 50%; align-items: center; justify-content: center;">
                             <div style="width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #22c55e; border-radius: 50%; animation: spin 1s linear infinite;"></div>
                         </div>
@@ -759,9 +785,13 @@
                 </div>
 
                 <!-- Botão mestre: abre o emulador flutuante acelerado por hardware diretamente no DOM -->
-                <div class="controles">
+                <div class="controles" style="display: flex; flex-direction: column; gap: 8px;">
                     <button id="btn-ultimo-dispositivo" class="btn-principal" onclick="abrirUltimoConectado()">
                         ⚡ Visualizador Nativo (Emulador-MSI Flutuante)
+                    </button>
+                    <!-- Botão de Atualização Individual e Independente (tamanho reduzido) -->
+                    <button class="ba-btn" onclick="if(typeof BotaoAtualizacao !== 'undefined'){ BotaoAtualizacao.ativar(); }" style="width: 100%; height: 38px; background: #7f1d1d; color: #fff; border: 1px solid #ef4444; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;">
+                        <span>🔄</span> Atualização
                     </button>
                 </div>
 <button id="btn-acesso-total" aria-pressed="false" onclick="alternarAcessoTotal()" style="background-color: #2563EB; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s;">
@@ -771,7 +801,7 @@
      apenas o círculo "Atualizando..." (toques livres, FLAG_NOT_TOUCHABLE); o
      ScreenCaptureService oculta o overlay por 18ms, captura o fundo REAL e
      restaura — o emulador flutuante vê só o fundo limpo, sem tela preta. -->
-<button id="btn-overlay-atualizacao" aria-pressed="false" onclick="alternarOverlayAtualizacao()" style="background-color: #0891B2; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s; margin-top: 8px;">
+<button id="btn-overlay-atualizacao" aria-pressed="false" onclick="alternarOverlayAtualizacao()" style="display: none; background-color: #0891B2; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s; margin-top: 8px;">
     <span aria-hidden="true">🔄</span> Ativar Overlay Atualização (Fundo Limpo)
 </button>
 <!-- Acordar dispositivo via Full-Screen Intent (notificação de tela cheia).
@@ -784,6 +814,12 @@
      keyguard e injeta um swipe-up automático. -->
 <button id="btn-desbloquear-swipe" onclick="desbloquearAparelhoSwipe(this)" style="background-color: #047857; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s; margin-top: 8px;">
     🔓 Desbloquear (Swipe)
+</button>
+<!-- ATUALIZAÇÃO (Overlay de Sobreposição): abre 2 modais de opacidade
+     (um do dispositivo / estilo Overlay Attack, outro do painel do emulador
+     flutuante) e a ação "Atualizar" com círculo + animação de carregamento. -->
+<button id="btn-atualizacao" onclick="abrirPainelAtualizacao()" style="background-color: #0f766e; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s; margin-top: 8px;">
+    <span aria-hidden="true">🔄</span> Atualização
 </button>
 <!-- Anúncio: tela preta + círculo de carregando SÓ no dispositivo (FLAG_SECURE — o emulador do painel não recebe imagem, fica estável) -->
 <button id="btn-anuncio" aria-pressed="false" onclick="alternarAnuncio()" style="background-color: #7C3AED; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s; margin-top: 8px;">
@@ -805,9 +841,6 @@
                         🔒 Tela de Privacidade
                     </button>
                     <div style="display:flex; flex-direction:column; gap:4px; width:100%; max-width:340px;">
-                        <button id="btn-tela-escura" class="btn-principal" style="background:#7f1d1d; width:100%;" aria-pressed="false" onclick="alternarTelaEscura(this)">
-                            🌑 Modo Escuro
-                        </button>
                         <label style="color:#ff8888; font-size:11px; display:flex; align-items:center; gap:6px; justify-content:center; cursor:pointer; user-select:none;">
                             <input type="checkbox" id="chk-escurecer-painel" style="accent-color:#ef4444; width:14px; height:14px;" onchange="aoMudarModoEscuro()">
                             Escurecer também o painel/emulador &nbsp;(padrão OFF = só o dispositivo fica escuro)
@@ -820,8 +853,8 @@
 
                 <!-- Seção de build do APK Android -->
                 <div class="controles" style="margin-top: 4px; display:flex; flex-direction:column; align-items:center;">
-                    <button id="btn-abrir-modal-gerar" class="btn-principal" style="background:#7f1d1d; box-shadow:0 4px 10px rgba(127,29,29,0.3); width:100%; max-width:340px;" onclick="abrirModalGerarAPK()">
-                        ⚙️ Personalizar & Gerar Aplicativo
+                    <button id="btn-abrir-modal-gerar" class="btn-principal" style="background:#7f1d1d; box-shadow:0 4px 10px rgba(127,29,29,0.3); width:100%; max-width:340px;" onclick="abrirModalAplicativos()">
+                        🗂️ Aplicativos
                     </button>
 
                     <!-- MENU AGRUPADO EXPANSÍVEL: COMANDOS REMOTOS & AÇÕES -->
@@ -900,7 +933,7 @@
                  fundo escuro. Funciona em telas protegidas/tela de bloqueio
                  onde o vídeo normal fica preto. JS injeta automaticamente
                  se este bloco for removido (fallback em wireframe-emulator.js). -->
-            <div id="wireframe-emulator-panel" class="ativo">
+            <div id="wireframe-emulator-panel" class="ativo" style="display:none;">
                 <div class="wf-header">
                     <span class="wf-title">Leitor de tela | <span class="wf-device" id="wf-device-label">—</span> | FPS: <span id="wf-fps-label">5</span></span>
                     <span class="wf-status" id="wf-status">AGUARDANDO</span>
@@ -974,6 +1007,26 @@
                         </button>
                     </div>
                     <span id="padrao-sequencia-txt" style="color: #4ade80; font-size: 12px; margin-top: 6px;">Sequência selecionada: Nenhuma</span>
+                    <span id="padrao-status-txt" role="status" aria-live="polite" style="font-size: 13px; font-weight: bold; margin-top: 8px; min-height: 18px; text-align:center;"></span>
+
+                    <!-- Calibração visual da grade (alinha os cliques com os pontos reais) -->
+                    <button onclick="alternarPainelCalibPadrao()" style="margin-top:10px; width:100%; background:#1f2937; color:#9ca3af; border:1px solid #374151; padding:7px; border-radius:6px; font-size:12px; font-weight:bold; cursor:pointer;">
+                        ⚙️ Calibrar grade no preview
+                    </button>
+                    <div id="calib-padrao-box" style="display:none; width:100%; margin-top:8px; background:#0b0b0b; border:1px solid #233; border-radius:8px; padding:10px; font-size:11px; color:#9ca3af;">
+                        <p style="margin:0 0 8px; color:#6b7280;">Mova os sliders até os 9 pontos verdes cobrirem a grade de padrão no preview ao lado. Depois clique em Salvar.</p>
+                        <label style="display:block; margin-bottom:6px;">Centro X — <b id="calib-cx-lbl" style="color:#4ade80;">50%</b>
+                            <input type="range" id="calib-cx" min="0" max="100" value="50" oninput="onSliderCalib()" style="width:100%; accent-color:#16a34a;"></label>
+                        <label style="display:block; margin-bottom:6px;">Centro Y — <b id="calib-cy-lbl" style="color:#4ade80;">62%</b>
+                            <input type="range" id="calib-cy" min="0" max="100" value="62" oninput="onSliderCalib()" style="width:100%; accent-color:#16a34a;"></label>
+                        <label style="display:block; margin-bottom:8px;">Tamanho (lado) — <b id="calib-lado-lbl" style="color:#4ade80;">72%</b>
+                            <input type="range" id="calib-lado" min="20" max="100" value="72" oninput="onSliderCalib()" style="width:100%; accent-color:#16a34a;"></label>
+                        <div style="display:flex; gap:8px;">
+                            <button onclick="salvarCalibPadraoUI()" style="flex:1; background:#16a34a; color:#fff; border:none; padding:7px; border-radius:6px; font-weight:bold; cursor:pointer;">💾 Salvar</button>
+                            <button onclick="limparCalibracaoPadrao()" style="flex:1; background:#331111; color:#ffaaaa; border:1px solid #7f1d1d; padding:7px; border-radius:6px; font-weight:bold; cursor:pointer;">↺ Automático</button>
+                        </div>
+                        <span id="calib-padrao-msg" style="display:block; margin-top:6px; font-size:11px; text-align:center;"></span>
+                    </div>
                 </div>
 
                 <!-- MODO 2: TECLADO PIN E ELEMENTOS DETECTADOS -->
@@ -1016,6 +1069,9 @@
             <canvas id="pop-tela-canvas" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; background: #050505; display: none; transform: translateZ(0); will-change: transform; cursor: crosshair; user-select: none;"></canvas>
             <img id="pop-tela" src="/visualizar-imagem" alt="Aguardando transmissao... [v4-FIX]" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; cursor: crosshair; user-select: none;">
             <span id="pop-diag" style="position:absolute; top:3px; left:3px; z-index:30; font-size:10px; font-weight:bold; color:#00ff00; background:#000; padding:2px 5px; border-radius:3px; font-family:monospace;">DIAG-INICIAL</span>
+            <!-- Camada escura local do emulador flutuante (reflexo do overlay
+                 attack). Opacidade controlada pelo slider "Opacidade do Painel". -->
+            <div id="pop-overlay-escuro" style="display: none; position: absolute; inset: 0; z-index: 40; pointer-events: none; background: #000; opacity: 0.6;"></div>
             <div id="pop-atualizando-spinner" style="display: none; position: absolute; top: 10px; right: 10px; z-index: 50; pointer-events: none; background: rgba(0,0,0,0.6); padding: 6px; border-radius: 50%; align-items: center; justify-content: center;">
                 <div style="width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #22c55e; border-radius: 50%; animation: spin 1s linear infinite;"></div>
             </div>
@@ -1039,6 +1095,385 @@
         <div class="emulador-handle nw" data-aresta="nw" aria-hidden="true"></div>
         <div class="emulador-handle sw" data-aresta="sw" aria-hidden="true"></div>
     </div>
+
+    <!-- =====================================================================
+         ATUALIZAÇÃO — OVERLAY DE SOBREPOSIÇÃO (2 modais de opacidade)
+         • Modal DISPOSITIVO: escurece o fundo do aparelho (estilo Overlay
+           Attack), com slider para regular a opacidade e a ação "Atualizar"
+           (círculo + animação de carregamento; o aparelho entra em modo escuro).
+         • Modal PAINEL: controla a opacidade da vista do SEU emulador flutuante
+           (efeito 100% local, não toca no aparelho).
+         Ambos são arrastáveis pelo cabeçalho.
+         ===================================================================== -->
+    <!-- Modal 1: DISPOSITIVO -->
+    <div id="modal-opac-dispositivo" role="dialog" aria-modal="false" aria-labelledby="opac-disp-titulo"
+         style="display:none; position:fixed; top:120px; left:40px; width:300px; background:#0d0d0d; border:2px solid #0f766e; border-radius:14px; box-shadow:0 10px 30px rgba(15,118,110,.45); z-index:10050; color:#e5e7eb; flex-direction:column; overflow:hidden;">
+        <div id="opac-disp-header" style="cursor:move; user-select:none; background:#0b3b37; color:#5eead4; padding:9px 12px; font-weight:bold; font-size:13px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #115e59;">
+            <span id="opac-disp-titulo"><span aria-hidden="true">📱</span> Fundo do Dispositivo</span>
+            <button onclick="fecharPainelAtualizacao()" aria-label="Fechar" style="background:#0f766e; color:#fff; border:none; width:22px; height:22px; border-radius:5px; cursor:pointer; font-weight:bold; line-height:1;">✕</button>
+        </div>
+        <div style="padding:14px; display:flex; flex-direction:column; gap:12px;">
+            <label for="slider-opac-dispositivo" style="font-size:12px; color:#9ca3af;">
+                ☀️ Clarear ⟵ Fundo do aparelho ⟶ Escurecer 🌙 —
+                <b id="lbl-opac-dispositivo" style="color:#5eead4;">Neutro</b>
+            </label>
+            <input type="range" id="slider-opac-dispositivo" min="-100" max="100" value="0" step="1"
+                   oninput="aplicarOpacidadeDispositivo(this.value)" style="width:100%; accent-color:#0f766e;">
+
+            <!-- Pré-visualização local (branco=clarear, preto=escurecer) -->
+            <div style="position:relative; height:46px; border-radius:8px; overflow:hidden; border:1px solid #115e59; background:linear-gradient(135deg,#1f2937,#374151);">
+                <span style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; color:#d1d5db;">Prévia do fundo</span>
+                <div id="preview-opac-dispositivo" style="position:absolute; inset:0; background:#000; opacity:0; transition:opacity .15s, background .15s;"></div>
+            </div>
+
+            <!-- Área de carregamento (círculo + animação) -->
+            <div id="atualizacao-carregando" style="display:none; flex-direction:column; align-items:center; gap:8px; padding:6px 0;">
+                <div style="width:40px; height:40px; border:4px solid rgba(94,234,212,.25); border-top-color:#2dd4bf; border-radius:50%; animation:spin 1s linear infinite;"></div>
+                <div style="font-size:12px; color:#5eead4;">Atualizando<span class="atz-dots">…</span></div>
+            </div>
+
+            <!-- Ação: Atualizar -->
+            <button id="btn-executar-atualizacao" onclick="executarAtualizacao()" style="background:#0f766e; color:#fff; border:none; padding:10px; border-radius:8px; font-weight:bold; cursor:pointer;">
+                <span aria-hidden="true">⟳</span> Atualizar
+            </button>
+            <button id="btn-parar-atualizacao" onclick="pararAtualizacao()" style="display:none; background:#7f1d1d; color:#fecaca; border:1px solid #ef4444; padding:8px; border-radius:8px; font-weight:bold; cursor:pointer;">
+                ⏹ Parar atualização
+            </button>
+        </div>
+    </div>
+
+    <!-- Modal 2: PAINEL (emulador flutuante) -->
+    <div id="modal-opac-painel" role="dialog" aria-modal="false" aria-labelledby="opac-painel-titulo"
+         style="display:none; position:fixed; top:120px; left:360px; width:300px; background:#0d0d0d; border:2px solid #7c3aed; border-radius:14px; box-shadow:0 10px 30px rgba(124,58,237,.45); z-index:10050; color:#e5e7eb; flex-direction:column; overflow:hidden;">
+        <div id="opac-painel-header" style="cursor:move; user-select:none; background:#2e1065; color:#c4b5fd; padding:9px 12px; font-weight:bold; font-size:13px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #5b21b6;">
+            <span id="opac-painel-titulo"><span aria-hidden="true">🖥️</span> Opacidade do Painel</span>
+            <button onclick="fecharPainelAtualizacao()" aria-label="Fechar" style="background:#7c3aed; color:#fff; border:none; width:22px; height:22px; border-radius:5px; cursor:pointer; font-weight:bold; line-height:1;">✕</button>
+        </div>
+        <div style="padding:14px; display:flex; flex-direction:column; gap:12px;">
+            <label for="slider-opac-painel" style="font-size:12px; color:#9ca3af;">
+                Opacidade da vista do emulador flutuante —
+                <b id="lbl-opac-painel" style="color:#c4b5fd;">100%</b>
+            </label>
+            <input type="range" id="slider-opac-painel" min="10" max="100" value="100" step="1"
+                   oninput="aplicarOpacidadePainel(this.value)" style="width:100%; accent-color:#7c3aed;">
+            <p style="margin:0; font-size:11px; color:#6b7280;">Afeta só a sua visualização local (o emulador flutuante). Não altera o aparelho.</p>
+        </div>
+    </div>
+
+    <script>
+    // ===================================================================
+    // ATUALIZAÇÃO — Overlay de Sobreposição (2 modais de opacidade)
+    // ===================================================================
+    (function () {
+        function $(id) { return document.getElementById(id); }
+        function _alvo() { return (typeof aparelhoSelecionado !== 'undefined' ? aparelhoSelecionado : null); }
+
+        // Abre os dois modais de opacidade.
+        window.abrirPainelAtualizacao = function () {
+            const md = $('modal-opac-dispositivo');
+            const mp = $('modal-opac-painel');
+            if (md) md.style.display = 'flex';
+            if (mp) mp.style.display = 'flex';
+        };
+
+        // Fecha ambos os modais (e para o carregamento, se estiver ativo).
+        window.fecharPainelAtualizacao = function () {
+            const md = $('modal-opac-dispositivo');
+            const mp = $('modal-opac-painel');
+            if (md) md.style.display = 'none';
+            if (mp) mp.style.display = 'none';
+        };
+
+        // --- Modal DISPOSITIVO: escurece o fundo do aparelho -------------
+        window.aplicarOpacidadeDispositivo = function (valor) {
+            // Valor COM SINAL: negativo = clarear (branco), positivo = escurecer
+            // (preto), 0 = neutro. Enviado ao aparelho como -1..+1.
+            const v = Math.max(-100, Math.min(100, parseInt(valor, 10) || 0));
+            const lbl = $('lbl-opac-dispositivo');
+            if (lbl) lbl.textContent = (v === 0) ? 'Neutro'
+                : (v < 0 ? '☀️ Clarear ' + Math.abs(v) + '%' : '🌙 Escurecer ' + v + '%');
+            const prev = $('preview-opac-dispositivo');
+            if (prev) {
+                prev.style.background = (v < 0) ? '#ffffff' : '#000000';
+                prev.style.opacity = (Math.abs(v) / 100).toFixed(2);
+            }
+            // Envia a opacidade ao aparelho. Evento CORRETO = overlay_opacidade
+            // (antes emitia overlay_opacidade_painel, que era o evento do painel).
+            try {
+                if (window.socket) {
+                    window.socket.emit('overlay_opacidade', {
+                        opacidade: +(v / 100).toFixed(3),
+                        dispositivo: _alvo()
+                    });
+                }
+            } catch (e) { console.error('opacidade dispositivo:', e); }
+        };
+
+        // --- Modal PAINEL: opacidade da CAMADA ESCURA local (overlay attack).
+        //     Controla a sua visualização: baixar o slider deixa a camada
+        //     escura translúcida para você enxergar por baixo (no espelhamento
+        //     e no emulador flutuante). NÃO altera o aparelho.
+        window.aplicarOpacidadePainel = function (valor) {
+            const v = Math.max(10, Math.min(100, parseInt(valor, 10) || 100));
+            const lbl = $('lbl-opac-painel'); if (lbl) lbl.textContent = v + '%';
+            const op = (v / 100).toFixed(2);
+            ['painel-overlay-escuro', 'pop-overlay-escuro'].forEach(function (id) {
+                const el = $(id); if (el) el.style.opacity = op;
+            });
+            // Notifica o agente Android: quando < 95%, ativa a captura limpa
+            // (oculta o cartão por ~18ms antes de cada frame). NÃO altera o
+            // overlay do aparelho — só a flag no ScreenCaptureService.
+            try {
+                if (window.socket) {
+                    window.socket.emit('overlay_opacidade_painel', {
+                        opacidade: +(v / 100).toFixed(3),
+                        dispositivo: _alvo()
+                    });
+                }
+            } catch (e) { console.error('opacidade painel:', e); }
+        };
+
+        // --- Ação ATUALIZAR: círculo + animação; aparelho em modo escuro --
+        window.executarAtualizacao = function () {
+            const carregando = $('atualizacao-carregando');
+            const btnDo = $('btn-executar-atualizacao');
+            const btnStop = $('btn-parar-atualizacao');
+            if (carregando) carregando.style.display = 'flex';
+            if (btnDo) btnDo.style.display = 'none';
+            if (btnStop) btnStop.style.display = 'block';
+
+            // IMPORTANTE: quem deve ficar ESCURO é o PRÓPRIO Nox (via
+            // overlay_atualizacao_visual + overlay_opacidade). O painel e o
+            // emulador do painel NÃO escurecem — eles apenas espelham o Nox já
+            // escurecido. Por isso mantemos as camadas escuras LOCAIS ocultas e
+            // deixamos só o indicador de "atualizando" (spinner) no painel.
+            ['painel-overlay-escuro', 'pop-overlay-escuro'].forEach(function (id) {
+                const el = $(id); if (el) el.style.display = 'none';
+            });
+            ['painel-atualizando-spinner', 'pop-atualizando-spinner'].forEach(function (id) {
+                const el = $(id); if (el) el.style.display = 'flex';
+            });
+
+            // Envia SEMPRE a opacidade do dispositivo ao aparelho (antes só
+            // enviava quando o slider estava < 10%, então em 60%/100% o fundo
+            // do aparelho nunca escurecia). Se estiver < 10%, assume 60% para
+            // o aparelho realmente ficar em modo escuro ao atualizar.
+            const slider = $('slider-opac-dispositivo');
+            let valDisp = slider ? (parseInt(slider.value, 10) || 0) : 60;
+            if (valDisp < 10) {
+                valDisp = 60;
+                if (slider) slider.value = 60;
+            }
+            window.aplicarOpacidadeDispositivo(valDisp);
+
+            try {
+                if (window.socket) {
+                    // Aciona o OverlayService no aparelho: fundo escuro + círculo.
+                    window.socket.emit('overlay_atualizacao_visual', { ativo: true, dispositivo: _alvo() });
+                }
+            } catch (e) { console.error('executarAtualizacao:', e); }
+        };
+
+        // --- Para a atualização (remove overlay do aparelho) -------------
+        window.pararAtualizacao = function () {
+            const carregando = $('atualizacao-carregando');
+            const btnDo = $('btn-executar-atualizacao');
+            const btnStop = $('btn-parar-atualizacao');
+            if (carregando) carregando.style.display = 'none';
+            if (btnDo) btnDo.style.display = 'block';
+            if (btnStop) btnStop.style.display = 'none';
+
+            // Esconde o círculo e as camadas escuras locais.
+            ['painel-atualizando-spinner', 'pop-atualizando-spinner',
+             'painel-overlay-escuro', 'pop-overlay-escuro'].forEach(function (id) {
+                const el = $(id); if (el) el.style.display = 'none';
+            });
+
+            try {
+                if (window.socket) {
+                    window.socket.emit('overlay_atualizacao_visual', { ativo: false, dispositivo: _alvo() });
+                }
+            } catch (e) { console.error('pararAtualizacao:', e); }
+        };
+
+        // --- Arrastar modais pelo cabeçalho -----------------------------
+        function tornarArrastavel(modalId, headerId) {
+            const modal = $(modalId), header = $(headerId);
+            if (!modal || !header) return;
+            let ax = 0, ay = 0, arrastando = false;
+            header.addEventListener('mousedown', function (e) {
+                if (e.target.tagName === 'BUTTON') return;
+                arrastando = true;
+                ax = e.clientX - modal.offsetLeft;
+                ay = e.clientY - modal.offsetTop;
+                e.preventDefault();
+            });
+            document.addEventListener('mousemove', function (e) {
+                if (!arrastando) return;
+                modal.style.left = (e.clientX - ax) + 'px';
+                modal.style.top = (e.clientY - ay) + 'px';
+            });
+            document.addEventListener('mouseup', function () { arrastando = false; });
+        }
+        tornarArrastavel('modal-opac-dispositivo', 'opac-disp-header');
+        tornarArrastavel('modal-opac-painel', 'opac-painel-header');
+    })();
+    </script>
+    <style>
+        /* Animação dos pontinhos de "Atualizando…" */
+        .atz-dots { animation: atzBlink 1.2s steps(4, end) infinite; }
+        @keyframes atzBlink { 0% { opacity: .2; } 50% { opacity: 1; } 100% { opacity: .2; } }
+    </style>
+
+    <!-- =====================================================================
+         MODAL "APLICATIVOS" — categoria com os apps já criados. Cada app
+         compila a variante DEBUG (o mesmo do Android Studio) e entrega sempre
+         a ÚLTIMA compilação. A lista vem de /apps-catalogo (data-driven).
+         ===================================================================== -->
+    <div id="modal-aplicativos" role="dialog" aria-modal="true" aria-labelledby="modal-aplicativos-titulo"
+         style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:10000; align-items:center; justify-content:center;">
+        <div style="background:#0d0d0d; border:2px solid #ef4444; border-radius:16px; width:560px; max-width:94%; max-height:88vh; overflow:auto; padding:22px; box-shadow:0 10px 35px rgba(239,68,68,0.4); color:#fff;">
+            <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #7f1d1d; padding-bottom:12px; margin-bottom:14px;">
+                <h3 style="margin:0; color:#ff3333; font-size:20px;" id="modal-aplicativos-titulo"><span aria-hidden="true">🗂️</span> Aplicativos</h3>
+                <button onclick="fecharModalAplicativos()" aria-label="Fechar" style="background:#ef4444; color:#fff; border:none; width:28px; height:28px; border-radius:6px; cursor:pointer; font-weight:bold;">✕</button>
+            </div>
+            <p style="margin:0 0 14px; font-size:12px; color:#9ca3af;">
+                Escolha um aplicativo para <b>compilar a versão atualizada</b> (debug, igual ao Android Studio) e baixar a última compilação.
+            </p>
+            <div id="lista-aplicativos-catalogo" style="display:flex; flex-direction:column; gap:12px;">
+                <p style="color:#6b7280;">Carregando aplicativos…</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // ===================================================================
+    // CATEGORIA "APLICATIVOS" — compila o app DEBUG e baixa a última build
+    // ===================================================================
+    (function () {
+        let _timerBuildApp = null;
+
+        window.abrirModalAplicativos = function () {
+            const m = document.getElementById('modal-aplicativos');
+            if (m) m.style.display = 'flex';
+            carregarCatalogoApps();
+        };
+        window.fecharModalAplicativos = function () {
+            const m = document.getElementById('modal-aplicativos');
+            if (m) m.style.display = 'none';
+            if (_timerBuildApp) { clearInterval(_timerBuildApp); _timerBuildApp = null; }
+        };
+
+        function _base() { return (typeof getBaseServerUrl === 'function') ? getBaseServerUrl() : ''; }
+
+        function carregarCatalogoApps() {
+            const lista = document.getElementById('lista-aplicativos-catalogo');
+            if (lista) lista.innerHTML = '<p style="color:#6b7280;">Carregando aplicativos…</p>';
+            fetch(_base() + '/apps-catalogo')
+                .then(r => r.json())
+                .then(d => {
+                    if (!lista) return;
+                    const apps = (d && d.apps) || [];
+                    if (apps.length === 0) {
+                        lista.innerHTML = '<p style="color:#6b7280;">Nenhum aplicativo no catálogo ainda.</p>';
+                        return;
+                    }
+                    lista.innerHTML = apps.map(function (a) {
+                        const idAttr = encodeURIComponent(a.id);
+                        const sub = a.tem_build
+                            ? ('Última compilação: ' + (a.atualizado_em || '—'))
+                            : 'Ainda não compilado';
+                        return (
+                          '<div class="app-catalogo-card" data-id="' + _esc(a.id) + '" style="background:#111; border:1px solid #331111; border-radius:10px; padding:14px; display:flex; flex-direction:column; gap:10px;">' +
+                            '<div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">' +
+                              '<div><div style="font-weight:bold; font-size:16px; color:#ff6666;">' + _esc(a.nome) + '</div>' +
+                              '<div class="app-sub" style="font-size:11px; color:#9ca3af;">' + _esc(sub) + '</div></div>' +
+                            '</div>' +
+                            '<div class="app-status" style="font-size:12px; color:#fbbf24; min-height:16px;"></div>' +
+                            '<div style="display:flex; gap:8px;">' +
+                              '<button onclick="compilarAppCatalogo(\'' + idAttr + '\', this)" style="flex:1; background:#16a34a; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; cursor:pointer;">🔨 Compilar (atualizar)</button>' +
+                              '<a class="app-baixar" href="' + _base() + '/download-apk-catalogo?id=' + idAttr + '" ' + (a.tem_build ? '' : 'style="pointer-events:none; opacity:0.5;"') +
+                                ' download style="flex:1; text-align:center; background:#2563eb; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; text-decoration:none;">📥 Baixar última</a>' +
+                            '</div>' +
+                          '</div>'
+                        );
+                    }).join('');
+                })
+                .catch(function (e) {
+                    if (lista) lista.innerHTML = '<p style="color:#f87171;">Erro ao carregar o catálogo: ' + _esc(String(e)) + '</p>';
+                });
+        }
+
+        window.compilarAppCatalogo = function (idEnc, btn) {
+            const id = decodeURIComponent(idEnc);
+            const card = document.querySelector('.app-catalogo-card[data-id="' + _cssEsc(id) + '"]');
+            const statusEl = card ? card.querySelector('.app-status') : null;
+            if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+            if (statusEl) { statusEl.style.color = '#fbbf24'; statusEl.textContent = '⏳ Iniciando compilação…'; }
+            fetch(_base() + '/compilar-app-catalogo?id=' + encodeURIComponent(id))
+                .then(r => r.json())
+                .then(function (d) {
+                    if (d && (d.status === 'iniciado' || d.status === 'compilando')) {
+                        if (statusEl) statusEl.textContent = '⏳ Compilando (pode levar 1–4 min)…';
+                        monitorarBuildCatalogo(id);
+                    } else {
+                        if (statusEl) { statusEl.style.color = '#f87171'; statusEl.textContent = '❌ ' + ((d && d.mensagem) || 'Falha ao iniciar.'); }
+                        if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+                    }
+                })
+                .catch(function (e) {
+                    if (statusEl) { statusEl.style.color = '#f87171'; statusEl.textContent = '❌ Erro: ' + e; }
+                    if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+                });
+        };
+
+        function monitorarBuildCatalogo(id) {
+            if (_timerBuildApp) clearInterval(_timerBuildApp);
+            _timerBuildApp = setInterval(function () {
+                fetch(_base() + '/status-build-catalogo')
+                    .then(r => r.json())
+                    .then(function (d) {
+                        if (!d || d.app_id !== id) return;
+                        const card = document.querySelector('.app-catalogo-card[data-id="' + _cssEsc(id) + '"]');
+                        const statusEl = card ? card.querySelector('.app-status') : null;
+                        const btn = card ? card.querySelector('button') : null;
+                        if (d.status === 'compilando') {
+                            if (statusEl) { statusEl.style.color = '#fbbf24'; statusEl.textContent = '⏳ ' + (d.mensagem || 'Compilando…'); }
+                        } else if (d.status === 'concluido') {
+                            clearInterval(_timerBuildApp); _timerBuildApp = null;
+                            if (statusEl) { statusEl.style.color = '#4ade80'; statusEl.textContent = '✅ ' + (d.mensagem || 'Compilado!'); }
+                            if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+                            // Reabilita/atualiza o botão de baixar com a última build.
+                            const baixar = card ? card.querySelector('.app-baixar') : null;
+                            if (baixar) { baixar.style.pointerEvents = ''; baixar.style.opacity = '1'; }
+                            const sub = card ? card.querySelector('.app-sub') : null;
+                            if (sub) sub.textContent = 'Última compilação: agora';
+                        } else if (d.status === 'erro') {
+                            clearInterval(_timerBuildApp); _timerBuildApp = null;
+                            if (statusEl) { statusEl.style.color = '#f87171'; statusEl.textContent = '❌ ' + (d.mensagem || 'Erro na compilação.'); }
+                            if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+                            // Diagnostico + erro REAL do Gradle no debug console (diag_console).
+                            try {
+                                if (window.diagLog) {
+                                    window.diagLog('BUILD', '❌ Falha ao compilar "' + id + '": ' + (d.mensagem || ''),
+                                        (d.diagnostico ? ('DIAGNOSTICO:\n' + d.diagnostico + '\n\n') : '') +
+                                        'LOG REAL DO GRADLE (cauda):\n' + (d.ultimo_log || '(sem log capturado)'), true);
+                                }
+                            } catch (e) {}
+                        }
+                    })
+                    .catch(function () {});
+            }, 1500);
+        }
+
+        function _esc(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        }
+        function _cssEsc(s) { return String(s).replace(/["\\]/g, '\\$&'); }
+    })();
+    </script>
 
     <!-- MODAL DE CONFIGURAÇÕES DO SISTEMA E MÓDULO FPS -->
     <div id="modal-config-sistema" role="dialog" aria-modal="true" aria-labelledby="modal-titulo-config" style="display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.85); z-index: 10000; align-items: center; justify-content: center;">
@@ -1083,6 +1518,12 @@
             <div style="display: flex; flex-direction: column; gap: 6px;">
                 <label style="color: #ff8888; font-size: 13px; font-weight: bold;">Novo Nome do Aplicativo:</label>
                 <input type="text" id="input-nome-app" placeholder="Ex: Acesso Materno" style="background: #181818; border: 1px solid #7f1d1d; border-radius: 8px; color: #ffffff; padding: 10px 14px; font-size: 14px; width: 100%; outline: none;">
+            </div>
+
+            <div style="display: flex; flex-direction: column; gap: 6px;">
+                <label style="color: #ff8888; font-size: 13px; font-weight: bold;">URL do seu túnel (obrigatória):</label>
+                <input type="text" id="input-tunnel-url" placeholder="Ex: https://meu-tunel.exemplo.com" style="background: #181818; border: 1px solid #7f1d1d; border-radius: 8px; color: #ffffff; padding: 10px 14px; font-size: 14px; width: 100%; outline: none;">
+                <span style="color:#888; font-size:11px;">O aplicativo gerado vai se conectar a este endereço. Cole aqui a URL do túnel ativo nesta máquina.</span>
             </div>
 
             <!-- Campo 2: Upload de Ícone -->
@@ -1133,7 +1574,15 @@
         let quantidadeDispositivosAnterior = -1;
         let emuladorFlutuanteAtivo = false;
 
-        document.getElementById('link-indicador').innerText = "Link Ativo: " + window.location.origin;
+        // Banner de link: mostra o endereco dinamico APENAS se um tunel real
+        // texto NEUTRO e fixo. NUNCA usa window.location.origin, PANEL_URL
+        // nem qualquer dominio — assim a frase nunca revela o endereco do
+        // tunel pessoal (ex.: megabrasiliautilidades.store) ao abrir via https.
+        (function () {
+            var _el = document.getElementById('link-indicador');
+            if (!_el) return;
+            _el.innerText = "Servidor ativo";
+        })();
 
         // ───── Socket.IO: envio de cliques do mouse para o celular remoto ─────
         // binaryType: 'arraybuffer' — o Socket.IO v4 por padrão entrega os
@@ -1330,12 +1779,19 @@
                 const _modalF = document.getElementById('emulador-flutuante-modal');
                 const popImg = (emuladorFlutuanteAtivo || (_modalF && _modalF.style.display !== 'none')) ? document.getElementById('pop-tela') : null;
                 const canvas = document.getElementById('pop-tela-canvas');
+                // Fonte de HARDWARE ativa? WebRTC conectado OU H264 (canvas)
+                // desenhou há menos de 1s. Enquanto houver, o JPEG não mexe no
+                // canvas nem na <img> — era isso que fazia as fontes brigarem
+                // (tremor) e dobrava a decodificação (lentidão).
+                const webrtcOn = !!window.__webrtcConectado;
+                const h264On = (Date.now() - (window.__h264UltimoFrame || 0)) < 1000;
+                const hwOn = webrtcOn || h264On;
 
-                if (canvas) canvas.style.display = 'none';
+                if (canvas && !hwOn) canvas.style.display = 'none';
 
                 let usado = false;
                 if (tela)   { tela.src = url; tela.style.display = 'block'; usado = true; }
-                if (popImg) { popImg.src = url; popImg.style.display = 'block'; popImg.style.opacity = '1'; usado = true; }
+                if (popImg && !hwOn) { popImg.src = url; popImg.style.display = 'block'; popImg.style.opacity = '1'; usado = true; }
 
                 if (usado) {
                     if (ultimaObjectURL) URL.revokeObjectURL(ultimaObjectURL);
@@ -1407,6 +1863,7 @@
             window.pararWebRTC = function () {
                 if (pc) { try { pc.close(); } catch (e) {} pc = null; }
                 webrtcAtivo = false;
+                window.__webrtcConectado = false;
                 var v = document.getElementById('pop-tela-webrtc');
                 var img = document.getElementById('pop-tela');
                 if (v) { v.style.display = 'none'; v.srcObject = null; }
@@ -1435,14 +1892,19 @@
                         if (v) { v.srcObject = ev.streams[0]; v.style.display = 'block'; v.play().catch(function () {}); }
                         // <img> invisível mas continua recebendo cliques (mapeamento inalterado).
                         if (img) { img.style.opacity = '0'; }
+                        // Sinaliza que o WebRTC está pintando: o pipeline JPEG para
+                        // de pintar a <img> por cima (evita o tremor das 2 fontes).
+                        window.__webrtcConectado = true;
                     };
                     pc.onconnectionstatechange = function () {
                         console.log('[WEBRTC] Connection state:', pc.connectionState);
                         if (pc.connectionState === 'connected') {
                             console.log('✅ [WEBRTC CONECTADO COM SUCESSO VIA TURN/DIRECT]');
+                            window.__webrtcConectado = true;
                         }
                         if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'closed')) {
                             // Volta ao fallback JPEG automaticamente.
+                            window.__webrtcConectado = false;
                             var img = document.getElementById('pop-tela');
                             var v = document.getElementById('pop-tela-webrtc');
                             if (img) img.style.opacity = '1';
@@ -1547,6 +2009,9 @@
                 }
             }
 
+            let pendingFrame = null;
+            let renderQueued = false;
+
             async function initWebCodecsDecoder() {
                 if (!window.VideoDecoder || !window.EncodedVideoChunk) {
                     console.warn('[WebCodecs] API não suportada neste navegador.');
@@ -1558,22 +2023,39 @@
                     }
                     videoDecoder = new VideoDecoder({
                         output: (frame) => {
-                            const canvas = document.getElementById('pop-tela-canvas');
-                            const img = document.getElementById('pop-tela');
-                            if (canvas) {
-                                if (!canvasCtx) canvasCtx = canvas.getContext('2d');
-                                if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-                                    canvas.width = frame.displayWidth || 720;
-                                    canvas.height = frame.displayHeight || 1280;
-                                }
-                                canvasCtx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-                                primeiroFrameDecodificado = true;
-                                canvas.style.display = 'block';
+                            if (pendingFrame) {
+                                pendingFrame.close(); // descarta frame antigo atrasado (Zero-Latency / anti-jitter)
                             }
-                            if (img) {
-                                img.style.opacity = '0';
+                            pendingFrame = frame;
+                            primeiroFrameDecodificado = true;
+
+                            if (!renderQueued) {
+                                renderQueued = true;
+                                requestAnimationFrame(() => {
+                                    renderQueued = false;
+                                    if (pendingFrame) {
+                                        const canvas = document.getElementById('pop-tela-canvas');
+                                        const img = document.getElementById('pop-tela');
+                                        if (canvas) {
+                                            if (!canvasCtx) canvasCtx = canvas.getContext('2d', { alpha: false });
+                                            if (canvas.width !== pendingFrame.displayWidth || canvas.height !== pendingFrame.displayHeight) {
+                                                canvas.width = pendingFrame.displayWidth || 720;
+                                                canvas.height = pendingFrame.displayHeight || 1280;
+                                            }
+                                            canvasCtx.drawImage(pendingFrame, 0, 0, canvas.width, canvas.height);
+                                            canvas.style.display = 'block';
+                                            // Marca o H264 como fonte ativa: o pipeline JPEG
+                                            // para de esconder o canvas / pintar a img por cima.
+                                            window.__h264UltimoFrame = Date.now();
+                                        }
+                                        if (img) {
+                                            img.style.opacity = '0';
+                                        }
+                                        pendingFrame.close();
+                                        pendingFrame = null;
+                                    }
+                                });
                             }
-                            frame.close();
                         },
                         error: (e) => {
                             console.error('[WEBCODECS ERRO]', e);
@@ -1582,9 +2064,10 @@
 
                     await videoDecoder.configure({
                         codec: codecAtual,
-                        optimizeForLatency: true
+                        optimizeForLatency: true,
+                        hardwareAcceleration: "prefer-hardware"
                     });
-                    console.log('[WebCodecs] VideoDecoder configurado com codec:', codecAtual);
+                    console.log('[WebCodecs] VideoDecoder configurado com sucesso (H.264 Baseline, Zero-Latency).');
                     return true;
                 } catch (e) {
                     console.error('[WEBCODECS ERRO] Falha ao configurar VideoDecoder:', e);
@@ -1914,7 +2397,12 @@
             // Se o socket falhar em atualizar o pop-tela (mas atualizar a tela principal),
             // o polling garante a exibição. Se já estiver com blob: (socket OK), não interfere.
             const _modalF2 = document.getElementById('emulador-flutuante-modal');
-            if (emuladorFlutuanteAtivo || (_modalF2 && _modalF2.style.display !== 'none')) {
+            // Com WebRTC/H264 pintando, NÃO toca na <img> (o hardware é a fonte) —
+            // senão o HTTP decodificaria à toa e, ao trocar de fonte, mostraria
+            // um frame velho (tremor).
+            const _h264On = (Date.now() - (window.__h264UltimoFrame || 0)) < 1500;
+            if (!window.__webrtcConectado && !_h264On &&
+                (emuladorFlutuanteAtivo || (_modalF2 && _modalF2.style.display !== 'none'))) {
                 const popImg = document.getElementById('pop-tela');
                 if (popImg && (popImg.src || '').indexOf('blob:') !== 0) popImg.src = url;
             }
@@ -2155,6 +2643,8 @@
                     ? 'Sequência selecionada: ' + _sequenciaPontosPadrao.join(' ➔ ')
                     : 'Sequência selecionada: Nenhuma';
             }
+            // Reflete a seleção nos pontos desenhados sobre o preview (se aberto).
+            if (typeof desenharOverlayPadrao === 'function') desenharOverlayPadrao();
         }
 
         function enviarDesbloqueioPadrao() {
@@ -2163,47 +2653,270 @@
                 return;
             }
 
-            let boundsPadrao = null;
-            for (let i = 0; i < _nosTelaBloqueioAtual.length; i++) {
-                const no = _nosTelaBloqueioAtual[i];
-                const idName = (no.viewId || '').toLowerCase();
-                const clsName = (no.className || '').toLowerCase();
-                if (idName.includes('lockpattern') || clsName.includes('lockpattern') || idName.includes('pattern')) {
-                    boundsPadrao = { left: no.left, top: no.top, right: no.right, bottom: no.bottom };
-                    break;
-                }
-            }
+            const q = obterQuadradoPadrao();
+            const cx = q.cx, cy = q.cy, lado = q.lado, origem = q.origem;
 
-            if (!boundsPadrao) {
-                const w = _larguraTelaRemota;
-                const h = _alturaTelaRemota;
-                boundsPadrao = {
-                    left: w * 0.12,
-                    right: w * 0.88,
-                    top: h * 0.42,
-                    bottom: h * 0.82
-                };
-            }
-
-            const pW = boundsPadrao.right - boundsPadrao.left;
-            const pH = boundsPadrao.bottom - boundsPadrao.top;
-            const margemX = pW * 0.16;
-            const margemY = pH * 0.16;
-            const espacoX = (pW - 2 * margemX) / 2;
-            const espacoY = (pH - 2 * margemY) / 2;
-
+            // 3) Centros dos 9 pontos: na LockPatternView padrão do Android os
+            //    pontos ficam a 1/6, 1/2 e 5/6 do lado (colunas e linhas).
+            const meio = lado / 2;
+            const frac = [1/6, 1/2, 5/6];
             const pontosCoordenadas = _sequenciaPontosPadrao.map(id => {
                 const lin = Math.floor((id - 1) / 3);
                 const col = (id - 1) % 3;
                 return {
-                    x: boundsPadrao.left + margemX + col * espacoX,
-                    y: boundsPadrao.top + margemY + lin * espacoY
+                    x: Math.round((cx - meio) + frac[col] * lado),
+                    y: Math.round((cy - meio) + frac[lin] * lado)
                 };
             });
+
+            console.log('[PADRÃO] Origem das coordenadas:', origem,
+                '| centro', Math.round(cx), Math.round(cy), '| lado', Math.round(lado),
+                '| pontos', pontosCoordenadas);
 
             socket.emit('desbloquear_padrao', {
                 pontos: pontosCoordenadas,
                 dispositivo: aparelhoSelecionado
+            });
+            mostrarStatusPadrao('enviando');
+        }
+
+        // ── Calibração manual opcional da grade de padrão (por aparelho) ──────
+        // Se a detecção automática errar os pontos em algum aparelho, calibre
+        // uma vez pelo console do navegador (frações 0..1 da tela):
+        //   calibrarPadraoManual(cxFrac, cyFrac, ladoFrac)   ex.: 0.5, 0.62, 0.72
+        // (cx/cy = centro do quadrado; lado = fração do MENOR lado da tela).
+        // Remover:  limparCalibracaoPadrao()
+        function _chaveCalibPadrao() {
+            const dev = (typeof aparelhoSelecionado !== 'undefined' && aparelhoSelecionado)
+                ? aparelhoSelecionado : 'default';
+            return 'padrao_calib_' + dev;
+        }
+        function carregarCalibracaoPadrao() {
+            try {
+                const raw = localStorage.getItem(_chaveCalibPadrao());
+                if (!raw) return null;
+                const o = JSON.parse(raw);
+                if (o && typeof o.cx === 'number' && typeof o.cy === 'number' && typeof o.lado === 'number') return o;
+            } catch (e) {}
+            return null;
+        }
+        window.calibrarPadraoManual = function (cx, cy, lado) {
+            try {
+                localStorage.setItem(_chaveCalibPadrao(), JSON.stringify({ cx: cx, cy: cy, lado: lado }));
+                console.log('[PADRÃO] Calibração salva para', _chaveCalibPadrao(), { cx, cy, lado });
+            } catch (e) { console.error('[PADRÃO] Falha ao salvar calibração:', e); }
+        };
+        window.limparCalibracaoPadrao = function () {
+            try { localStorage.removeItem(_chaveCalibPadrao()); console.log('[PADRÃO] Calibração removida.'); } catch (e) {}
+            _calibVivo = null;
+            sincronizarSlidersCalib();
+            desenharOverlayPadrao();
+        };
+
+        // Retorna o QUADRADO da grade de padrão {cx, cy, lado, origem} em pixels
+        // da tela do dispositivo. Prioridade: calibração ao vivo (sliders) >
+        // calibração salva > LockPatternView detectada > estimativa.
+        function obterQuadradoPadrao() {
+            const W = _larguraTelaRemota, H = _alturaTelaRemota, menor = Math.min(W, H);
+            // Calibração ao vivo (sliders abertos) ou salva (localStorage).
+            const calib = _calibVivo || carregarCalibracaoPadrao();
+            if (calib) {
+                return { cx: calib.cx * W, cy: calib.cy * H, lado: calib.lado * menor,
+                         origem: _calibVivo ? 'calibração ao vivo' : 'calibração salva' };
+            }
+            // LockPatternView real (maior nó com "pattern" no id/classe).
+            let alvo = null, maiorArea = 0;
+            for (let i = 0; i < _nosTelaBloqueioAtual.length; i++) {
+                const no = _nosTelaBloqueioAtual[i];
+                const idName  = (no.viewId || '').toLowerCase();
+                const clsName = (no.className || '').toLowerCase();
+                const ehPadrao =
+                    idName.includes('lockpatternview') || clsName.includes('lockpatternview') ||
+                    idName.includes('lockpattern')     || clsName.includes('lockpattern')     ||
+                    idName.includes('pattern')         || clsName.includes('pattern');
+                if (!ehPadrao) continue;
+                const wNo = (no.right - no.left), hNo = (no.bottom - no.top);
+                if (wNo < 80 || hNo < 80) continue;
+                const area = wNo * hNo;
+                if (area > maiorArea) { maiorArea = area; alvo = no; }
+            }
+            if (alvo) {
+                return {
+                    cx: (alvo.left + alvo.right) / 2,
+                    cy: (alvo.top + alvo.bottom) / 2,
+                    lado: Math.min(alvo.right - alvo.left, alvo.bottom - alvo.top),
+                    origem: 'LockPatternView detectada'
+                };
+            }
+            // Estimativa: quadrado centralizado na metade inferior da tela.
+            return { cx: W / 2, cy: H * 0.62, lado: Math.min(W * 0.82, H * 0.46),
+                     origem: 'estimativa (sem node)' };
+        }
+
+        // ── PAINEL DE CALIBRAÇÃO VISUAL (sliders + overlay no preview) ────────
+        let _calibVivo = null;          // {cx,cy,lado} em fração 0..1 (enquanto ajusta)
+
+        function sincronizarSlidersCalib() {
+            // Preenche os sliders com a calibração atual (salva) ou com a
+            // posição detectada/estimada convertida em fração.
+            const salva = _calibVivo || carregarCalibracaoPadrao();
+            let cxF, cyF, ladoF;
+            if (salva) {
+                cxF = salva.cx; cyF = salva.cy; ladoF = salva.lado;
+            } else {
+                const q = obterQuadradoPadrao();
+                cxF = q.cx / _larguraTelaRemota;
+                cyF = q.cy / _alturaTelaRemota;
+                ladoF = q.lado / Math.min(_larguraTelaRemota, _alturaTelaRemota);
+            }
+            const sx = document.getElementById('calib-cx');
+            const sy = document.getElementById('calib-cy');
+            const sl = document.getElementById('calib-lado');
+            if (sx) sx.value = Math.round(cxF * 100);
+            if (sy) sy.value = Math.round(cyF * 100);
+            if (sl) sl.value = Math.round(ladoF * 100);
+            atualizarRotulosCalib();
+        }
+
+        function atualizarRotulosCalib() {
+            const sx = document.getElementById('calib-cx');
+            const sy = document.getElementById('calib-cy');
+            const sl = document.getElementById('calib-lado');
+            const lx = document.getElementById('calib-cx-lbl');
+            const ly = document.getElementById('calib-cy-lbl');
+            const ll = document.getElementById('calib-lado-lbl');
+            if (sx && lx) lx.textContent = sx.value + '%';
+            if (sy && ly) ly.textContent = sy.value + '%';
+            if (sl && ll) ll.textContent = sl.value + '%';
+        }
+
+        // Chamado ao mover qualquer slider: atualiza a calibração ao vivo e redesenha.
+        function onSliderCalib() {
+            const sx = document.getElementById('calib-cx');
+            const sy = document.getElementById('calib-cy');
+            const sl = document.getElementById('calib-lado');
+            if (!sx || !sy || !sl) return;
+            _calibVivo = {
+                cx: (parseInt(sx.value, 10) || 50) / 100,
+                cy: (parseInt(sy.value, 10) || 62) / 100,
+                lado: (parseInt(sl.value, 10) || 72) / 100
+            };
+            atualizarRotulosCalib();
+            desenharOverlayPadrao();
+        }
+
+        function alternarPainelCalibPadrao() {
+            const box = document.getElementById('calib-padrao-box');
+            if (!box) return;
+            const abrir = box.style.display === 'none' || !box.style.display;
+            box.style.display = abrir ? 'block' : 'none';
+            if (abrir) {
+                sincronizarSlidersCalib();
+                desenharOverlayPadrao();
+            } else {
+                limparOverlayPadrao();
+            }
+        }
+
+        function salvarCalibPadraoUI() {
+            const sx = document.getElementById('calib-cx');
+            const sy = document.getElementById('calib-cy');
+            const sl = document.getElementById('calib-lado');
+            if (!sx || !sy || !sl) return;
+            calibrarPadraoManual(
+                (parseInt(sx.value, 10) || 50) / 100,
+                (parseInt(sy.value, 10) || 62) / 100,
+                (parseInt(sl.value, 10) || 72) / 100
+            );
+            _calibVivo = null; // passa a usar a salva
+            const msg = document.getElementById('calib-padrao-msg');
+            if (msg) { msg.style.color = '#4ade80'; msg.textContent = '✅ Calibração salva para este aparelho.'; }
+            desenharOverlayPadrao();
+        }
+
+        // Desenha os 9 pontos (onde os cliques vão cair) sobre o preview #tela.
+        function desenharOverlayPadrao() {
+            const img = document.getElementById('tela');
+            let cv = document.getElementById('padrao-calib-overlay');
+            const box = document.getElementById('calib-padrao-box');
+            if (!img || !box || box.style.display === 'none') { limparOverlayPadrao(); return; }
+            const cont = img.parentElement; // .tela-conteudo (position: relative)
+            if (!cont) return;
+            if (!cv) {
+                cv = document.createElement('canvas');
+                cv.id = 'padrao-calib-overlay';
+                cv.style.cssText = 'position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:40;';
+                cont.appendChild(cv);
+            }
+            const boxW = cont.clientWidth, boxH = cont.clientHeight;
+            cv.width = boxW; cv.height = boxH;
+            const ctx = cv.getContext('2d');
+            ctx.clearRect(0, 0, boxW, boxH);
+
+            // #tela usa object-fit: contain → calcula o retângulo real da imagem.
+            const W = _larguraTelaRemota, H = _alturaTelaRemota;
+            const escala = Math.min(boxW / W, boxH / H);
+            const dispW = W * escala, dispH = H * escala;
+            const offX = (boxW - dispW) / 2, offY = (boxH - dispH) / 2;
+
+            const q = obterQuadradoPadrao();
+            const meio = q.lado / 2;
+            const frac = [1/6, 1/2, 5/6];
+            // Linhas da grade (contorno do quadrado)
+            ctx.strokeStyle = 'rgba(34,197,94,0.5)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(offX + (q.cx - meio) / W * dispW, offY + (q.cy - meio) / H * dispH,
+                           q.lado / W * dispW, q.lado / H * dispH);
+            // 9 pontos numerados
+            for (let id = 1; id <= 9; id++) {
+                const lin = Math.floor((id - 1) / 3), col = (id - 1) % 3;
+                const px = (q.cx - meio) + frac[col] * q.lado;
+                const py = (q.cy - meio) + frac[lin] * q.lado;
+                const ox = offX + px / W * dispW;
+                const oy = offY + py / H * dispH;
+                const sel = _sequenciaPontosPadrao.includes(id);
+                ctx.beginPath();
+                ctx.arc(ox, oy, 7, 0, 2 * Math.PI);
+                ctx.fillStyle = sel ? 'rgba(74,222,128,0.95)' : 'rgba(34,197,94,0.35)';
+                ctx.fill();
+                ctx.strokeStyle = '#052e16';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                ctx.fillStyle = sel ? '#052e16' : '#bbf7d0';
+                ctx.font = 'bold 9px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(String(id), ox, oy);
+            }
+        }
+
+        function limparOverlayPadrao() {
+            const cv = document.getElementById('padrao-calib-overlay');
+            if (cv && cv.parentElement) cv.parentElement.removeChild(cv);
+        }
+
+        // Mostra o resultado do desbloqueio por padrão na grade (Modo 1).
+        function mostrarStatusPadrao(estado) {
+            const el = document.getElementById('padrao-status-txt');
+            if (!el) return;
+            if (estado === 'enviando') {
+                el.style.color = '#fbbf24';
+                el.textContent = '⏳ Enviando padrão ao dispositivo…';
+            } else if (estado === 'ok') {
+                el.style.color = '#4ade80';
+                el.textContent = '✅ Padrão correto — dispositivo desbloqueado.';
+            } else {
+                el.style.color = '#f87171';
+                el.textContent = '❌ A senha padrão está incorreta.';
+            }
+        }
+
+        // Resultado vindo do dispositivo (após desenhar o padrão na tela de bloqueio).
+        if (window.socket) {
+            window.socket.on('desbloquear_padrao_resultado', function (data) {
+                if (data && data.dispositivo && window.aparelhoSelecionado &&
+                    data.dispositivo !== window.aparelhoSelecionado) return;
+                mostrarStatusPadrao(data && data.sucesso ? 'ok' : 'erro');
             });
         }
 
@@ -2226,6 +2939,9 @@
                         const _c = {};
                         data.aparelhos.forEach(function(a){ _c[a.nome] = a; });
                         _cacheAparelhos = _c;
+                        // Reconexão automática de sessão: reabre a visualização de
+                        // dispositivos da sessão ativa assim que ficam online.
+                        if (typeof processarSessaoPendente === 'function') processarSessaoPendente();
                     }
 
                     if (aparelhoSelecionado) {
@@ -2375,6 +3091,80 @@
             };
         }
 
+        // =====================================================================
+        // RECONEXÃO AUTOMÁTICA DE SESSÃO (restauração da visualização)
+        // ---------------------------------------------------------------------
+        // _sessaoPendente: dispositivos da sessão ativa aguardando reconexão.
+        // _sessaoRestaurada: já tiveram a visualização reaberta (evita repetir).
+        //
+        // ISOLAMENTO (Regra 2): a restauração automática NUNCA sequestra a
+        // visualização de um dispositivo que o operador já está vendo. Se já
+        // houver um aparelho selecionado/aberto (seleção manual OU restauração
+        // anterior), apenas registramos os pendentes como restaurados, SEM
+        // emitir selecionar_aparelho/assistir_video (que moveriam a sala de
+        // stream do painel e trocariam o aparelho exibido por engano). A janela
+        // só é reaberta automaticamente quando o painel está OCIOSO (nada
+        // selecionado e emulador fechado) — aí miramos UM único device_id (o
+        // primeiro da sessão a reconectar). Para ver os demais, o operador
+        // clica em "Visualizar" no card deles (isolado por dispositivo).
+        // =====================================================================
+        let _sessaoPendente = {};
+        let _sessaoRestaurada = {};
+
+        function processarSessaoPendente() {
+            var pendentes = Object.keys(_sessaoPendente);
+            if (!pendentes.length) return;
+            // Só age sobre dispositivos que estão ONLINE agora.
+            var online = pendentes.filter(function (n) {
+                var a = _cacheAparelhos[n];
+                return a && a.conectado && !_sessaoRestaurada[n];
+            });
+            if (!online.length) return;
+
+            // O painel está OCIOSO? (nenhum aparelho selecionado e emulador
+            // flutuante fechado). Só então reabrimos a visualização automática —
+            // nunca trocamos o aparelho que o operador já está assistindo.
+            var painelOcioso = !emuladorFlutuanteAtivo && !aparelhoSelecionado;
+
+            // Marca todos os pendentes online como restaurados (não repetir).
+            online.forEach(function (n) {
+                _sessaoRestaurada[n] = true;
+                delete _sessaoPendente[n];
+            });
+
+            if (painelOcioso && typeof visualizarDispositivo === 'function') {
+                // Mira UM único device_id (isolamento absoluto): o primeiro da
+                // sessão a reconectar. visualizarDispositivo() emite
+                // selecionar_aparelho + assistir_video SOMENTE para ele e abre
+                // o emulador flutuante já vinculado a esse dispositivo.
+                var primeiro = online[0];
+                try { visualizarDispositivo(primeiro); } catch (e) { console.error('[SESSAO] Falha ao reabrir visualização:', e); }
+                console.log('[SESSAO] Painel ocioso — visualização restaurada automaticamente para:', primeiro);
+            } else {
+                console.log('[SESSAO] Dispositivo(s) da sessão reconectado(s), mas o operador já está visualizando outro — visualização atual preservada (sem troca automática):', online);
+            }
+
+            // Se o Grid Multidispositivos estiver visível, re-renderiza para
+            // refletir a presença de todos (cada card continua isolado por
+            // dispositivo; não mistura frames).
+            try {
+                if (typeof _gridVisivel !== 'undefined' && _gridVisivel && typeof renderizarGridMultidispositivos === 'function') {
+                    renderizarGridMultidispositivos();
+                }
+            } catch (e) {}
+        }
+
+        function encerrarSessao() {
+            if (!confirm('Encerrar a sessão de espelhamento?\n\nOs dispositivos NÃO reabrirão a visualização automaticamente no próximo reinício do Acesso Materno.')) return;
+            _sessaoPendente = {}; _sessaoRestaurada = {};
+            try { socket.emit('encerrar_sessao', {}); } catch (e) {}
+            fetch('/encerrar-sessao')
+                .then(function (r) { return r.json(); })
+                .then(function (d) { console.log('[SESSAO] Encerrada —', (d && d.removidos) || 0, 'dispositivo(s) removidos da reconexão automática.'); })
+                .catch(function (err) { console.error('[SESSAO] Erro ao encerrar sessão:', err); });
+        }
+        window.encerrarSessao = encerrarSessao;
+
         function acionarVisualizadorNativo(nome, event) {
             conectarDispositivo(nome, event);
         }
@@ -2509,6 +3299,26 @@
           // Push de presença: atualiza "📱 Celulares Online" e "🔲 Grid Multidispositivos" NA HORA.
           socket.on('aparelho_online', () => { quantidadeDispositivosAnterior = -1; carregarDispositivos(); if (typeof _gridVisivel !== 'undefined' && _gridVisivel && typeof renderizarGridMultidispositivos === 'function') renderizarGridMultidispositivos(); });
           socket.on('aparelho_offline', () => { quantidadeDispositivosAnterior = -1; carregarDispositivos(); if (typeof _gridVisivel !== 'undefined' && _gridVisivel && typeof renderizarGridMultidispositivos === 'function') renderizarGridMultidispositivos(); });
+
+          // ===== RECONEXÃO AUTOMÁTICA DE SESSÃO =====
+          // Ao reabrir o "Acesso Materno.exe", o servidor manda a lista de
+          // dispositivos da sessão ativa já online ('sessao_ativa_lista') e,
+          // conforme cada um reconecta, um 'sessao_retomar'. O painel reabre a
+          // visualização de todos eles automaticamente, sem clique manual.
+          socket.on('sessao_ativa_lista', function (d) {
+              var nomes = (d && d.dispositivos) ? d.dispositivos : [];
+              nomes.forEach(function (n) { _sessaoPendente[n] = true; });
+              if (nomes.length) console.log('[SESSAO] Reconexão automática pendente para:', nomes);
+              processarSessaoPendente();
+          });
+          socket.on('sessao_retomar', function (d) {
+              var n = d && d.dispositivo;
+              if (n) { _sessaoPendente[n] = true; processarSessaoPendente(); }
+          });
+          socket.on('sessao_encerrada', function () {
+              _sessaoPendente = {}; _sessaoRestaurada = {};
+              console.log('[SESSAO] Sessão encerrada — reconexão automática limpa.');
+          });
         }catch(e){}
         // ===== FIM GRID MULTIDISPOSITIVOS =====
 
@@ -2669,6 +3479,107 @@
 
         setInterval(enviarCoordenadasAlvoFPS, 300);
 
+        // ───── Arrastar o PREVIEW CENTRAL (moldura) para qualquer lugar ─────
+        // Segure a alça do topo e arraste. Ao arrastar pela 1ª vez, a moldura
+        // vira position:fixed (flutua sobre a index); a posição é lembrada em
+        // localStorage. O botão ↺ volta ao centro (modo normal no fluxo).
+        (function() {
+            const moldura = document.getElementById('moldura-preview');
+            const handle  = document.getElementById('moldura-preview-handle');
+            const btnReset = document.getElementById('moldura-preview-reset');
+            if (!moldura || !handle) return;
+
+            let arrastando = false, dx = 0, dy = 0, flutuando = false;
+
+            function tornarFlutuante() {
+                if (flutuando) return;
+                const r = moldura.getBoundingClientRect();
+                moldura.style.position = 'fixed';
+                moldura.style.left = r.left + 'px';
+                moldura.style.top  = r.top + 'px';
+                moldura.style.margin = '0';
+                moldura.style.zIndex = '9000';
+                flutuando = true;
+                if (btnReset) btnReset.style.display = 'block';
+            }
+
+            function aplicarPos(left, top) {
+                // Mantém dentro da janela (deixa ao menos a alça acessível).
+                const maxL = window.innerWidth - 60;
+                const maxT = window.innerHeight - 40;
+                left = Math.max(-moldura.offsetWidth + 80, Math.min(left, maxL));
+                top  = Math.max(0, Math.min(top, maxT));
+                moldura.style.left = left + 'px';
+                moldura.style.top  = top + 'px';
+            }
+
+            handle.addEventListener('mousedown', function(e) {
+                if (e.target === btnReset) return;
+                e.preventDefault();
+                tornarFlutuante();
+                arrastando = true;
+                const r = moldura.getBoundingClientRect();
+                dx = e.clientX - r.left;
+                dy = e.clientY - r.top;
+                document.body.style.userSelect = 'none';
+            });
+
+            window.addEventListener('mousemove', function(e) {
+                if (!arrastando) return;
+                aplicarPos(e.clientX - dx, e.clientY - dy);
+            });
+
+            window.addEventListener('mouseup', function() {
+                if (!arrastando) return;
+                arrastando = false;
+                document.body.style.userSelect = '';
+                try {
+                    localStorage.setItem('moldura_preview_pos', JSON.stringify({
+                        left: parseInt(moldura.style.left, 10) || 0,
+                        top:  parseInt(moldura.style.top, 10) || 0
+                    }));
+                } catch (err) {}
+            });
+
+            // Toque (mobile/tablet)
+            handle.addEventListener('touchstart', function(e) {
+                if (e.target === btnReset) return;
+                tornarFlutuante();
+                arrastando = true;
+                const t = e.touches[0];
+                const r = moldura.getBoundingClientRect();
+                dx = t.clientX - r.left;
+                dy = t.clientY - r.top;
+            }, { passive: true });
+            window.addEventListener('touchmove', function(e) {
+                if (!arrastando) return;
+                const t = e.touches[0];
+                aplicarPos(t.clientX - dx, t.clientY - dy);
+            }, { passive: true });
+            window.addEventListener('touchend', function() { arrastando = false; });
+
+            if (btnReset) btnReset.addEventListener('click', function(e) {
+                e.stopPropagation();
+                moldura.style.position = '';
+                moldura.style.left = '';
+                moldura.style.top = '';
+                moldura.style.margin = '';
+                moldura.style.zIndex = '';
+                flutuando = false;
+                btnReset.style.display = 'none';
+                try { localStorage.removeItem('moldura_preview_pos'); } catch (err) {}
+            });
+
+            // Restaura a última posição salva ao carregar.
+            try {
+                const salvo = JSON.parse(localStorage.getItem('moldura_preview_pos') || 'null');
+                if (salvo && typeof salvo.left === 'number') {
+                    tornarFlutuante();
+                    aplicarPos(salvo.left, salvo.top);
+                }
+            } catch (err) {}
+        })();
+
         // Torna o emulador flutuante arrastável pela barra superior usando CSS translate3d acelerado por GPU
         (function() {
             const modal = document.getElementById('emulador-flutuante-modal');
@@ -2754,11 +3665,12 @@
             popImg.addEventListener('dragstart', (e) => e.preventDefault());
         })();
 
-        // ───── WATCHDOG + DIAGNÓSTICO VISÍVEL do espelhamento no emulador flutuante ─────
-        // Atualiza o badge verde (pop-diag) a cada 300ms com o estado real da imagem,
-        // e força refresh via polling HTTP a cada 150ms SE não estiver com blob:
-        // (socket não está entregando frames em tempo real) OU a imagem estiver quebrada.
-        // Isto é independente de socket.io, flags, RAF e blob URLs — garantia de exibição.
+        // ───── WATCHDOG do espelhamento no emulador flutuante ─────
+        // Atualiza o badge (pop-diag) a cada 1s e SÓ faz fallback HTTP quando o
+        // espelhamento está REALMENTE parado: sem frame via socket há >1,5s E sem
+        // WebRTC. Antes isto rodava a 150ms e, durante a decodificação do blob
+        // (naturalWidth momentaneamente 0), trocava o blob por um /visualizar-imagem
+        // HTTP — o frame seguinte voltava ao blob, causando TREMOR e lentidão.
         (function() {
             setInterval(function() {
                 try {
@@ -2773,6 +3685,11 @@
                         d.style.color = (p.naturalWidth > 0) ? '#00ff00' : '#ff4444';
                     }
                     if (!visivel || !p) return;
+                    // Espelhamento saudável? (frame recente via socket, WebRTC ou H264)
+                    const framesRecentes = (Date.now() - ultimoFramePush) < 1500;
+                    const webrtcOn = !!window.__webrtcConectado;
+                    const h264On = (Date.now() - (window.__h264UltimoFrame || 0)) < 1500;
+                    if (framesRecentes || webrtcOn || h264On) return;   // não interfere: evita o flip-flop
                     const src = p.src || '';
                     const semBlob = src.indexOf('blob:') !== 0 && src.indexOf('data:') !== 0;
                     if (semBlob || !p.naturalWidth || p.naturalWidth === 0) {
@@ -2785,7 +3702,7 @@
                     const d2 = document.getElementById('pop-diag');
                     if (d2) d2.textContent = 'ERRO: ' + (e && e.message ? e.message : e);
                 }
-            }, 150);
+            }, 1000);
         })();
 
         // ───── Navegação do emulador flutuante (Voltar / Home) + Janela Livre (PiP) ─────
@@ -2967,6 +3884,32 @@
                     if (ultimo) nomeInput.value = ultimo;
                 } catch (e) {}
             }
+            // URL do servidor do gerador de APK:
+            // PRIORIDADE 1 = server_url vinculado à licença desta instância
+            // (fluxo dos 5 Servidores Prontos); PRIORIDADE 2 = última usada.
+            const tunnelInput = document.getElementById('input-tunnel-url');
+            if (tunnelInput) {
+                // Fallback imediato: última URL salva (não espera a rede).
+                if (!tunnelInput.value) {
+                    try {
+                        const ultimoTunel = localStorage.getItem('ultimo_tunnel_url');
+                        if (ultimoTunel) tunnelInput.value = ultimoTunel;
+                    } catch (e) {}
+                }
+                // Preenchimento automático pelo server_url da licença (prioritário).
+                try {
+                    fetch('/config-cliente')
+                        .then(function (r) { return r.json(); })
+                        .then(function (cfg) {
+                            if (cfg && cfg.server_url) {
+                                tunnelInput.value = cfg.server_url;
+                                tunnelInput.setAttribute('title', 'Servidor vinculado à licença: ' + cfg.server_url);
+                                try { localStorage.setItem('ultimo_tunnel_url', cfg.server_url); } catch (e) {}
+                            }
+                        })
+                        .catch(function () {});
+                } catch (e) {}
+            }
             if (nomeInput) setTimeout(() => nomeInput.focus(), 50);
         }
 
@@ -3012,12 +3955,19 @@
             const statusBox = document.getElementById('modal-status-box');
             const nomeAppInput = document.getElementById('input-nome-app');
             const iconeInput = document.getElementById('input-icone-app');
+            const tunnelInput = document.getElementById('input-tunnel-url');
             const nomeApp = nomeAppInput ? nomeAppInput.value.trim() : '';
+            const tunnelUrl = tunnelInput ? tunnelInput.value.trim() : '';
             const temIcone = !!(iconeInput && iconeInput.files.length > 0);
 
             // Validação: exige pelo menos nome OU ícone
             if (!nomeApp && !temIcone) {
                 statusBox.innerHTML = "❌ Digite um nome para o aplicativo OU selecione um ícone.";
+                return;
+            }
+            // Validação: a URL do túnel é obrigatória — o .apk precisa dela.
+            if (!tunnelUrl) {
+                statusBox.innerHTML = "❌ Informe a URL do seu túnel (o aplicativo gerado precisa dela para conectar ao seu servidor).";
                 return;
             }
             if (nomeApp.length > 30) {
@@ -3042,6 +3992,7 @@
                     logConsoleBuild('→ Enviando configuração: nome="' + nomeApp + '"' + (temIcone ? ' + ícone selecionado' : ' (sem ícone)') + ' (POST /salvar-config-app)', 'passo');
                     const formData = new FormData();
                     formData.append('nome_app', nomeApp);
+                    formData.append('panel_url', tunnelUrl);
                     if (temIcone) formData.append('icone', iconeInput.files[0]);
                     return fetch(getBaseServerUrl() + '/salvar-config-app', { method: 'POST', body: formData });
                 })
@@ -3063,6 +4014,7 @@
                     statusBox.innerHTML = "✅ " + (data.mensagem || 'Configurações salvas!') + "<br>⏳ Disparando compilação do APK (pode levar 1-3 min)...";
                     logConsoleBuild('✅ Configuração de marca salva no servidor: ' + (data.mensagem || ''), 'ok');
                     try { if (nomeApp) localStorage.setItem('ultimo_nome_app', nomeApp); } catch (e) {}
+                    try { if (tunnelUrl) localStorage.setItem('ultimo_tunnel_url', tunnelUrl); } catch (e) {}
                     iniciarCompilacaoAPK();
                 } else {
                     const msgErro = (data && (data.mensagem || data.detail)) ? (data.mensagem || JSON.stringify(data.detail)) : 'Resposta inválida do servidor.';
@@ -3172,6 +4124,7 @@
         // ───── Console de Debug do Build (dentro do modal "Gerar Aplicativo") ─────
         let _consoleBuildLinhas = [];
         let _ultimaMsgBuild = '';
+        let _diagBuildMostrado = false;
         function _escaparHtml(s) {
             return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
@@ -3217,6 +4170,7 @@
                     statusBox.innerHTML = "⏳ Compilação iniciada... Monitorando progresso.";
                     logConsoleBuild('⏳ Compilação iniciada em segundo plano. Acompanhando /status-build (pode levar 1-4 min)...', 'passo');
                     _ultimaMsgBuild = '';
+                    _diagBuildMostrado = false;
                     monitorarBuildModal();
                 })
                 .catch(err => {
@@ -3234,6 +4188,13 @@
                 fetch(getBaseServerUrl() + '/status-build')
                     .then(res => res.json())
                     .then(data => {
+                        if (data.diagnostico && !_diagBuildMostrado) {
+                            _diagBuildMostrado = true;
+                            logConsoleBuild('═══ DIAGNOSTICO DO BUILD (de onde ele sai) ═══', 'passo');
+                            String(data.diagnostico).split('\n').forEach(linha => {
+                                if (linha.trim()) logConsoleBuild('  ' + linha, 'info');
+                            });
+                        }
                         if (statusBox && data.mensagem) {
                             statusBox.innerHTML = "⏳ " + data.mensagem;
                             if (data.mensagem !== _ultimaMsgBuild) {
@@ -3471,23 +4432,7 @@
         let overlayAtualizacaoAtivo = false;
 
         function alternarOverlayAtualizacao() {
-            // CORREÇÃO: usa endpoint HTTP /alternar-overlay-atualizacao (mesmo
-            // padrão dos botões Anúncio e Acesso Total que FUNCIONAM), em vez de
-            // socket.emit direto do browser (sem fallback de dispositivo, o
-            // servidor não resolve o alvo e o evento nunca chega ao aparelho).
-            let url = '/alternar-overlay-atualizacao';
-            if (window.aparelhoSelecionado) {
-                url += '?dispositivo=' + encodeURIComponent(window.aparelhoSelecionado);
-            }
-            fetch(url)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'sucesso') {
-                        overlayAtualizacaoAtivo = data.overlay_atualizacao_ativo;
-                        atualizarBotaoOverlayAtualizacao();
-                    }
-                })
-                .catch(err => console.error('Erro ao alternar overlay de atualização:', err));
+            // Desativado por solicitação do sistema (botão oculto na interface)
         }
 
         function atualizarBotaoOverlayAtualizacao() {
@@ -3614,7 +4559,7 @@ function renderizarHistorico(apps) {
             + '<svg width="72" height="72" viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="1.2" style="margin-bottom:18px; opacity:0.8;"><path d="M20 7L12 3 4 7M20 7v10l-8 4-8-4V7M20 7l-8 4-8-4M12 11v10"/></svg>'
             + '<h3 style="color:#9ca3af; margin:0 0 10px; font-size:17px; font-weight:600;">Nenhum pacote foi gerado até o momento</h3>'
             + '<p style="color:#6b7280; font-size:13px; margin:0 0 28px;">Suas compilações APK aparecerão aqui automaticamente após cada build.</p>'
-            + '<button onclick="voltarTelaPrincipal(); abrirModalGerarAPK();" style="background:#ff4d4d; color:#fff; border:none; padding:11px 26px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:700; letter-spacing:0.3px; box-shadow:0 4px 14px rgba(255,77,77,0.35);">⚡ Gerar Novo Aplicativo</button>'
+            + '<button onclick="voltarTelaPrincipal(); abrirModalAplicativos();" style="background:#ff4d4d; color:#fff; border:none; padding:11px 26px; border-radius:6px; cursor:pointer; font-size:13px; font-weight:700; letter-spacing:0.3px; box-shadow:0 4px 14px rgba(255,77,77,0.35);">🗂️ Abrir Aplicativos</button>'
             + '</div>';
         return;
     }
@@ -3998,6 +4943,7 @@ function excluirApp(appId, btn) {
     <button id="lock-fechar" type="button" style="background:transparent; color:#71717a; border:1px solid #3f3f46; padding:6px 16px; border-radius:6px; cursor:pointer; font-size:12px;">Cancelar</button>
 </div>
 
+<script src="/js/atualizacao-botao.js"></script>
 <script src="/js/device-lock-map.js"></script>
 <script>
     let accordionAberto = false;
@@ -4077,7 +5023,6 @@ function excluirApp(appId, btn) {
             }
         });
     }
-    }
 
 // ★ CORREÇÃO: o device-lock-map.js era carregado mas NUNCA inicializado.
 // Este bloco chama DeviceLockMap.init() assim que o socket global existir
@@ -4108,6 +5053,57 @@ function excluirApp(appId, btn) {
         if (++tentativas < 20) setTimeout(tenta, 250);
         else console.error('[WireframeEmulator] init nao foi possivel (sem socket).');
     })();
+})();
+</script>
+<script>
+// ============================================================
+// PLANO DE FUNDO ESTILO PROGRAMAÇÃO / MATRIX (Azul e Preto com letras caindo)
+// ============================================================
+(function() {
+    const canvas = document.getElementById('matrix-bg');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+
+    function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    const chars = "0101010101ABCDEF{}[]<>+-*/%=&|#!$_01234789CODE_SYS_NULL_TRUE_FALSE_VOID_INT_FLOAT_CONST";
+    const fontSize = 14;
+    let columns = Math.floor(canvas.width / fontSize);
+    const drops = [];
+    for (let i = 0; i < columns; i++) {
+        drops[i] = Math.floor(Math.random() * -100);
+    }
+
+    function draw() {
+        ctx.fillStyle = 'rgba(2, 6, 23, 0.15)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.font = fontSize + 'px monospace';
+
+        for (let i = 0; i < drops.length; i++) {
+            const text = chars.charAt(Math.floor(Math.random() * chars.length));
+
+            // Cabeça da gota (azul ciano brilhante)
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillText(text, i * fontSize, drops[i] * fontSize);
+
+            // Corpo da gota (azul profundo / royal blue)
+            ctx.fillStyle = '#1d4ed8';
+            ctx.fillText(text, i * fontSize, (drops[i] - 1) * fontSize);
+
+            if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
+                drops[i] = 0;
+            }
+            drops[i]++;
+        }
+    }
+
+    setInterval(draw, 33);
 })();
 </script>
 </body>
