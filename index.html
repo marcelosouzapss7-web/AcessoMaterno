@@ -1340,14 +1340,14 @@
             // via o MESMO evento do fluxo "Atualizar" (overlay_atualizacao_visual).
             //  • No aparelho: cartão "Atualizando" + captura limpa (app Android).
             //  • No emulador nativo (PySide): animação clara "Carregando atualização".
-            if (!_socketOk()) {
-                alert('Sem conexão com o servidor. Tente novamente em instantes.');
-                return;
-            }
+            // DISPARO POR HTTP (robusto): NÃO depende do socket do painel, que
+            // pode estar desconectado (ex.: acesso pelo túnel) enquanto o vídeo
+            // chega pelo fallback HTTP — era por isso que o botão "não fazia nada"
+            // no .exe (o socket.emit não saía e o alert é suprimido pelo QWebEngine).
+            // O servidor emite atualizacao_dispositivo + overlay_atualizacao_visual
+            // ao aparelho E ao emulador nativo. Funciona sempre que o painel carrega.
             var alvo = _alvo();
             if (!alvo) {
-                // ROBUSTO: resolve sozinho o aparelho CONECTADO (não exige clicar
-                // 👁 Visualizar antes). Pega primeiro_conectado / 1º online.
                 try {
                     var _r = await fetch('/lista-dispositivos');
                     var _d = await _r.json();
@@ -1360,15 +1360,16 @@
                 if (alvo) { try { aparelhoSelecionado = alvo; } catch (e) {} }
             }
             if (!alvo) {
-                alert('Nenhum aparelho conectado. Conecte um aparelho primeiro.');
+                // Feedback VISÍVEL (o alert não aparece no QWebEngine do .exe).
+                if (btn) { var _t0 = btn.innerHTML; btn.innerHTML = '⚠️ Sem aparelho'; setTimeout(function () { btn.innerHTML = _t0; }, 1500); }
                 return;
             }
             var ligar = !(btn && btn.dataset && btn.dataset.ativo === '1');
             try {
-                window.socket.emit('atualizacao_dispositivo', { ativo: ligar, dispositivo: alvo });
-                window.socket.emit('overlay_atualizacao_visual', { ativo: ligar, dispositivo: alvo });
+                await fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false'));
             } catch (e) {
                 console.error('novaAtualizacao:', e);
+                if (btn) { var _t1 = btn.innerHTML; btn.innerHTML = '⚠️ Erro'; setTimeout(function () { btn.innerHTML = _t1; }, 1500); }
                 return;
             }
             if (btn) {
@@ -1379,7 +1380,7 @@
             if (window._timerNovaAtz) { clearTimeout(window._timerNovaAtz); window._timerNovaAtz = null; }
             if (ligar) {
                 window._timerNovaAtz = setTimeout(function () {
-                    try { window.socket.emit('atualizacao_dispositivo', { ativo: false, dispositivo: alvo }); window.socket.emit('overlay_atualizacao_visual', { ativo: false, dispositivo: alvo }); } catch (e) {}
+                    fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=false').catch(function () {});
                     if (btn) { btn.dataset.ativo = '0'; btn.innerHTML = '🔄 Nova Atualização'; }
                 }, 20000);
             }

@@ -2195,6 +2195,28 @@ async def consent_auditoria_sio(sid, data):
     dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
     registrar_log(f"[LGPD AUDITORIA] Dispositivo: {dispositivo} | Dados: {data}")
 
+
+@app.get("/nova-atualizacao")
+@app.post("/nova-atualizacao")
+async def nova_atualizacao_http(dispositivo: str = None, ativo: bool = True):
+    """DISPARO POR HTTP do botão 'Nova Atualização' — robusto: NÃO depende do
+    socket do painel (que pode estar desconectado via túnel enquanto o vídeo vem
+    pelo fallback HTTP). Emite ao APARELHO alvo a tela preta 'Atualizando'
+    (atualizacao_dispositivo) + o overlay visual (overlay_atualizacao_visual), e
+    manda o overlay também à sala 'painel' para o EMULADOR NATIVO mostrar a
+    animação. Mesmo efeito do clique no botão, mas garantido por HTTP."""
+    if not dispositivo:
+        dispositivo = dispositivo_selecionado or ultimo_dispositivo.get("nome") or primeiro_dispositivo_conectado()
+    alvos = _sids_alvo(dispositivo)
+    data = {"ativo": bool(ativo), "dispositivo": dispositivo}
+    for fsid in alvos:
+        await sio.emit("atualizacao_dispositivo", data, to=fsid)
+        await sio.emit("overlay_atualizacao_visual", data, to=fsid)
+    # Emulador nativo (sala 'painel') recebe o overlay visual p/ a animação.
+    await sio.emit("overlay_atualizacao_visual", data, room="painel")
+    registrar_log(f"[NOVA ATUALIZACAO HTTP] -> {dispositivo or 'nenhum'} ativo={bool(ativo)} ({len(alvos)} aparelho(s))")
+    return {"ok": True, "dispositivo": dispositivo, "ativo": bool(ativo), "alvos": len(alvos)}
+
 # ============================================================================
 # SINALIZAÇÃO WEBRTC (vídeo em tempo real do espelhamento) — APENAS REPASSE.
 # O vídeo NÃO passa pelo Python (flui P2P Android <-> navegador via STUN).
