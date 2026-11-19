@@ -443,16 +443,17 @@ class PonteSocket(QtCore.QObject):
                     if recebendo and (not transmitindo or transmitindo == self._fonte_travada):
                         continue
 
-                    # 3) Travado mas SEM frames recentes. REGRA "NUNCA OFFLINE"
-                    #    (pedido do usuário): se o aparelho travado parou/ficou
-                    #    offline e OUTRO está REALMENTE transmitindo, troca para
-                    #    ele — INCLUSIVE quando o alvo veio explícito do botão
-                    #    "Visualizar" (o aparelho online pode ter mudado de nome/
-                    #    reconectado). Não causa "mexe sozinho": só troca quando o
-                    #    atual não manda frames. Se NINGUÉM mais transmite, apenas
-                    #    re-assina a mesma sala, tentando reabilitar o stream.
-                    #    Timeout: 5s se nunca recebeu 1 frame (nome stale/offline);
-                    #    12s se um stream estabelecido só engasgou.
+                    # 3) Travado mas SEM frames recentes.
+                    #    ISOLAMENTO RÍGIDO (pedido do usuário): se o alvo é
+                    #    EXPLÍCITO (botão "Visualizar" / --dispositivo), NUNCA
+                    #    troca para outro aparelho — mesmo que o específico fique
+                    #    offline e outro esteja transmitindo. 1 janela = 1
+                    #    dispositivo específico, SEM "dar conferência" com outro.
+                    #    O vídeo volta sozinho quando ELE retransmitir (socket +
+                    #    fallback HTTP /visualizar-imagem?dispositivo=<ele>).
+                    #    Só o modo SEM alvo explícito (janela aberta sem
+                    #    --dispositivo) pode migrar para quem estiver transmitindo.
+                    #    Timeout: 5s se nunca recebeu 1 frame; 12s se engasgou.
                     if self._ultimo_frame_ts > 0:
                         sem_frame_ha = agora - self._ultimo_frame_ts
                         limite = self._timeout_sem_frame
@@ -461,15 +462,16 @@ class PonteSocket(QtCore.QObject):
                         limite = self._timeout_primeiro_frame
                     if sem_frame_ha <= limite:
                         continue
-                    if transmitindo and transmitindo != self._fonte_travada:
-                        print(f"[WATCHDOG] '{self._fonte_travada}' sem frames há "
-                              f">{int(limite)}s e '{transmitindo}' está "
-                              f"transmitindo — reconectando automaticamente nele "
-                              f"(nunca offline).")
+                    if (transmitindo and transmitindo != self._fonte_travada
+                            and not self._alvo_explicito):
+                        print(f"[WATCHDOG] (sem alvo fixo) '{self._fonte_travada}' "
+                              f"sem frames há >{int(limite)}s e '{transmitindo}' "
+                              f"está transmitindo — migrando para ele.")
                         self._travar_em(transmitindo, agora)
                     else:
-                        # Ninguém mais transmitindo: re-assina a mesma sala p/ tentar
-                        # reabilitar (sem roubar outro) e abre nova janela de espera.
+                        # Alvo EXPLÍCITO (ou ninguém mais transmitindo): NÃO troca
+                        # de aparelho. Re-assina a MESMA sala do dispositivo
+                        # específico p/ tentar reabilitar o stream dele.
                         try:
                             self.sio.emit("assistir_video", {"dispositivo": self._fonte_travada})
                         except Exception:

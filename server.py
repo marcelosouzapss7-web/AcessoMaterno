@@ -654,6 +654,54 @@ except Exception:
     _DIRETORIO_SERVIDOR = os.getcwd()
 PASTA_HISTORICO = os.path.join(_DIRETORIO_SERVIDOR, "apps_gerados")
 
+# ---------------------------------------------------------------------------
+# ÚLTIMO APK PERSISTENTE (sobrevive a fechar/reabrir o .exe E a um .exe NOVO).
+# A pasta de saída do Gradle (app/build/outputs/...) é limpa a cada build e,
+# no .exe, nem fica dentro do bundle (_internal) — por isso o botão "Baixar
+# última" perdia o APK e exigia recompilar. Aqui guardamos uma CÓPIA do último
+# APK compilado na PASTA DO USUÁRIO (fora do bundle), que nenhum rebuild ou
+# .exe novo apaga. O download e o "tem_build" caem nela quando a saída do
+# Gradle não existe. Diretório: ~/AcessoMaterno_APKs.
+# ---------------------------------------------------------------------------
+PASTA_APKS_PERSISTENTE = os.path.join(os.path.expanduser("~"), "AcessoMaterno_APKs")
+
+def _persistir_ultimo_apk(apk_path, chave="ultimo"):
+    """Copia o APK recém-compilado para ~/AcessoMaterno_APKs como <chave>.apk e
+    SEMPRE também como ultimo.apk. Retorna o caminho de ultimo.apk ou None."""
+    try:
+        if not apk_path or not os.path.exists(apk_path):
+            return None
+        os.makedirs(PASTA_APKS_PERSISTENTE, exist_ok=True)
+        destinos = {os.path.join(PASTA_APKS_PERSISTENTE, "ultimo.apk")}
+        if chave and str(chave) != "ultimo":
+            safe = re.sub(r'[^\w\-.]+', '', str(chave)) or "app"
+            destinos.add(os.path.join(PASTA_APKS_PERSISTENTE, safe + ".apk"))
+        for d in destinos:
+            shutil.copy2(apk_path, d)
+        registrar_log(f"[APK PERSISTENTE] Último APK salvo em {PASTA_APKS_PERSISTENTE} (chave={chave}).")
+        return os.path.join(PASTA_APKS_PERSISTENTE, "ultimo.apk")
+    except Exception as e:
+        try:
+            registrar_log(f"[APK PERSISTENTE] falha ao salvar: {e}")
+        except Exception:
+            pass
+        return None
+
+def _apk_persistente(chave=None):
+    """Caminho do APK persistente de `chave` (ou do ultimo.apk geral), se existir."""
+    try:
+        if chave:
+            safe = re.sub(r'[^\w\-.]+', '', str(chave)) or "app"
+            p = os.path.join(PASTA_APKS_PERSISTENTE, safe + ".apk")
+            if os.path.exists(p):
+                return p
+        p = os.path.join(PASTA_APKS_PERSISTENTE, "ultimo.apk")
+        if os.path.exists(p):
+            return p
+    except Exception:
+        pass
+    return None
+
 
 def _porta_esta_livre(porta):
     import socket as _s
@@ -1559,6 +1607,39 @@ def sessao_dispositivos_online():
 
 # Carrega a sessão ativa NO BOOT (antes de qualquer conexão).
 _carregar_sessao_ativa()
+
+# ---------------------------------------------------------------------------
+# POSIÇÕES DOS CARTÕES DO PAINEL (persistência em disco).
+# O painel salva onde o usuário arrastou cada cartão (Controles Rápidos,
+# Acessos, Celulares Online). Guardar em disco faz a posição SOBREVIVER a
+# fechar/reabrir o .exe — o localStorage sozinho pode ser limpo pelo WebView
+# e varia por origem (localhost vs túnel). Formato: {chave: {left, top}}.
+# ---------------------------------------------------------------------------
+_ARQUIVO_POSICOES_CARTOES = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "posicoes_cartoes.json")
+
+def _ler_posicoes_cartoes():
+    import json
+    try:
+        if os.path.exists(_ARQUIVO_POSICOES_CARTOES):
+            with open(_ARQUIVO_POSICOES_CARTOES, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _gravar_posicoes_cartoes(d):
+    import json
+    try:
+        tmp = _ARQUIVO_POSICOES_CARTOES + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(d, ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _ARQUIVO_POSICOES_CARTOES)  # atômico (mesmo filesystem)
+    except Exception as e:
+        registrar_log(f"[POSICOES CARTOES] não foi possível salvar: {e}")
 
 # Carrega o server_url da licença do cliente (fluxo dos 5 Servidores Prontos).
 _carregar_config_licenca_cliente()
@@ -4982,6 +5063,10 @@ def compilar_apk_em_segundo_plano():
         mensagem=f"Concluido! Aplicativo '{_nome_app_build}' gerado com sucesso (nome e icone do modal aplicados). Suporte Motor embutido e icone oculto. (servidor: {_url_apk})",
         apk=apk,
     )
+    # Cópia persistente (fora do bundle) do último APK — sobrevive a fechar/
+    # reabrir o .exe e a um .exe novo, para o botão "Baixar última" nunca ficar
+    # sem APK e não exigir recompilar toda vez.
+    _persistir_ultimo_apk(apk)
     try:
         _arquivar_build(apk, _nome_app_build, _ultima_config_app.get("icone_bytes"))
     except Exception as e_hist:
@@ -5522,6 +5607,7 @@ def _compilar_catalogo_com_marca(app_id):
     _salvar_catalogo(lista)
     estado_build_catalogo.update(status="concluido", apk=apk_destino, app_id=app_id,
                                  mensagem=f"'{nome}' compilado com sucesso.")
+    _persistir_ultimo_apk(apk_destino, app_id)   # cópia persistente p/ "Baixar última"
     registrar_log(f"[CATALOGO BUILD SUCESSO] '{nome}' (id={app_id}) -> {apk_destino}")
 
 
@@ -5712,28 +5798,35 @@ def apps_catalogo():
             # App CRIADO no painel: APK próprio em apps_catalogo_builds/<id>/.
             apk_rel = a.get("apk")
             apk_abs = os.path.join(_DIRETORIO_SERVIDOR, apk_rel) if apk_rel else None
+            # FALLBACK PERSISTENTE: se a cópia do bundle sumiu (.exe novo), ainda
+            # há o APK salvo em ~/AcessoMaterno_APKs -> botão continua habilitado.
+            tem = bool(apk_abs and os.path.exists(apk_abs)) or bool(_apk_persistente(a.get("id")))
             itens.append({
                 "id": a.get("id"),
                 "nome": a.get("nome", a.get("id")),
                 "icone": bool(a.get("icone")),
-                "tem_build": bool(apk_abs and os.path.exists(apk_abs)),
+                "tem_build": tem,
                 "atualizado_em": a.get("atualizado_em"),
             })
         else:
             # Entrada legada (ex.: giga+): usa a pasta de saída do Gradle.
             pasta = os.path.join(_DIRETORIO_SERVIDOR, a.get("pasta", ""))
             apk = _apk_mais_recente(pasta)
+            # FALLBACK PERSISTENTE: no .exe a pasta do Gradle nem existe no bundle
+            # e é limpa a cada build — cai no último APK salvo em ~/AcessoMaterno_APKs.
+            apk_persist = _apk_persistente(a.get("id"))
+            ref = apk or apk_persist
             atualizado = None
-            if apk:
+            if ref:
                 try:
-                    atualizado = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(apk)))
+                    atualizado = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(ref)))
                 except Exception:
                     atualizado = None
             itens.append({
                 "id": a.get("id"),
                 "nome": a.get("nome", a.get("id")),
                 "icone": False,
-                "tem_build": bool(apk),
+                "tem_build": bool(ref),
                 "atualizado_em": atualizado,
             })
     return {"apps": itens}
@@ -5845,11 +5938,22 @@ def download_apk_catalogo(id: str):
         if apk and os.path.exists(apk):
             return FileResponse(apk, media_type="application/vnd.android.package-archive",
                                 filename=nome + ".apk")
+        # FALLBACK: cópia persistente (sobrevive a .exe novo / pasta limpa).
+        apk_p = _apk_persistente(id)
+        if apk_p:
+            return FileResponse(apk_p, media_type="application/vnd.android.package-archive",
+                                filename=nome + ".apk")
         return {"status": "erro", "mensagem": "Nenhum APK compilado ainda para este app. Clique em Compilar."}
     pasta = os.path.join(_DIRETORIO_SERVIDOR, app_cfg.get("pasta", ""))
     apk = _apk_mais_recente(pasta)
     if apk and os.path.exists(apk):
         return FileResponse(apk, media_type="application/vnd.android.package-archive",
+                            filename=nome + ".apk")
+    # FALLBACK: último APK persistente em ~/AcessoMaterno_APKs (entrada legada no
+    # .exe não tem a pasta do Gradle; e ela é limpa a cada build).
+    apk_p = _apk_persistente(id)
+    if apk_p:
+        return FileResponse(apk_p, media_type="application/vnd.android.package-archive",
                             filename=nome + ".apk")
     return {"status": "erro", "mensagem": "Nenhum APK compilado ainda para este app. Clique em Compilar."}
 
@@ -6148,6 +6252,48 @@ def sessao_ativa_status():
     }
 
 
+@app.get("/posicoes-cartoes")
+def obter_posicoes_cartoes():
+    """Devolve as posições salvas dos cartões arrastáveis do painel (persistidas
+    em disco → sobrevivem a fechar/reabrir o .exe). Formato {chave:{left,top}}."""
+    return _ler_posicoes_cartoes()
+
+
+@app.post("/posicoes-cartoes")
+async def salvar_posicoes_cartoes(request: Request):
+    """Salva a posição de UM cartão ({chave,left,top}) ou substitui o conjunto
+    inteiro ({chave:{left,top},...}). left/top nulos (ou chave sem eles) = reset
+    daquela chave."""
+    try:
+        corpo = await request.json()
+    except Exception:
+        corpo = None
+    if not isinstance(corpo, dict):
+        return {"ok": False, "erro": "payload invalido"}
+    atual = _ler_posicoes_cartoes()
+    chave = corpo.get("chave")
+    if chave:
+        if corpo.get("left") is None or corpo.get("top") is None:
+            atual.pop(chave, None)                      # reset (duplo-clique)
+        else:
+            try:
+                atual[str(chave)] = {"left": int(corpo["left"]),
+                                     "top": int(corpo["top"])}
+            except Exception:
+                return {"ok": False, "erro": "coords invalidas"}
+    else:
+        novo = {}
+        for k, v in corpo.items():
+            if isinstance(v, dict) and "left" in v and "top" in v:
+                try:
+                    novo[str(k)] = {"left": int(v["left"]), "top": int(v["top"])}
+                except Exception:
+                    pass
+        atual = novo
+    _gravar_posicoes_cartoes(atual)
+    return {"ok": True}
+
+
 @app.get("/config-cliente")
 def config_cliente():
     """Expõe ao painel o server_url vinculado à licença desta instância, para o
@@ -6294,6 +6440,12 @@ def download_apk():
     if apk and os.path.exists(apk):
         nome = os.path.basename(apk)
         return FileResponse(apk, media_type="application/vnd.android.package-archive", filename=nome)
+    # FALLBACK: último APK persistente (~/AcessoMaterno_APKs) — sobrevive a
+    # fechar/reabrir o .exe e a um .exe novo, sem recompilar.
+    apk_p = _apk_persistente()
+    if apk_p:
+        return FileResponse(apk_p, media_type="application/vnd.android.package-archive",
+                            filename="app.apk")
     return {"status": "erro", "mensagem": "Nenhum APK gerado ainda. Clique em Gerar Aplicativo."}
 
 

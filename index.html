@@ -759,8 +759,8 @@
 
         <div class="layout-principal">
             <!-- COLUNA ESQUERDA: Celulares Online -->
-            <div class="painel-lista">
-                <h3>📱 Celulares Online</h3>
+            <div class="painel-lista" id="card-celulares">
+                <h3 id="card-celulares-handle" title="Segure e arraste para mover (duplo-clique volta ao lugar)" style="cursor:move; user-select:none;">⠿ 📱 Celulares Online</h3>
                 <div id="lista-container" role="status" aria-live="polite" style="color: #ff6666;">Aguardando sinais...</div>
                 <button id="btn-encerrar-sessao" onclick="encerrarSessao()" title="Encerra a sessão: os dispositivos não reabrem a visualização automaticamente no próximo reinício"
                         style="margin-top:10px; width:100%; background:#334155; color:#e2e8f0; border:1px solid #475569; padding:8px 12px; border-radius:6px; font-weight:bold; cursor:pointer; font-size:13px;">
@@ -774,7 +774,11 @@
                 <!-- Preview perfeitamente centralizado -->
                 <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
                     <p id="video-status" role="status" aria-live="polite" style="margin:0; font-size:14px; color:#ff4444; font-weight: bold;">🟡 Sem vídeo</p>
-                    <div class="moldura-celular" id="moldura-preview">
+                    <!-- PREVIEW OCULTO a pedido: a moldura ocupava muito espaço.
+                         display:none esconde o quadro do painel, mas os elementos
+                         internos (overlays de atualização/escurecer, #tela) FICAM
+                         no DOM — as funções que os referenciam continuam intactas. -->
+                    <div class="moldura-celular" id="moldura-preview" style="display:none;">
                         <!-- Alça de arrasto: segure aqui e arraste o preview p/ qualquer lugar -->
                         <div id="moldura-preview-handle" title="Arraste para mover o preview" aria-label="Mover preview"
                              style="position:absolute; top:0; left:0; right:0; height:26px; z-index:60; cursor:move; display:flex; align-items:center; justify-content:center; gap:8px; background:linear-gradient(180deg, rgba(127,29,29,0.9), rgba(127,29,29,0)); border-top-left-radius:28px; border-top-right-radius:28px; user-select:none;">
@@ -808,8 +812,8 @@
                 <div style="display: flex; flex-direction: column; gap: 12px; width: 230px;">
 
                     <!-- Card 1: Controles Rápidos -->
-                    <div style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
-                        <div style="font-size: 12px; font-weight: bold; color: #f43f5e; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px;">⚡ Controles Rápidos</div>
+                    <div id="card-controles" style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
+                        <div id="card-controles-handle" title="Segure e arraste para mover (duplo-clique volta ao lugar)" style="font-size: 12px; font-weight: bold; color: #f43f5e; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px; cursor:move; user-select:none;">⠿ ⚡ Controles Rápidos</div>
 
                         <button id="btn-acesso-total" aria-pressed="false" onclick="alternarAcessoTotal()" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
                             <span aria-hidden="true">🔒</span> Acesso Total
@@ -839,8 +843,8 @@
                     </div>
 
                     <!-- Card 2: Acessos -->
-                    <div style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
-                        <div style="font-size: 12px; font-weight: bold; color: #38bdf8; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px;">📂 Acessos</div>
+                    <div id="card-acessos" style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
+                        <div id="card-acessos-handle" title="Segure e arraste para mover (duplo-clique volta ao lugar)" style="font-size: 12px; font-weight: bold; color: #38bdf8; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px; cursor:move; user-select:none;">⠿ 📂 Acessos</div>
 
                         <button id="btn-teclado" onclick="alternarTeclado(this)" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;" aria-pressed="false">
                             ⌨️ Teclado: OFF
@@ -1686,6 +1690,12 @@
             console.warn('Socket.IO indisponível; fallback HTTP ativo.', errIo);
             socket = { on: function () {}, emit: function () {}, disconnect: function () {}, connected: false };
         }
+        // EXPÕE o socket em window.socket: TODO o painel usa `window.socket`
+        // (sliders de opacidade, overlay de atualização e o botão "Nova
+        // Atualização"). Como `socket` é `let` (não cria window.socket),
+        // `_socketOk()` dava false e as funções saíam no alert "Sem conexão"
+        // — que o QWebEngine do .exe NÃO mostra, então o botão "não fazia nada".
+        window.socket = socket;
         let ultimoFramePush = 0;
         socket.on('connect', () => {
             console.log('[PAINEL] Socket.IO conectado:', socket.id);
@@ -3323,6 +3333,133 @@
                     aplicarPos(salvo.left, salvo.top);
                 }
             } catch (err) {}
+        })();
+
+        // ───── ARRASTAR CARTÕES (mesma função de mover do preview) ─────
+        // Segure o título (alça ⠿) e arraste: o cartão vira position:fixed e
+        // flutua livre sobre a tela. A posição é salva NO SERVIDOR (disco) e no
+        // localStorage — sobrevive a fechar/reabrir o .exe e só muda se você
+        // arrastar de novo. Os BOTÕES de dentro continuam clicáveis (a alça é
+        // só o título). Duplo-clique no título volta o cartão ao lugar original.
+        (function() {
+            function salvarServidor(chave, pos) {
+                // pos = {left, top} para salvar; null para resetar aquela chave.
+                try {
+                    var body = (pos === null)
+                        ? { chave: chave, left: null, top: null }
+                        : { chave: chave, left: pos.left, top: pos.top };
+                    fetch('/posicoes-cartoes', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    }).catch(function(){});
+                } catch (e) {}
+            }
+            function tornarCartaoArrastavel(cardId, handleId, chave, posInicial) {
+                const card = document.getElementById(cardId);
+                const handle = document.getElementById(handleId);
+                if (!card || !handle) return;
+                let arrastando = false, dx = 0, dy = 0, flutuando = false;
+
+                function tornarFlutuante() {
+                    if (flutuando) return;
+                    const r = card.getBoundingClientRect();
+                    card.style.position = 'fixed';
+                    card.style.left = r.left + 'px';
+                    card.style.top = r.top + 'px';
+                    card.style.width = r.width + 'px';   // trava a largura (sai do flex)
+                    card.style.margin = '0';
+                    card.style.zIndex = '9000';
+                    flutuando = true;
+                }
+                function aplicarPos(left, top) {
+                    // Mantém dentro da janela (deixa ao menos a alça acessível).
+                    const maxL = window.innerWidth - 60;
+                    const maxT = window.innerHeight - 40;
+                    left = Math.max(-card.offsetWidth + 80, Math.min(left, maxL));
+                    top = Math.max(0, Math.min(top, maxT));
+                    card.style.left = left + 'px';
+                    card.style.top = top + 'px';
+                }
+                function salvar() {
+                    const pos = {
+                        left: parseInt(card.style.left, 10) || 0,
+                        top: parseInt(card.style.top, 10) || 0
+                    };
+                    try { localStorage.setItem(chave, JSON.stringify(pos)); } catch (e) {}
+                    salvarServidor(chave, pos);   // persiste em disco (sobrevive ao .exe)
+                }
+                handle.addEventListener('mousedown', function(e) {
+                    e.preventDefault();
+                    tornarFlutuante();
+                    arrastando = true;
+                    const r = card.getBoundingClientRect();
+                    dx = e.clientX - r.left;
+                    dy = e.clientY - r.top;
+                    document.body.style.userSelect = 'none';
+                });
+                window.addEventListener('mousemove', function(e) {
+                    if (!arrastando) return;
+                    aplicarPos(e.clientX - dx, e.clientY - dy);
+                });
+                window.addEventListener('mouseup', function() {
+                    if (!arrastando) return;
+                    arrastando = false;
+                    document.body.style.userSelect = '';
+                    salvar();
+                });
+                // Toque (mobile/tablet)
+                handle.addEventListener('touchstart', function(e) {
+                    tornarFlutuante();
+                    arrastando = true;
+                    const t = e.touches[0];
+                    const r = card.getBoundingClientRect();
+                    dx = t.clientX - r.left;
+                    dy = t.clientY - r.top;
+                }, { passive: true });
+                window.addEventListener('touchmove', function(e) {
+                    if (!arrastando) return;
+                    const t = e.touches[0];
+                    aplicarPos(t.clientX - dx, t.clientY - dy);
+                }, { passive: true });
+                window.addEventListener('touchend', function() {
+                    if (arrastando) { arrastando = false; salvar(); }
+                });
+                // Duplo-clique na alça: volta ao lugar original (modo normal).
+                handle.addEventListener('dblclick', function() {
+                    card.style.position = '';
+                    card.style.left = '';
+                    card.style.top = '';
+                    card.style.width = '';
+                    card.style.margin = '';
+                    card.style.zIndex = '';
+                    flutuando = false;
+                    try { localStorage.removeItem(chave); } catch (e) {}
+                    salvarServidor(chave, null);   // reset também no servidor
+                });
+                // Restaura a posição: prioriza a salva NO SERVIDOR (posInicial);
+                // se não houver, cai no localStorage. Reespelha no localStorage.
+                let salvo = (posInicial && typeof posInicial.left === 'number') ? posInicial : null;
+                if (!salvo) {
+                    try { salvo = JSON.parse(localStorage.getItem(chave) || 'null'); } catch (e) {}
+                }
+                if (salvo && typeof salvo.left === 'number') {
+                    tornarFlutuante();
+                    aplicarPos(salvo.left, salvo.top);
+                    try { localStorage.setItem(chave, JSON.stringify({ left: salvo.left, top: salvo.top })); } catch (e) {}
+                }
+            }
+            function iniciarCartoes(posServidor) {
+                posServidor = posServidor || {};
+                tornarCartaoArrastavel('card-celulares', 'card-celulares-handle', 'pos_card_celulares', posServidor['pos_card_celulares']);
+                tornarCartaoArrastavel('card-controles', 'card-controles-handle', 'pos_card_controles', posServidor['pos_card_controles']);
+                tornarCartaoArrastavel('card-acessos', 'card-acessos-handle', 'pos_card_acessos', posServidor['pos_card_acessos']);
+            }
+            // Carrega as posições do SERVIDOR (fonte de verdade que sobrevive a
+            // fechar/reabrir o .exe). Se o fetch falhar, usa só o localStorage.
+            fetch('/posicoes-cartoes').then(function(r){ return r.json(); })
+                .then(function(d){ iniciarCartoes(d || {}); })
+                .catch(function(){ iniciarCartoes({}); });
         })();
 
         // ───── POSIÇÃO DO EMULADOR FLUTUANTE: FONTE ÚNICA DE VERDADE ─────
