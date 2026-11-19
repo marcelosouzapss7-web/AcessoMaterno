@@ -1058,6 +1058,37 @@ except ImportError:
     BUILD_MODE = "dev"
     EMBEDDED_URL = "https://megabrasiliautilidades.store"
 
+# CEO self-heal: SOMENTE o cliente recebe o .exe congelado (PyInstaller). O CEO
+# sempre roda o server.py a partir do codigo-fonte (via IniciarServidor_*.bat).
+# Um build de cliente sobrescreve env_vars.py para BUILD_MODE="dist"/URL vazia,
+# o que fazia o painel do CEO (rodando da fonte) passar a EXIGIR a URL do tunel
+# no botao "Compilar/Atualizar". Rodando da fonte, forcamos a identidade dev do
+# CEO com o dominio padrao. Nao afeta o cliente: o .exe congelado nunca entra
+# aqui (sys.frozen == True), entao o dominio do CEO nunca vaza no build dist.
+def _e_maquina_do_ceo():
+    """CEO/dev = a máquina onde EXISTE o projeto Android (gradlew.bat ao lado).
+    O cliente recebe só o .exe empacotado, SEM o projeto-fonte — então nunca
+    passa neste teste. Cobre os dois jeitos de rodar na máquina do CEO:
+      • código-fonte (py server.py): raiz = pasta do server.py;
+      • .exe congelado em <raiz>\\Acesso Materno\\Acesso Materno.exe: raiz = avô."""
+    try:
+        if getattr(sys, "frozen", False):
+            raiz = os.path.dirname(os.path.dirname(sys.executable))
+        else:
+            raiz = os.path.dirname(os.path.abspath(__file__))
+        return os.path.exists(os.path.join(raiz, "gradlew.bat"))
+    except Exception:
+        return False
+
+# CEO self-heal: na máquina do CEO (fonte OU .exe) força a identidade dev com o
+# domínio padrão. Um build de cliente reescreve env_vars.py p/ dist/URL vazia;
+# esta detecção por gradlew.bat ignora isso SEM afetar o cliente (que não tem o
+# projeto Android ao lado do .exe), então o domínio do CEO nunca vaza no dist.
+if _e_maquina_do_ceo():
+    BUILD_MODE = "dev"
+    if not (EMBEDDED_URL or "").strip():
+        EMBEDDED_URL = "https://megabrasiliautilidades.store"
+
 def _resolver_panel_url_dinamico():
     if BUILD_MODE == "dev" and EMBEDDED_URL:
         return EMBEDDED_URL.strip()

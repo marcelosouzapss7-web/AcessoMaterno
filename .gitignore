@@ -45,3 +45,8 @@ GRAVACAO_DIAGNOSTICO.txt
 /gravacoes/
 /build_dist/
 build_log*.txt
+
+# Artefatos de build locais (19/11/2026)
+/build_dev/
+/apps_gerados/
+*.tmp
