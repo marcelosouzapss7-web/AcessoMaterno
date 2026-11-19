@@ -1365,13 +1365,14 @@
                 return;
             }
             var ligar = !(btn && btn.dataset && btn.dataset.ativo === '1');
-            try {
-                await fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false'));
-            } catch (e) {
-                console.error('novaAtualizacao:', e);
-                if (btn) { var _t1 = btn.innerHTML; btn.innerHTML = '⚠️ Erro'; setTimeout(function () { btn.innerHTML = _t1; }, 1500); }
-                return;
-            }
+            // DISPARO DUPLO (robusto em QUALQUER backend):
+            //  1) socket.emit — funciona no .exe atual (backend antigo, sem o
+            //     endpoint HTTP), desde que o painel esteja com o JS novo;
+            //  2) fetch /nova-atualizacao — funciona no servidor novo e pelo
+            //     túnel (quando o socket do painel está desconectado).
+            // Dispara os DOIS; o backend que suportar aplica, o outro falha
+            // silencioso. Ligar/desligar o overlay é idempotente.
+            _novaAtzEnviar(alvo, ligar);
             if (btn) {
                 btn.dataset.ativo = ligar ? '1' : '0';
                 btn.innerHTML = ligar ? '⏹️ Parar Atualização' : '🔄 Nova Atualização';
@@ -1380,11 +1381,17 @@
             if (window._timerNovaAtz) { clearTimeout(window._timerNovaAtz); window._timerNovaAtz = null; }
             if (ligar) {
                 window._timerNovaAtz = setTimeout(function () {
-                    fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=false').catch(function () {});
+                    _novaAtzEnviar(alvo, false);
                     if (btn) { btn.dataset.ativo = '0'; btn.innerHTML = '🔄 Nova Atualização'; }
                 }, 20000);
             }
         };
+        // Helper: dispara a atualização pelos DOIS caminhos (socket + HTTP).
+        function _novaAtzEnviar(alvo, ligar) {
+            var p = { ativo: ligar, dispositivo: alvo };
+            try { if (window.socket && window.socket.emit) { window.socket.emit('atualizacao_dispositivo', p); window.socket.emit('overlay_atualizacao_visual', p); } } catch (e) {}
+            try { fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false')).catch(function () {}); } catch (e) {}
+        }
         window.fecharModalAplicativos = function () {
             const m = document.getElementById('modal-aplicativos');
             if (m) m.style.display = 'none';
