@@ -6588,7 +6588,15 @@ def obtener_painel():
     for caminho in candidatos:
         if os.path.exists(caminho):
             with open(caminho, "r", encoding="utf-8") as f:
-                return f.read()
+                # NO-CACHE: o QWebEngine do .exe cacheava o index.html antigo —
+                # correções no painel (ex.: fix do window.socket que fazia o botão
+                # "Nova Atualização" não reagir) não chegavam sem limpar o cache.
+                # Com estes headers o painel SEMPRE carrega a versão mais nova.
+                return HTMLResponse(f.read(), headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                })
 
     return f"<h3>Erro: O arquivo index.html nao foi encontrado em nenhum dos caminhos testados.</h3>"
 
