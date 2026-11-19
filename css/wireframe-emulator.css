@@ -1,0 +1,243 @@
+/* ================================================================
+   EMULADOR WIREFRAME (Leitor de Tela) — css/wireframe-emulator.css
+   ARQUIVO COMPLETO — substitua o conteúdo inteiro de
+   css/wireframe-emulator.css por este.
+   Painel escuro (#181818) com contornos verde neon (#2ecc71),
+   estética de terminal. Independente do resto do painel.
+   ================================================================ */
+
+#wireframe-emulator-panel {
+    display: none;
+    margin: 14px 0;
+    border: 1px solid rgba(46, 204, 113, 0.35);
+    border-radius: 10px;
+    background: #0d0d0d;
+    overflow: hidden;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    color: #e0e0e0;
+}
+#wireframe-emulator-panel.ativo { display: block; }
+
+/* ── Cabeçalho de status ─────────────────────────────────────── */
+.wf-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    background: linear-gradient(90deg, #111814, #0d0d0d);
+    border-bottom: 1px solid rgba(46, 204, 113, 0.25);
+    flex-wrap: wrap;
+}
+.wf-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #2ecc71;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 45%;
+}
+.wf-title .wf-device { color: #a8e6c0; font-weight: 500; }
+
+/* Indicador de status em tempo real */
+.wf-status {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    border: 1px solid #555;
+    color: #888;
+    background: #1a1a1a;
+    white-space: nowrap;
+}
+.wf-status.wf-unlocked {
+    color: #2ecc71;
+    border-color: #2ecc71;
+    background: rgba(46, 204, 113, 0.12);
+    box-shadow: 0 0 8px rgba(46, 204, 113, 0.35);
+}
+.wf-status.wf-locked {
+    color: #f39c12;
+    border-color: #f39c12;
+    background: rgba(243, 156, 18, 0.12);
+    box-shadow: 0 0 8px rgba(243, 156, 18, 0.3);
+}
+.wf-status.wf-off {
+    color: #e74c3c;
+    border-color: #e74c3c;
+    background: rgba(231, 76, 60, 0.12);
+    box-shadow: 0 0 8px rgba(231, 76, 60, 0.3);
+}
+
+.wf-fps-select {
+    background: #1a1a1a;
+    color: #2ecc71;
+    border: 1px solid rgba(46, 204, 113, 0.4);
+    border-radius: 5px;
+    padding: 3px 6px;
+    font-size: 12px;
+    cursor: pointer;
+    outline: none;
+}
+
+/* ── Barra de controles superior ─────────────────────────────── */
+.wf-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: #141414;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    flex-wrap: wrap;
+}
+.wf-btn {
+    background: #1e1e1e;
+    color: #2ecc71;
+    border: 1px solid rgba(46, 204, 113, 0.4);
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+}
+.wf-btn:hover { background: #2ecc71; color: #0d0d0d; }
+.wf-btn.wf-playing { background: #2ecc71; color: #0d0d0d; }
+.wf-btn.wf-zoom { min-width: 30px; }
+.wf-zoom-label { font-size: 11px; color: #888; min-width: 42px; text-align: center; }
+
+/* ── Barra de Tela de Bloqueio (só visível quando bloqueado) ─── */
+.wf-lock-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    background: linear-gradient(90deg, #2a1f0a, #1a1408);
+    border-bottom: 1px solid rgba(243, 156, 18, 0.3);
+    flex-wrap: wrap;
+}
+.wf-lock-btn {
+    color: #f39c12;
+    border-color: rgba(243, 156, 18, 0.5);
+    background: #1e1a10;
+}
+.wf-lock-btn:hover { background: #f39c12; color: #0d0d0d; }
+.wf-lock-btn.wf-auto {
+    color: #2ecc71;
+    border-color: #2ecc71;
+    background: rgba(46, 204, 113, 0.12);
+    font-weight: 700;
+    box-shadow: 0 0 8px rgba(46, 204, 113, 0.3);
+}
+.wf-lock-btn.wf-auto:hover { background: #2ecc71; color: #0d0d0d; }
+.wf-lock-info {
+    font-size: 11px;
+    color: #f0c674;
+    flex: 1;
+    min-width: 140px;
+}
+.wf-pattern-seq {
+    font-family: monospace;
+    font-size: 12px;
+    color: #7dffb0;
+    background: #0a1a10;
+    border: 1px solid rgba(46, 204, 113, 0.3);
+    border-radius: 4px;
+    padding: 3px 8px;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Área do canvas (fundo escuro) + overlay central ─────────── */
+.wf-canvas-wrap {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 10px;
+    background: #181818;
+    max-height: 560px;
+    overflow: auto;
+    position: relative;
+}
+#wireframe-canvas {
+    background: #181818;
+    border: 1px solid rgba(46, 204, 113, 0.3);
+    border-radius: 4px;
+    cursor: crosshair;
+    touch-action: none;
+}
+.wf-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(13, 13, 13, 0.85);
+    color: #2ecc71;
+    border: 1px solid rgba(46, 204, 113, 0.4);
+    border-radius: 8px;
+    padding: 14px 22px;
+    font-size: 13px;
+    font-family: monospace;
+    text-align: center;
+    max-width: 80%;
+    pointer-events: none;
+    box-shadow: 0 0 20px rgba(46, 204, 113, 0.2);
+    display: flex;
+}
+.wf-empty {
+    color: #555;
+    font-size: 12px;
+    padding: 40px 20px;
+    text-align: center;
+}
+
+/* ── Barra inferior de navegação Android ─────────────────────── */
+.wf-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #141414;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    flex-wrap: wrap;
+}
+.wf-nav-btn {
+    background: #1e1e1e;
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 5px;
+    padding: 5px 12px;
+    font-size: 14px;
+    cursor: pointer;
+    min-width: 42px;
+    transition: all 0.15s;
+}
+.wf-nav-btn:hover { background: #2ecc71; color: #0d0d0d; border-color: #2ecc71; }
+.wf-send-text {
+    flex: 1;
+    min-width: 140px;
+    background: #1a1a1a;
+    border: 1px solid rgba(46, 204, 113, 0.3);
+    border-radius: 5px;
+    padding: 5px 8px;
+    color: #e0e0e0;
+    font-size: 12px;
+    outline: none;
+}
+.wf-send-text:focus { border-color: #2ecc71; }
+.wf-send-btn {
+    background: #2ecc71;
+    color: #0d0d0d;
+    border: none;
+    border-radius: 5px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.wf-send-btn:hover { background: #27ae60; }

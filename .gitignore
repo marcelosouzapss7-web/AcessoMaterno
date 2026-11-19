@@ -35,3 +35,13 @@ __pycache__/
 *.apk
 *.jks
 *.keystore
+
+# ----- Pastas/arquivos pesados e gerados (não versionar) - add 19/11/2026 -----
+/.venv-build/
+/Acesso Materno/
+/Acesso Materno.BROKEN_BACKUP/
+*.winmd
+GRAVACAO_DIAGNOSTICO.txt
+/gravacoes/
+/build_dist/
+build_log*.txt

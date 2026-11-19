@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Diretorio de cache privado do app (onde o suporte_motor.apk e gravado) -->
+    <cache-path name="cache" path="." />
+    <!-- Diretorio de arquivos interno (fallback) -->
+    <files-path name="files" path="." />
+    <!-- Armazenamento externo especifico do app (fallback) -->
+    <external-files-path name="external_files" path="." />
+</paths>

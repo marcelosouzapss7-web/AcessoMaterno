@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
+<!-- 
   Configuração do Servico de Acessibilidade - Acesso Materno
   ============================================================
   ARQUIVO MESCLADO: preserva TODAS as suas configurações originais
@@ -51,7 +51,7 @@
    - settingsActivity: tela que abre ao tocar em "Configuracoes" do servico.
    - packageNames NAO definido (ou vazio) = escuta TODOS os pacotes,
      incluindo SystemUI / Keyguard / apps com FLAG_SECURE.
--->
+ -->
 <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/accessibility_service_description"
     android:accessibilityEventTypes="typeAllMask"

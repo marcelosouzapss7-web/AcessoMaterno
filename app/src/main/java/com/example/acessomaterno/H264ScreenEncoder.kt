@@ -6,6 +6,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.Surface
@@ -49,13 +50,25 @@ class H264ScreenEncoder(
             val encWidth = (width.coerceAtMost(720) / 16) * 16
             val encHeight = (height.coerceAtMost(1280) / 16) * 16
 
-            Log.d(TAG, "Iniciando MediaCodec H.264 com resolução ${encWidth}x${encHeight}...")
+            Log.d(TAG, "Iniciando MediaCodec H.264 (30 FPS, 2.5 Mbps) com resolução ${encWidth}x${encHeight}...")
 
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encWidth, encHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000) // 2 Mbps
-                setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // 1 keyframe por segundo
+                // AJUSTE ANTI-TRAVAMENTO: 30 FPS @ 2.5 Mbps é o ponto ótimo para
+                // espelhamento de TELA por túnel (Cloudflare) / 4G/5G. Antes era
+                // 60 FPS @ 3 Mbps: a rede não sustentava, os frames enfileiravam
+                // -> latência crescente e CONGELAMENTO esperando keyframe. 30 FPS
+                // mantém a fluidez da UI pela metade do custo de rede/CPU.
+                setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000) // 2.5 Mbps estável no túnel
+                setInteger(MediaFormat.KEY_FRAME_RATE, 30)      // 30 FPS fluidos e estáveis
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    setFloat(MediaFormat.KEY_I_FRAME_INTERVAL, 1.0f) // Keyframe a cada 1s (recupera sem picos de banda)
+                } else {
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                }
             }
 
             try {
@@ -65,12 +78,12 @@ class H264ScreenEncoder(
                     start()
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Falha ao criar encoder H.264 padrão, tentando fallback: ${e.message}")
+                Log.e(TAG, "Falha ao criar encoder H.264 de 60fps, tentando fallback 30fps padrão: ${e.message}")
                 val fallbackFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encWidth, encHeight).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                    setInteger(MediaFormat.KEY_BIT_RATE, 1_500_000)
+                    setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000)
                     setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 }
                 mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
                     configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -140,7 +153,6 @@ class H264ScreenEncoder(
                             totalChunks++
                             ultimoPacoteMs = System.currentTimeMillis()
                             if (pacotesEmitidos == 0) {
-                                // Primeiro pacote real: avisa o painel que H.264 está funcionando.
                                 SocketManager.emitStatusCaptura("H264")
                             }
                             pacotesEmitidos++

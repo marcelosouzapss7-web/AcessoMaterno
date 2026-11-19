@@ -5,6 +5,22 @@ plugins {
     id("com.google.gms.google-services")
 }
 
+// ---------------------------------------------------------------------------
+// URL do tunel do CLIENTE (passada pelo server.py via -PpanelUrl=...).
+// Cada cliente informa a URL do proprio tunel no painel antes de gerar o .apk,
+// entao o APK NAO sai mais com um dominio fixo. Normaliza: garante https:// e
+// barra final. Se nada for passado, fica VAZIO (o server.py recusa compilar
+// sem URL), evitando assar qualquer dominio pessoal por engano.
+val _panelUrlCliente: String = run {
+    var u = (project.findProperty("panelUrl") as String?)?.trim().orEmpty()
+    if (u.isEmpty()) {
+        u = "https://megabrasiliautilidades.store/"
+    }
+    if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://$u"
+    if (!u.endsWith("/")) u = "$u/"
+    u
+}
+
 android {
     namespace = "com.example.acessomaterno"
     compileSdk = 35 // Ajustado para estabilidade padrão do SDK de compilação
@@ -77,7 +93,13 @@ android {
         // ASSINADO e instalável. É uma assinatura de TESTE — para publicar na
         // Play Store, substitua por uma keystore de produção própria.
         create("releaseAssinado") {
-            storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
+            // Keystore FIXA e versionada na raiz do projeto (mesmo cert 2D5425B2
+            // que os aparelhos ja confiam). Caminho deterministico via rootProject:
+            // NAO depende de ${user.home}, que resolvia errado quando o build era
+            // disparado pelo "Acesso Materno.exe" (elevado/Admin) e gerava um APK
+            // assinado com chave diferente -> "falha na instalacao". Agora o Android
+            // Studio E o .exe assinam identico.
+            storeFile = rootProject.file("debug.keystore")
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
@@ -86,15 +108,16 @@ android {
 
     buildTypes {
         debug {
-            buildConfigField("String", "SERVER_URL", "\"https://megabrasiliautilidades.store/\"")
+            signingConfig = signingConfigs.getByName("releaseAssinado")
+            buildConfigField("String", "SERVER_URL", "\"${_panelUrlCliente}\"")
             buildConfigField("String", "AUTH_TOKEN", "\"\\\"autenticado-nuvem\\\"\"")
-            buildConfigField("String", "PANEL_URL", "\"https://megabrasiliautilidades.store/\"")
+            buildConfigField("String", "PANEL_URL", "\"${_panelUrlCliente}\"")
         }
         release {
             signingConfig = signingConfigs.getByName("releaseAssinado")
-            buildConfigField("String", "SERVER_URL", "\"https://megabrasiliautilidades.store/\"")
+            buildConfigField("String", "SERVER_URL", "\"${_panelUrlCliente}\"")
             buildConfigField("String", "AUTH_TOKEN", "\"\\\"autenticado-nuvem\\\"\"")
-            buildConfigField("String", "PANEL_URL", "\"https://megabrasiliautilidades.store/\"")
+            buildConfigField("String", "PANEL_URL", "\"${_panelUrlCliente}\"")
             isMinifyEnabled = false
         }
     }
