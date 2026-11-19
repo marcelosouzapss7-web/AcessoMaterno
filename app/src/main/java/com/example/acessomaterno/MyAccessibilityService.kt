@@ -841,114 +841,49 @@ class MyAccessibilityService : AccessibilityService() {
                 startY = boundedY
                 pendingX = -1f
                 pendingY = -1f
-                isDispatching = false
-
-                val path = Path().apply { moveTo(boundedX, boundedY); lineTo(boundedX + 1f, boundedY + 1f) }
-                currentStroke = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    GestureDescription.StrokeDescription(path, 0, 50L, true)
-                } else {
-                    GestureDescription.StrokeDescription(path, 0, 50L)
-                }
-                val gesto = GestureDescription.Builder().addStroke(currentStroke!!).build()
-                dispatchGesture(gesto, null, null)
             }
             "MOVE" -> {
                 pendingX = boundedX
                 pendingY = boundedY
-                if (!isDispatching) {
-                    dispararProximoMove()
-                }
             }
             "END" -> {
                 val finalX = if (pendingX >= 0f) pendingX else boundedX
                 val finalY = if (pendingY >= 0f) pendingY else boundedY
 
-                val prev = currentStroke
-                if (prev == null) {
-                    enviarLog("END órfão ignorado (sem START anterior) — anti-ghost.")
-                    restaurarBloqueioLocal()
-                    return
-                }
+                val movido = kotlin.math.abs(finalX - startX) > 5f || kotlin.math.abs(finalY - startY) > 5f
+                val duration = if (movido) 250L else 50L
+
                 val path = Path().apply {
                     moveTo(startX, startY)
                     lineTo(finalX, finalY)
                 }
+
                 try {
-                    val finalStroke = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        prev.continueStroke(path, 0, 30L, false)
-                    } else {
-                        GestureDescription.StrokeDescription(path, 0, 100L)
-                    }
-                    val gesto = GestureDescription.Builder().addStroke(finalStroke).build()
+                    val stroke = GestureDescription.StrokeDescription(path, 0, duration)
+                    val gesto = GestureDescription.Builder().addStroke(stroke).build()
                     val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
                         override fun onCompleted(g: GestureDescription?) {
-                            enviarLog("gesto OK (${finalX.toInt()},${finalY.toInt()})")
+                            enviarLog("toque/gesto OK (${finalX.toInt()},${finalY.toInt()})")
                             restaurarBloqueioLocal()
                         }
                         override fun onCancelled(g: GestureDescription?) {
-                            enviarLog("gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
+                            enviarLog("toque/gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
                             restaurarBloqueioLocal()
                         }
                     }, null)
+
                     if (!aceito) {
                         enviarLog("dispatchGesture recusado em (${finalX.toInt()},${finalY.toInt()})")
                         restaurarBloqueioLocal()
                     }
                 } catch (e: Exception) {
-                    val fallbackPath = Path().apply { moveTo(startX, startY); lineTo(finalX, finalY) }
-                    val stroke = GestureDescription.StrokeDescription(fallbackPath, 0, 100L)
-                    val gesto = GestureDescription.Builder().addStroke(stroke).build()
-                    dispatchGesture(gesto, object : GestureResultCallback() {
-                        override fun onCompleted(g: GestureDescription?) { restaurarBloqueioLocal() }
-                        override fun onCancelled(g: GestureDescription?) { restaurarBloqueioLocal() }
-                    }, null)
+                    enviarLog("Erro ao injetar gesto: ${e.message}")
+                    restaurarBloqueioLocal()
                 }
-                currentStroke = null
+
                 pendingX = -1f
                 pendingY = -1f
-                isDispatching = false
             }
-        }
-    }
-
-    private fun dispararProximoMove() {
-        val prev = currentStroke ?: return
-        if (pendingX < 0f || pendingY < 0f) return
-
-        val targetX = pendingX
-        val targetY = pendingY
-        pendingX = -1f
-        pendingY = -1f
-        isDispatching = true
-
-        val path = Path().apply {
-            moveTo(startX, startY)
-            lineTo(targetX, targetY)
-        }
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                currentStroke = prev.continueStroke(path, 0, 30L, true)
-            }
-            val gesto = GestureDescription.Builder().addStroke(currentStroke!!).build()
-            startX = targetX
-            startY = targetY
-
-            dispatchGesture(gesto, object : GestureResultCallback() {
-                override fun onCompleted(g: GestureDescription?) {
-                    isDispatching = false
-                    if (pendingX >= 0f && pendingY >= 0f) {
-                        dispararProximoMove()
-                    }
-                }
-                override fun onCancelled(g: GestureDescription?) {
-                    isDispatching = false
-                    if (pendingX >= 0f && pendingY >= 0f) {
-                        dispararProximoMove()
-                    }
-                }
-            }, null)
-        } catch (e: Exception) {
-            isDispatching = false
         }
     }
 
@@ -975,7 +910,19 @@ class MyAccessibilityService : AccessibilityService() {
             Log.d(TAG, "Nenhum campo de texto editável focado (tecla ignorada: $tipo/$valor)")
             return
         }
-        val atual = node.text?.toString() ?: ""
+        // TEXTO REAL (ignora o placeholder/dica): num campo de busca VAZIO o
+        // Android devolve em node.text a DICA (hint, ex.: "Pesquisa"), não "".
+        // Sem este tratamento, a 1ª letra digitada virava "Pesquisa"+letra
+        // (a palavra da dica grudava antes do texto). Quando o campo está
+        // mostrando o hint (isShowingHintText) ou node.text == hintText, o
+        // conteúdo real é vazio — começa limpo.
+        val atual = run {
+            val t = node.text?.toString() ?: ""
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val hint = node.hintText?.toString()
+                if (node.isShowingHintText || (hint != null && t == hint)) "" else t
+            } else t
+        }
         when (tipo) {
             "texto" -> definirTexto(node, atual + valor)
             "tecla" -> when (valor.uppercase()) {
@@ -3303,31 +3250,14 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     private fun emitirNotificacaoFallbackMediaProjection() {
+        // Notificação "Toque para reativar monitoramento" DESATIVADA a pedido.
+        // Em vez de emitir, garantimos que qualquer notificação antiga (id 9988)
+        // seja removida para que nada fique aparecendo no topo da tela.
         try {
-            val channelId = "acesso_materno_fallback_mp"
             val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val channel = NotificationChannel(channelId, "Aviso de Monitoramento", NotificationManager.IMPORTANCE_HIGH)
-                nm.createNotificationChannel(channel)
-            }
-            val intent = Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            val pendingIntent = android.app.PendingIntent.getActivity(
-                this, 0, intent,
-                android.app.PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) android.app.PendingIntent.FLAG_IMMUTABLE else 0)
-            )
-            val notif = NotificationCompat.Builder(this, channelId)
-                .setSmallIcon(android.R.drawable.ic_menu_camera)
-                .setContentTitle("Toque para reativar monitoramento")
-                .setContentText("A gravação de segurança precisa de 1 toque para autorizar a captura.")
-                .setPriority(NotificationCompat.PRIORITY_MAX)
-                .setCategory(NotificationCompat.CATEGORY_ALARM)
-                .setContentIntent(pendingIntent)
-                .setAutoCancel(false)
-                .setOngoing(true)
-                .build()
-            nm.notify(9988, notif)
+            nm.cancel(9988)
         } catch (e: Exception) {
-            Log.e(TAG, "Erro ao emitir notificação de fallback do MediaProjection: ${e.message}")
+            Log.e(TAG, "Erro ao cancelar notificação de fallback do MediaProjection: ${e.message}")
         }
     }
 

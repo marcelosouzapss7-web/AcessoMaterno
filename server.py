@@ -1093,6 +1093,13 @@ async def startup_event():
     global loop_principal
     loop_principal = asyncio.get_running_loop()
     registrar_log("[EVENTO] Loop principal AsyncIO inicializado e pronto.")
+    # WATCHDOG do emulador nativo: garante que ele fique ABERTO e espelhando
+    # enquanto um celular transmite (reabre sozinho se a janela for fechada).
+    try:
+        asyncio.create_task(_watchdog_emulador_nativo())
+        registrar_log("[EMU NATIVO] Watchdog de auto-abertura iniciado.")
+    except Exception as _e_wd:
+        registrar_log(f"[EMU NATIVO] Falha ao iniciar watchdog: {_e_wd}")
     try:
         import multipart  # noqa: F401
         registrar_log("[OK] python-multipart disponível (upload de ícone funcionará).")
@@ -1621,6 +1628,12 @@ async def disconnect(sid):
         try:
             if ultimo_dispositivo.get("nome") == nome:
                 ultimo_dispositivo["nome"] = None
+        except Exception:
+            pass
+        # AUTO-INÍCIO: libera o aparelho para re-disparar o emulador nativo
+        # quando ele voltar a transmitir (rec['n'] volta a 1 após a limpeza).
+        try:
+            _emulador_auto_lancado.discard(nome)
         except Exception:
             pass
     if nome:
@@ -2325,6 +2338,13 @@ async def enviar_tela(sid, *args):
     # ao reiniciar o servidor, o painel reabra a visualização dele automaticamente.
     if nome != "global":
         _marcar_sessao(nome)
+
+    # AUTO-INÍCIO DO EMULADOR NATIVO: no 1º frame deste aparelho (nesta execução
+    # do servidor), sobe o emulador nativo já mirando nele. Assim, quando o
+    # celular começa a transmitir, o emulador "começa a receber" sozinho — sem
+    # precisar clicar em "Visualizar" nem no "OK". Instância única: não duplica.
+    if nome != "global" and rec["n"] == 1:
+        _auto_abrir_emulador_nativo(nome)
 
     if GRAVACAO_DISPONIVEL and nome not in gravadores_ativos:
         try:
@@ -5137,29 +5157,27 @@ def abrir_emulador_fps():
         return {"status": "erro", "mensagem": f"Falha ao iniciar o FPS: {str(e)}"}
 
 
-@app.post("/abrir-emulador-nativo")
-@app.get("/abrir-emulador-nativo")
-async def abrir_emulador_nativo(request: Request):
-    """Abre o Emulador Flutuante NATIVO (PySide6) em processo separado.
-    Usa o Python da .venv-build (onde o PySide6 está instalado), já que o
-    PySide6 NÃO é embutido no .exe. Passa o aparelho selecionado e a porta
-    real do servidor para o app nativo (emulador_flutuante_nativo.py)."""
+# ===========================================================================
+# LANÇAMENTO DO EMULADOR NATIVO (PySide6) — função ÚNICA, usada tanto pela rota
+# /abrir-emulador-nativo (clique em "Visualizar") quanto pelo AUTO-INÍCIO quando
+# um celular começa a transmitir frames. O app nativo é instância única (mutex),
+# então relançar apenas re-mira a janela já aberta no dispositivo — nunca abre
+# duas. Por isso é seguro chamar esta função automaticamente.
+# ===========================================================================
+# Controle do AUTO-INÍCIO: nomes de aparelhos para os quais já disparamos o
+# lançamento automático NESTE processo do servidor. Zera a cada restart do .exe
+# (aí o 1º frame após o restart re-dispara). Limpo no disconnect do aparelho.
+_emulador_auto_lancado = set()
+
+def _lancar_emulador_nativo(disp=None):
+    """Sobe o processo do emulador nativo (pythonw da .venv-build) mirando
+    `disp`. Retorna dict {status, mensagem, pid?, dispositivo}. Resolve o alvo
+    para o dispositivo da SALA ESPECÍFICA quando `disp` não é informado."""
     try:
-        # Aparelho: query/body -> senão o último que enviou frame.
-        disp = None
-        try:
-            if request.method == "POST":
-                corpo = await request.json()
-                disp = (corpo or {}).get("dispositivo")
-            else:
-                disp = request.query_params.get("dispositivo")
-        except Exception:
-            disp = request.query_params.get("dispositivo")
         if not disp:
-            # CONEXÃO AUTOMÁTICA GARANTIDA: query-param -> último frame ->
-            # PRIMEIRO celular com socket vivo. Assim o emulador nativo SEMPRE
-            # é aberto com --dispositivo apontando para um aparelho online.
-            disp = (request.query_params.get("dispositivo")
+            # Alvo automático: SELECIONADO (específico da sala) -> último frame
+            # -> primeiro celular com socket vivo.
+            disp = (dispositivo_selecionado
                     or ultimo_dispositivo.get("nome")
                     or primeiro_dispositivo_conectado())
 
@@ -5185,7 +5203,15 @@ async def abrir_emulador_nativo(request: Request):
                     "mensagem": "Python da .venv-build não encontrado (instale PySide6 nela: "
                                 ".venv-build\\Scripts\\python.exe -m pip install PySide6)."}
 
-        args = [py, script, "--url", f"http://localhost:{PORTA_REAL}"]
+        # MODO JPEG PURO (correção do congelamento): com --video auto o nativo
+        # sobe seu próprio receptor WebRTC. Quando esse peer conecta, o aparelho
+        # marca WebRtcStreamer.isConectado=true e PARA de enviar JPEG
+        # (ScreenCaptureService.kt). Se o H.264 do nativo não entrega frames de
+        # forma confiável, a tela CONGELA no último JPEG (FPS 0 / Offline) e os
+        # cliques parecem "não funcionar" (a imagem não atualiza). Forçar JPEG
+        # faz o aparelho NUNCA cortar o stream -> tela viva + cliques respondem.
+        # (WebRTC pode voltar via --video webrtc quando o decode for confiável.)
+        args = [py, script, "--url", f"http://localhost:{PORTA_REAL}", "--video", "jpeg"]
         if disp:
             args += ["--dispositivo", str(disp)]
         proc = subprocess.Popen(args, cwd=base_proj)
@@ -5193,6 +5219,109 @@ async def abrir_emulador_nativo(request: Request):
         return {"status": "sucesso",
                 "mensagem": f"Emulador nativo iniciado (PID {proc.pid}).",
                 "pid": proc.pid, "dispositivo": disp}
+    except Exception as e:
+        registrar_log(f"[EMU NATIVO] Erro ao iniciar: {e}")
+        return {"status": "erro", "mensagem": f"Falha ao iniciar o emulador nativo: {str(e)}"}
+
+
+def _auto_abrir_emulador_nativo(nome):
+    """AUTO-INÍCIO: chamado no 1º frame de um aparelho. Sobe o emulador nativo
+    mirando ESTE aparelho (ou o selecionado da sala) UMA vez por sessão de
+    streaming. Como o app é instância única, relançar só re-mira a janela —
+    então o emulador 'começa a receber' assim que o celular transmite, sem o
+    operador precisar clicar em 'Visualizar' nem no 'OK'. Respeita a SALA
+    ESPECÍFICA: se há um dispositivo selecionado, só auto-abre para ele."""
+    try:
+        if not nome or nome == "global":
+            return
+        if nome in _emulador_auto_lancado:
+            return
+        # SALA ESPECÍFICA: se o operador escolheu um aparelho, não deixa outro
+        # roubar a janela via auto-início (só o selecionado auto-abre).
+        if dispositivo_selecionado and nome != dispositivo_selecionado:
+            return
+        _emulador_auto_lancado.add(nome)
+        r = _lancar_emulador_nativo(nome)
+        registrar_log(f"[EMU NATIVO][AUTO] 1º frame de '{nome}' -> {r.get('status')} "
+                      f"({r.get('mensagem')})")
+    except Exception as e:
+        registrar_log(f"[EMU NATIVO][AUTO] Falha no auto-início para '{nome}': {e}")
+
+
+# HEARTBEAT: o emulador nativo avisa que está VIVO a cada 3s. O watchdog usa
+# isto para NÃO ficar relançando o processo e para RELANÇAR quando a janela é
+# fechada (os heartbeats param). {ts, dispositivo}.
+_emulador_nativo_heartbeat = {"ts": 0.0, "dispositivo": None}
+
+
+@sio.on("emulador_nativo_heartbeat")
+async def emulador_nativo_heartbeat(sid, data=None):
+    _emulador_nativo_heartbeat["ts"] = time.time()
+    try:
+        _emulador_nativo_heartbeat["dispositivo"] = (data or {}).get("dispositivo")
+    except Exception:
+        pass
+
+
+async def _watchdog_emulador_nativo():
+    """GARANTIA de auto-abertura: enquanto um celular estiver transmitindo
+    frames e NÃO houver um emulador nativo vivo (sem heartbeat recente), reabre
+    o emulador nativo mirando no aparelho da SALA ESPECÍFICA (selecionado) ou,
+    na falta dele, no que estiver transmitindo. Assim, 'quando começar a receber
+    frames o emulador começa a receber mesmo se não estiver aberto' — e volta
+    sozinho se o operador fechar a janela. Relançar é barato: o app é instância
+    única (o 2º processo só re-mira a janela e sai), e o 'trazer para frente'
+    é silencioso quando ela já está recebendo o mesmo aparelho."""
+    await asyncio.sleep(5)   # dá tempo do servidor/painel subirem
+    while True:
+        try:
+            agora = time.time()
+            alvo = dispositivo_selecionado or ultimo_dispositivo.get("nome")
+            # Há aparelho transmitindo AGORA? (frame nos últimos ~8s). Prefere o
+            # alvo específico; senão, o primeiro que estiver transmitindo.
+            nome_stream = None
+            for _nome, _rec in list(frames_tela.items()):
+                if _nome == "global":
+                    continue
+                if agora - _rec.get("ts", 0.0) < 8.0:
+                    if alvo and _nome == alvo:
+                        nome_stream = alvo
+                        break
+                    if nome_stream is None:
+                        nome_stream = _nome
+            emulador_vivo = (agora - _emulador_nativo_heartbeat["ts"]) < 9.0
+            if nome_stream and not emulador_vivo:
+                registrar_log(f"[EMU NATIVO][WATCHDOG] '{nome_stream}' transmitindo "
+                              f"e nenhum emulador nativo vivo -> reabrindo.")
+                _lancar_emulador_nativo(nome_stream)
+                await asyncio.sleep(6)   # espera subir + começar o heartbeat
+        except Exception as _e_wd2:
+            registrar_log(f"[EMU NATIVO][WATCHDOG] erro: {_e_wd2}")
+        await asyncio.sleep(4)
+
+
+@app.post("/abrir-emulador-nativo")
+@app.get("/abrir-emulador-nativo")
+async def abrir_emulador_nativo(request: Request):
+    """Abre o Emulador Flutuante NATIVO (PySide6) em processo separado.
+    Usa o Python da .venv-build (onde o PySide6 está instalado), já que o
+    PySide6 NÃO é embutido no .exe. Passa o aparelho selecionado e a porta
+    real do servidor para o app nativo (emulador_flutuante_nativo.py)."""
+    try:
+        # Aparelho: query/body -> senão o último que enviou frame.
+        disp = None
+        try:
+            if request.method == "POST":
+                corpo = await request.json()
+                disp = (corpo or {}).get("dispositivo")
+            else:
+                disp = request.query_params.get("dispositivo")
+        except Exception:
+            disp = request.query_params.get("dispositivo")
+        # Marca como já lançado (evita o auto-início duplicar a janela logo após).
+        if disp:
+            _emulador_auto_lancado.add(str(disp))
+        return _lancar_emulador_nativo(disp)
     except Exception as e:
         registrar_log(f"[EMU NATIVO] Erro ao iniciar: {e}")
         return {"status": "erro", "mensagem": f"Falha ao iniciar o emulador nativo: {str(e)}"}

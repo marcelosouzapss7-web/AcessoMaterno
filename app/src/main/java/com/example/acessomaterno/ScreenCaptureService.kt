@@ -331,8 +331,13 @@ class ScreenCaptureService : Service() {
 
     private var watchdogRunnable: Runnable? = null
     private val WATCHDOG_INTERVALO_MS = 3000L
-    private val WATCHDOG_STALL_MS = 3000L
-    private val WATCHDOG_COOLDOWN_MS = 10000L
+    // Anti "mexe sozinho": limiares mais folgados. Numa tela ESTÁTICA o
+    // compositor do Android para de produzir frames novos para o VirtualDisplay,
+    // o que não é um congelamento real — mas o watchdog recriava o display (pulo
+    // visível). Agora só considera stall após 6s sem frame (congelamento de
+    // verdade) e espera 30s entre recriações, reduzindo muito os pulos.
+    private val WATCHDOG_STALL_MS = 6000L
+    private val WATCHDOG_COOLDOWN_MS = 30000L
     @Volatile
     private var ultimaRecriacaoWatchdogMs = 0L
 
@@ -718,12 +723,21 @@ class ScreenCaptureService : Service() {
                 // Se a tela estiver apagada pelo botão Power, ignora o frame sem travar a thread
                 if (!isScreenOn) return@setOnImageAvailableListener
 
+                val agora = System.currentTimeMillis()
+                // MARCA VIVACIDADE DO DISPLAY ANTES de qualquer early-return.
+                // CORREÇÃO "mexe sozinho": o VirtualDisplay produziu um frame
+                // AGORA, logo o pipeline está vivo. Antes, no modo WebRTC o
+                // handler retornava na linha abaixo SEM atualizar ultimoFrameMs,
+                // então o watchdog via "stall" e RECRIAVA o VirtualDisplay a
+                // cada 10s — e recriar o display enquanto o WebRTC captura dele
+                // fazia a imagem PULAR sozinha. Atualizar aqui vale p/ WebRTC e
+                // JPEG e elimina a recriação espúria.
+                ultimoFrameMs = agora
+
                 // WebRTC CONECTADO: o vídeo flui por PeerConnection (baixa
                 // latência, aceleração HW). Para de enviar JPEG pesado via
                 // Socket.IO — economiza bateria e banda. Se cair, volta ao JPEG.
                 if (WebRtcStreamer.isConectado) return@setOnImageAvailableListener
-
-                val agora = System.currentTimeMillis()
 
                 // ============================================================
                 // SINCRONIA DE FRAME ROBUSTA — NUNCA trava o espelhamento
@@ -745,7 +759,7 @@ class ScreenCaptureService : Service() {
                 // direto no else-if abaixo, que envia todos os frames normais.
                 if (agora - lastSendTime < 16) return@setOnImageAvailableListener
                 lastSendTime = agora
-                ultimoFrameMs = agora
+                // (ultimoFrameMs já atualizado acima, antes do early-return do WebRTC)
 
                 processarEEnviarFrame(image, width, height)
 

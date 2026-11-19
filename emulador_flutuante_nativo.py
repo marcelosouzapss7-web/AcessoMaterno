@@ -211,6 +211,22 @@ class PonteSocket(QtCore.QObject):
     # "Carregando atualização" sobre o vídeo. NÃO afeta o dispositivo — é só a
     # tela do SEU emulador. (O handler do dispositivo será feito na próxima etapa.)
     atualizacaoMudou = QtCore.Signal(bool)  # True = mostrar overlay de atualização
+    # Emitido SEMPRE que o árbitro trava/re-trava num aparelho (nome do device).
+    # A janela escuta isto para manter self.dispositivo SINCRONIZADO com a fonte
+    # que está REALMENTE no vídeo — assim cliques, botões e teclado vão para o
+    # aparelho que aparece na tela, nunca para um nome antigo/offline (que o
+    # servidor descartaria por ISOLAMENTO, fazendo o clique "não funcionar").
+    fonteTravou = QtCore.Signal(str)
+
+    def _definir_fonte(self, nome):
+        """Ponto ÚNICO de trava do árbitro: grava _fonte_travada e avisa a GUI
+        (fonteTravou) para ela re-mirar os comandos no aparelho correto."""
+        self._fonte_travada = nome
+        if nome:
+            try:
+                self.fonteTravou.emit(str(nome))
+            except Exception:
+                pass
 
     def __init__(self, url_base: str, dispositivo: str):
         super().__init__()
@@ -294,7 +310,7 @@ class PonteSocket(QtCore.QObject):
                 if self._dispositivo_desejado and nome_frame != self._dispositivo_desejado:
                     pass
                 else:
-                    self._fonte_travada = nome_frame
+                    self._definir_fonte(nome_frame)
                     try:
                         sio.emit("assistir_video", {"dispositivo": nome_frame})
                     except Exception:
@@ -344,7 +360,7 @@ class PonteSocket(QtCore.QObject):
                 # configurada (ou se não houver nenhum configurado).
                 if self._dispositivo_desejado and nome != self._dispositivo_desejado:
                     return
-                self._fonte_travada = nome
+                self._definir_fonte(nome)
                 try:
                     sio.emit("assistir_video", {"dispositivo": nome})
                     print(f"[SOCKET] Aparelho online detectado: {nome}")
@@ -357,7 +373,7 @@ class PonteSocket(QtCore.QObject):
             if nome and not self._fonte_travada:
                 if self._dispositivo_desejado and nome != self._dispositivo_desejado:
                     return
-                self._fonte_travada = nome
+                self._definir_fonte(nome)
                 try:
                     sio.emit("assistir_video", {"dispositivo": nome})
                 except Exception:
@@ -427,13 +443,16 @@ class PonteSocket(QtCore.QObject):
                     if recebendo and (not transmitindo or transmitindo == self._fonte_travada):
                         continue
 
-                    # 3) Travado mas SEM frames. Dois comportamentos:
-                    #    - ALVO EXPLÍCITO (usuário clicou "Visualizar" neste
-                    #      aparelho): NUNCA troca para outro ("mexe sozinho"
-                    #      vinha daí). Apenas RE-ASSINA a mesma sala para tentar
-                    #      destravar o stream, mantendo a imagem estável.
-                    #    - ALVO AUTOMÁTICO: reconcilia para quem está transmitindo
-                    #      (5s se nunca recebeu frame; 12s se o stream parou).
+                    # 3) Travado mas SEM frames recentes. REGRA "NUNCA OFFLINE"
+                    #    (pedido do usuário): se o aparelho travado parou/ficou
+                    #    offline e OUTRO está REALMENTE transmitindo, troca para
+                    #    ele — INCLUSIVE quando o alvo veio explícito do botão
+                    #    "Visualizar" (o aparelho online pode ter mudado de nome/
+                    #    reconectado). Não causa "mexe sozinho": só troca quando o
+                    #    atual não manda frames. Se NINGUÉM mais transmite, apenas
+                    #    re-assina a mesma sala, tentando reabilitar o stream.
+                    #    Timeout: 5s se nunca recebeu 1 frame (nome stale/offline);
+                    #    12s se um stream estabelecido só engasgou.
                     if self._ultimo_frame_ts > 0:
                         sem_frame_ha = agora - self._ultimo_frame_ts
                         limite = self._timeout_sem_frame
@@ -442,18 +461,20 @@ class PonteSocket(QtCore.QObject):
                         limite = self._timeout_primeiro_frame
                     if sem_frame_ha <= limite:
                         continue
-                    if self._alvo_explicito:
-                        # Fixo no aparelho escolhido: só re-assina (sem roubar outro).
+                    if transmitindo and transmitindo != self._fonte_travada:
+                        print(f"[WATCHDOG] '{self._fonte_travada}' sem frames há "
+                              f">{int(limite)}s e '{transmitindo}' está "
+                              f"transmitindo — reconectando automaticamente nele "
+                              f"(nunca offline).")
+                        self._travar_em(transmitindo, agora)
+                    else:
+                        # Ninguém mais transmitindo: re-assina a mesma sala p/ tentar
+                        # reabilitar (sem roubar outro) e abre nova janela de espera.
                         try:
                             self.sio.emit("assistir_video", {"dispositivo": self._fonte_travada})
                         except Exception:
                             pass
-                        self._ultimo_frame_ts = agora  # dá nova janela de espera
-                    elif transmitindo and transmitindo != self._fonte_travada:
-                        print(f"[WATCHDOG] '{self._fonte_travada}' sem frames há "
-                              f">{int(limite)}s e '{transmitindo}' está "
-                              f"transmitindo — reconectando automaticamente nele.")
-                        self._travar_em(transmitindo, agora)
+                        self._ultimo_frame_ts = agora
                 except Exception:
                     pass
 
@@ -485,7 +506,7 @@ class PonteSocket(QtCore.QObject):
         filtro da sala específica, registra o instante da trava e zera a espera
         por frame — e emite 'assistir_video' para entrar em stream:{nome}."""
         agora = agora if agora is not None else time.time()
-        self._fonte_travada = nome
+        self._definir_fonte(nome)
         self._dispositivo_desejado = nome
         self._travado_em = agora
         self._ultimo_frame_ts = agora   # dá a janela de timeout antes de reconciliar de novo
@@ -497,7 +518,7 @@ class PonteSocket(QtCore.QObject):
     def trocar_dispositivo(self, nome: str):
         """Passa a assistir OUTRO aparelho (ao reusar a janela já aberta)."""
         self.dispositivo = nome
-        self._fonte_travada = nome          # re-trava o árbitro no novo aparelho
+        self._definir_fonte(nome)           # re-trava o árbitro no novo aparelho
         self._dispositivo_desejado = nome   # o filtro da sala específica acompanha
         self._alvo_explicito = True         # troca explícita do usuário
         self._travado_em = time.time()      # instante da trava (reconciliação)
@@ -793,9 +814,18 @@ class TelaVideo(QtWidgets.QLabel):
         # Trava a proporção no primeiro frame. Encoders Android alternam a
         # dimensão do frame por alguns px; sem travar, a caixa "contain" era
         # recalculada a cada frame e a imagem pulava (tremor).
-        if self._aspecto is None and pix.height() > 0:
-            self._aspecto = pix.width() / pix.height()
-            self.setText("")   # some o "Aguardando…" no 1º frame
+        if pix.height() > 0:
+            asp_atual = pix.width() / pix.height()
+            if self._aspecto is None:
+                self._aspecto = asp_atual
+                self.setText("")   # some o "Aguardando…" no 1º frame
+            elif abs(asp_atual - self._aspecto) / self._aspecto > 0.04:
+                # RE-TRAVA só em mudança REAL de proporção (>4%), p.ex. ao abrir
+                # um app que muda a resolução da captura — assim a imagem volta a
+                # CENTRALIZAR na proporção nova em vez de ficar torta/descentrada.
+                # Variação de poucos px (jitter do encoder) fica abaixo do limiar
+                # e NÃO re-trava, preservando a correção de tremor.
+                self._aspecto = asp_atual
         self._pix = pix
         # update() apenas AGENDA o repaint — NÃO usa setPixmap (que mexeria no
         # sizeHint do label e disparava relayout a cada frame = vibração).
@@ -832,22 +862,28 @@ class TelaVideo(QtWidgets.QLabel):
 
     def _norm(self, ponto):
         """Converte um ponto da tela para coords 0..1 DENTRO da imagem
-        renderizada (corrige o letterbox do contain). None se cair na borda."""
+        renderizada (corrige o letterbox do contain). Com clamp robusto."""
         if self._pix is None:
-            return None
+            area = self.size()
+            if area.width() <= 0 or area.height() <= 0:
+                return (0.5, 0.5)
+            return (max(0.0, min(1.0, ponto.x() / area.width())), max(0.0, min(1.0, ponto.y() / area.height())))
+
         area = self.size()
         pw, ph = self._pix.width(), self._pix.height()
         if pw == 0 or ph == 0:
-            return None
+            return (max(0.0, min(1.0, ponto.x() / area.width())), max(0.0, min(1.0, ponto.y() / area.height())))
+
         escala = min(area.width() / pw, area.height() / ph)
         larg, alt = pw * escala, ph * escala
         off_x = (area.width() - larg) / 2
         off_y = (area.height() - alt) / 2
         px = ponto.x() - off_x
         py = ponto.y() - off_y
-        if px < 0 or py < 0 or px > larg or py > alt:
-            return None
-        return (max(0.0, min(1.0, px / larg)), max(0.0, min(1.0, py / alt)))
+
+        norm_x = max(0.0, min(1.0, px / larg)) if larg > 0 else 0.5
+        norm_y = max(0.0, min(1.0, py / alt)) if alt > 0 else 0.5
+        return (norm_x, norm_y)
 
     # ---- Toque / deslize (arrastar o dedo) ----
     def mousePressEvent(self, ev):
@@ -978,6 +1014,20 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # WebRTC parar por >2s, volta a aceitar JPEG automaticamente.
         self._ultimo_webrtc_ts = 0.0
         self._webrtc_conectado = False
+        # Instante do ÚLTIMO frame recebido (qualquer fonte). Base do status
+        # "grudento": enquanto chegam frames (inclui o keep-alive do aparelho a
+        # cada 150ms, mesmo com a tela parada), a janela fica Connected e NUNCA
+        # cai para Offline por um engasgo curto.
+        self._ultimo_frame_status_ts = 0.0
+        # Instante do último frame vindo do SOCKET (frame/WebRTC) — SEPARADO do
+        # status acima. O fallback HTTP só entra quando o SOCKET ficou mudo por
+        # alguns segundos; renderizar via HTTP NÃO atualiza este ts, então o
+        # fallback continua puxando ~1x/s enquanto o socket estiver parado
+        # (igual ao preview web, que nunca congela). Ver _puxar_frame_http().
+        self._ultimo_frame_socket_ts = 0.0
+        self._http_em_voo = False       # evita requisições HTTP sobrepostas
+        # Cliente HTTP assíncrono (não bloqueia a GUI) para o fallback do preview.
+        self._net = QtNetwork.QNetworkAccessManager(self)
         self._arrastando = False
         self._pos_arraste = None
         # Redimensionar arrastando as bordas (como o Nox)
@@ -1000,6 +1050,79 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._atualizar_status)
         self._timer.start(1000)
+
+        # HEARTBEAT: avisa o servidor, a cada 3s, que ESTE emulador nativo está
+        # VIVO e mirando tal aparelho. O watchdog do servidor usa isso para NÃO
+        # ficar relançando o processo à toa — e para RELANÇAR sozinho se a janela
+        # for fechada (aí os heartbeats param e o servidor reabre o emulador
+        # quando o celular ainda estiver transmitindo).
+        self._timer_hb = QtCore.QTimer(self)
+        self._timer_hb.timeout.connect(self._enviar_heartbeat)
+        self._timer_hb.start(3000)
+        self._enviar_heartbeat()
+
+        # FALLBACK HTTP (robustez igual ao preview web): puxa o último frame do
+        # aparelho por /visualizar-imagem quando o stream do socket engasga —
+        # assim o nativo NUNCA congela em 0 FPS. Roda 1x/s.
+        self._timer_http = QtCore.QTimer(self)
+        self._timer_http.timeout.connect(self._puxar_frame_http)
+        self._timer_http.start(1000)
+
+    def _enviar_heartbeat(self):
+        try:
+            alvo = self.ponte._fonte_travada or self.dispositivo or ""
+            self.ponte.enviar("emulador_nativo_heartbeat", {"dispositivo": alvo})
+        except Exception:
+            pass
+
+    # ---- FALLBACK HTTP (mesma robustez do preview web) ----
+    def _puxar_frame_http(self):
+        """Se o stream do SOCKET ficou >2,5s sem frame, puxa o último frame do
+        aparelho por GET /visualizar-imagem?dispositivo=X — o MESMO caminho do
+        preview web (sempre devolve o último JPEG do frames_tela do servidor,
+        independente de sala/árbitro/WebRTC). Com isso o nativo NUNCA congela
+        em 0 FPS quando o socket engasga, e retoma sozinho após reiniciar o
+        .exe: assim que o aparelho transmitir, o frame aparece aqui também."""
+        if time.time() - self._ultimo_frame_socket_ts < 2.5:
+            return  # socket entregando frames -> não briga com ele
+        if self._http_em_voo:
+            return  # já há uma requisição em andamento
+        alvo = self.ponte._fonte_travada or self.dispositivo
+        if not alvo:
+            return
+        try:
+            url = QtCore.QUrl(f"{self.ponte.url_base}/visualizar-imagem")
+            q = QtCore.QUrlQuery()
+            q.addQueryItem("dispositivo", str(alvo))
+            q.addQueryItem("t", str(int(time.time() * 1000)))  # anti-cache
+            url.setQuery(q)
+            req = QtNetwork.QNetworkRequest(url)
+            self._http_em_voo = True
+            resp = self._net.get(req)
+            resp.finished.connect(lambda r=resp: self._ao_http_frame(r))
+        except Exception:
+            self._http_em_voo = False
+
+    def _ao_http_frame(self, resp):
+        self._http_em_voo = False
+        try:
+            dados = bytes(resp.readAll())
+            # O endpoint devolve um SVG placeholder quando ainda não há frame;
+            # só renderiza se vier JPEG de verdade (magic FF D8).
+            if dados[:2] == b"\xff\xd8":
+                pix = QtGui.QPixmap()
+                if pix.loadFromData(dados, "JPG"):
+                    self.video.definir_frame(pix)
+                    self._fps += 1
+                    self._ultimo_frame_status_ts = time.time()
+                    self._conectado = True
+        except Exception:
+            pass
+        finally:
+            try:
+                resp.deleteLater()
+            except Exception:
+                pass
 
     # ---- UI ----
     def _montar_ui(self):
@@ -1098,15 +1221,22 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # Handler EXCLUSIVO do emulador nativo: liga/desliga o overlay de
         # "Carregando atualização" (separado de qualquer ação no dispositivo).
         self.ponte.atualizacaoMudou.connect(self.overlay_atualizacao.ligar)
+        # SINCRONIZAÇÃO DO ALVO: sempre que o árbitro travar/re-travar num
+        # aparelho (conexão automática, retomada de sessão, reconciliação do
+        # watchdog ou trava no 1º frame), atualizamos self.dispositivo para que
+        # cliques/botões/teclado SEMPRE mirem o aparelho que está no vídeo —
+        # nunca um nome antigo/offline (que o servidor descartaria -> o clique
+        # "não funcionava" após a janela re-mirar sozinha).
+        self.ponte.fonteTravou.connect(self._ao_travar_fonte)
         # Mantém o overlay sempre do tamanho do vídeo.
         self.video.installEventFilter(self)
-        # Botões -> eventos Socket.IO (mesmo payload do painel web).
-        alvo = {"dispositivo": self.dispositivo}
-        self.btn_voltar.clicked.connect(lambda: self.ponte.enviar("botao_voltar", alvo))
-        self.btn_home.clicked.connect(lambda: self.ponte.enviar("botao_home", alvo))
-        self.btn_recentes.clicked.connect(lambda: self.ponte.enviar("botao_recentes", alvo))
-        self.btn_power.clicked.connect(lambda: self.ponte.enviar("botao_power", alvo))
-        self.btn_notif.clicked.connect(lambda: self.ponte.enviar("notificacao_acordar", alvo))
+        # Botões -> eventos Socket.IO (mesmo payload do painel web). O alvo é
+        # lido DINAMICAMENTE (self._alvo()) a cada clique, não capturado uma vez.
+        self.btn_voltar.clicked.connect(lambda: self.ponte.enviar("botao_voltar", self._alvo()))
+        self.btn_home.clicked.connect(lambda: self.ponte.enviar("botao_home", self._alvo()))
+        self.btn_recentes.clicked.connect(lambda: self.ponte.enviar("botao_recentes", self._alvo()))
+        self.btn_power.clicked.connect(lambda: self.ponte.enviar("botao_power", self._alvo()))
+        self.btn_notif.clicked.connect(lambda: self.ponte.enviar("notificacao_acordar", self._alvo()))
         self.btn_colar.clicked.connect(self._colar_do_computador)
         # Toque / deslize / rolagem no vídeo
         self.video.gesto.connect(self._ao_gesto)
@@ -1128,6 +1258,8 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         if pix.loadFromData(jpeg, "JPG"):   # Qt decodifica o JPEG nativamente
             self.video.definir_frame(pix)
             self._fps += 1
+            self._ultimo_frame_status_ts = time.time()
+            self._ultimo_frame_socket_ts = time.time()   # socket vivo -> fallback HTTP recua
             # MODO BYPASS: se está chegando frame, está conectado. Evita o status
             # "Offline" preso quando o sinal de conexão não chegou a tempo.
             self._conectado = True
@@ -1141,6 +1273,8 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self._ultimo_webrtc_ts = time.time()
         self.video.definir_frame(QtGui.QPixmap.fromImage(img))
         self._fps += 1
+        self._ultimo_frame_status_ts = time.time()
+        self._ultimo_frame_socket_ts = time.time()   # socket vivo -> fallback HTTP recua
         self._conectado = True
 
     @QtCore.Slot(bool)
@@ -1151,10 +1285,23 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     def _ao_mudar_conexao(self, ok: bool):
         self._conectado = ok
 
+    @QtCore.Slot(str)
+    def _ao_travar_fonte(self, nome: str):
+        # O árbitro travou num aparelho — mira os comandos nele (fonte de verdade
+        # = o que está no vídeo). Mantém o status/cabeçalho coerentes também.
+        if nome and nome != self.dispositivo:
+            self.dispositivo = nome
+
+    def _alvo(self):
+        """Aparelho-alvo ATUAL dos comandos: a fonte travada pelo árbitro (o que
+        está no vídeo) tem prioridade sobre self.dispositivo inicial."""
+        return {"dispositivo": (self.ponte._fonte_travada or self.dispositivo)}
+
     def _ao_gesto(self, payload: dict):
-        # payload já vem pronto (START/MOVE/END/SWIPE_VERTICAL); só anexa o alvo.
+        # payload já vem pronto (START/MOVE/END/SWIPE_VERTICAL); só anexa o alvo
+        # ATUAL (fonte travada no vídeo), nunca um nome antigo/offline.
         payload = dict(payload)
-        payload["dispositivo"] = self.dispositivo
+        payload["dispositivo"] = self.ponte._fonte_travada or self.dispositivo
         self.ponte.enviar("clique_painel", payload)
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
@@ -1187,13 +1334,15 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         txt = ev.text()
         if txt and len(txt) == 1 and txt.isprintable():
             self.ponte.enviar("tecla_painel",
-                              {"tipo": "texto", "valor": txt, "dispositivo": self.dispositivo})
+                              {"tipo": "texto", "valor": txt,
+                               "dispositivo": self.ponte._fonte_travada or self.dispositivo})
             return
         super().keyPressEvent(ev)
 
     def _tecla(self, valor: str):
         self.ponte.enviar("tecla_painel",
-                          {"tipo": "tecla", "valor": valor, "dispositivo": self.dispositivo})
+                          {"tipo": "tecla", "valor": valor,
+                           "dispositivo": self.ponte._fonte_travada or self.dispositivo})
 
     def _colar_do_computador(self):
         """Lê o texto da área de transferência do Windows e DIGITA no aparelho."""
@@ -1209,11 +1358,24 @@ class EmuladorFlutuante(QtWidgets.QWidget):
                 self._tecla("ESPACO")
             else:
                 self.ponte.enviar("tecla_painel",
-                                  {"tipo": "texto", "valor": ch, "dispositivo": self.dispositivo})
+                                  {"tipo": "texto", "valor": ch,
+                                   "dispositivo": self.ponte._fonte_travada or self.dispositivo})
 
     def _atualizar_status(self):
-        recebendo = self._fps > 0
-        estado = "Connected" if (self._conectado and recebendo) else ("Online" if self._conectado else "Offline")
+        # STATUS GRUDENTO (pedido: "nunca offline" enquanto recebe frames).
+        # Base = tempo desde o último frame (o aparelho manda keep-alive a cada
+        # ~150ms mesmo com a tela parada, então frames NÃO param só por estar
+        # parado). Connected se houve frame há <4s; Online (tolerância) até 12s
+        # ou enquanto o socket estiver vivo; Offline só sem frame há muito tempo
+        # E socket caído — um engasgo curto nunca mostra Offline.
+        agora = time.time()
+        desde_frame = (agora - self._ultimo_frame_status_ts) if self._ultimo_frame_status_ts > 0 else 1e9
+        if desde_frame < 4.0:
+            estado = "Connected"
+        elif desde_frame < 12.0 or self._conectado:
+            estado = "Online"
+        else:
+            estado = "Offline"
         nome = self.dispositivo or "Aguardando…"
         if len(nome) > 18:
             nome = nome[:18] + "…"
@@ -1332,10 +1494,20 @@ class EmuladorFlutuante(QtWidgets.QWidget):
                 # derrubaria um H.264 que já está fluido).
                 self.receptor.definir_dispositivo(alvo)
         # Sem alvo: o watchdog já está auto-conectando ao que estiver transmitindo.
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        self.setFocus()
+        #
+        # NÃO INTRUSIVO: o watchdog do servidor relança o emulador periodicamente
+        # para GARANTIR que ele esteja aberto. Se a janela JÁ está visível,
+        # recebendo frames e NÃO trocou de aparelho, não roubamos o foco nem
+        # trazemos pra frente a cada relançamento (seria piscar/roubar foco sem
+        # parar). Só levantamos a janela quando é uma abertura real: 1º open,
+        # troca de aparelho, janela minimizada/oculta ou vídeo congelado.
+        recebendo = (time.time() - self._ultimo_frame_status_ts) < 3.0
+        janela_visivel = self.isVisible() and not self.isMinimized()
+        if trocou or not janela_visivel or not recebendo:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            self.setFocus()
 
     def closeEvent(self, ev):
         self.ponte.parar()
@@ -1351,7 +1523,7 @@ def main():
     ap = argparse.ArgumentParser(description="Emulador Flutuante nativo (Acesso Materno)")
     ap.add_argument("--url", default=URL_PADRAO, help="URL do servidor Socket.IO")
     ap.add_argument("--dispositivo", default=None, help="Nome do aparelho a espelhar")
-    ap.add_argument("--video", default="auto", choices=["auto", "webrtc", "jpeg"],
+    ap.add_argument("--video", default="jpeg", choices=["auto", "webrtc", "jpeg"],
                     help="Fonte de vídeo: 'auto' (H.264 WebRTC + fallback JPEG), "
                          "'webrtc' (força H.264) ou 'jpeg' (só JPEG).")
     args = ap.parse_args()
@@ -1376,21 +1548,75 @@ def main():
     # --- INSTÂNCIA ÚNICA ---
     # Se já houver uma janela aberta, manda o aparelho pra ela e sai (ela vem
     # pra frente). Evita abrir uma segunda janela a cada clique em "Visualizar".
-    teste = QtNetwork.QLocalSocket()
-    teste.connectToServer(NOME_INSTANCIA)
-    if teste.waitForConnected(300):
-        try:
-            teste.write((disp or "").encode("utf-8"))
-            teste.flush()
-            teste.waitForBytesWritten(300)
-        except Exception:
-            pass
-        teste.disconnectFromServer()
-        print("[INFO] Emulador nativo já estava aberto — trazendo para frente.")
-        return
+    #
+    # À PROVA DE CORRIDA (corrige o "mexe sozinho" = 2 janelas): dois lançadores
+    # podiam disparar no MESMO instante (ex.: botão Visualizar + outro atalho),
+    # e o `removeServer()` CEGO removia o listener da instância que já tinha
+    # vencido a corrida — aí as duas viravam "principal" e abriam 2 janelas
+    # sobrepostas. Agora: (1) tenta encaminhar p/ uma instância viva; (2) só se
+    # não houver, tenta `listen()` SEM remover cego; (3) se `listen()` falhar,
+    # reconfere se outra acabou de assumir (encaminha e sai) e só remove o
+    # socket quando ele é órfão (crash), nunca um vivo.
+    def _encaminhar(disp_, tentativas=1):
+        # Envia o aparelho para a instância principal (que vem para frente).
+        # Com `tentativas`, espera a principal terminar de subir o QLocalServer.
+        for i in range(tentativas):
+            s = QtNetwork.QLocalSocket()
+            s.connectToServer(NOME_INSTANCIA)
+            if s.waitForConnected(600):
+                try:
+                    s.write((disp_ or "").encode("utf-8"))
+                    s.flush()
+                    s.waitForBytesWritten(600)
+                except Exception:
+                    pass
+                s.disconnectFromServer()
+                return True
+            if i < tentativas - 1:
+                time.sleep(0.4)
+        return False
 
-    # Sou a primeira instância: crio o servidor local que escuta novos pedidos.
-    QtNetwork.QLocalServer.removeServer(NOME_INSTANCIA)  # limpa resto de crash
+    # ----- EXCLUSÃO REAL POR MUTEX NOMEADO DO WINDOWS (à prova de corrida) -----
+    # No Windows, QLocalServer.listen() NÃO é exclusivo (named pipes aceitam
+    # vários servidores com o mesmo nome) — por isso dois lançadores simultâneos
+    # abriam 2 janelas ("mexe sozinho"). Um mutex nomeado é atômico no kernel:
+    # só UM processo o cria; os demais veem ERROR_ALREADY_EXISTS e viram
+    # secundários (encaminham o aparelho e saem). Guardado numa variável de
+    # main() -> fica vivo enquanto o app roda (não fechar).
+    _sou_principal = True
+    _mutex_handle = None
+    try:
+        import ctypes
+        # use_last_error=True: captura o Win32 last-error IMEDIATAMENTE após a
+        # chamada (ler kernel32.GetLastError() direto é não confiável, pois o
+        # próprio ctypes pode resetar o erro — foi por isso que abriam 2 janelas).
+        _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _k32.CreateMutexW.restype = ctypes.c_void_p
+        _k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        _mutex_handle = _k32.CreateMutexW(None, False, NOME_INSTANCIA + "_Mutex")
+        _err = ctypes.get_last_error()
+        if _mutex_handle == 0 or _err == 183:   # 183 = ERROR_ALREADY_EXISTS
+            _sou_principal = False
+    except Exception:
+        _sou_principal = True   # fora do Windows: segue pelo caminho antigo
+
+    if not _sou_principal:
+        # Secundária: traz a principal para frente (com algumas tentativas, pois
+        # ela pode ainda estar subindo o servidor local) e sai SEM abrir janela.
+        _encaminhar(disp, tentativas=4)
+        print("[INFO] Emulador nativo já estava aberto — trazendo para frente.")
+        # ENCERRAMENTO FORÇADO: só `return` NÃO encerra o processo — o
+        # QtWidgets.QApplication já criado mantém threads internas do Qt vivas e
+        # o secundário ficava PENDURADO (era isso que acumulava instâncias
+        # fantasmas e abria 2 janelas). os._exit mata na hora (nada a limpar: o
+        # secundário só encaminhou o aparelho).
+        import os
+        sys.stdout.flush()
+        os._exit(0)
+
+    # Sou a principal (garantido pelo mutex): posso limpar socket órfão de crash
+    # com segurança e escutar novos pedidos de "trazer para frente".
+    QtNetwork.QLocalServer.removeServer(NOME_INSTANCIA)
     servidor = QtNetwork.QLocalServer()
     servidor.listen(NOME_INSTANCIA)
 

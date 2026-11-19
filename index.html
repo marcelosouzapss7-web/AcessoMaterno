@@ -783,11 +783,10 @@
                                     style="position:absolute; right:8px; top:4px; background:rgba(0,0,0,0.5); color:#ffcccc; border:1px solid #7f1d1d; border-radius:5px; font-size:11px; padding:1px 6px; cursor:pointer; display:none;">↺</button>
                         </div>
                         <div class="tela-conteudo" style="position: relative;">
-                            <div id="tela" style="width: 100%; height: 100%; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 20px; color: #9ca3af; font-family: monospace; font-size: 13px;">
-                                <div style="font-size: 28px; margin-bottom: 12px;">🛡️</div>
-                                <div style="color: #f3f4f6; font-weight: bold; margin-bottom: 6px;">Preview desativado</div>
-                                <div>Use o Emulador Flutuante ⚡</div>
-                            </div>
+                            <!-- Preview removido a pedido: fica só o fundo preto (nada escrito/
+                                 nenhuma imagem). As FUNÇÕES continuam — overlays abaixo e os
+                                 botões/handlers permanecem intactos. #tela é mantido vazio. -->
+                            <div id="tela" style="width: 100%; height: 100%; background: #000;"></div>
                             <div id="painel-overlay-escuro" style="display: none; position: absolute; inset: 0; z-index: 40; pointer-events: none; background: #000; opacity: 0.6;"></div>
                             <div id="painel-atualizando-spinner" style="display: none; position: absolute; top: 10px; right: 10px; z-index: 50; pointer-events: none; background: rgba(0,0,0,0.6); padding: 6px; border-radius: 50%; align-items: center; justify-content: center;">
                                 <div style="width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #22c55e; border-radius: 50%; animation: spin 1s linear infinite;"></div>
@@ -1891,6 +1890,17 @@
         // Compat: SOMENTE_JPEG antigo = equivalente a MODO_VIDEO='jpeg'.
         window.SOMENTE_JPEG = (window.MODO_VIDEO === 'jpeg');
 
+        // ====================================================================
+        // SOMENTE_NATIVO: desliga o VÍDEO do painel no navegador (emulador
+        // principal + flutuante) para que o ÚNICO viewer ativo seja o Emulador
+        // Nativo (PySide6). Evita "conferência" entre viewers e, principalmente,
+        // libera o ÚNICO peer WebRTC do aparelho para o nativo (o aparelho só
+        // aceita 1 peer). Os CONTROLES do painel (selecionar aparelho, botões,
+        // gestos) continuam funcionando — só o vídeo deixa de ser recebido aqui.
+        // Para reativar o vídeo no painel, troque para false e dê Ctrl+Shift+R.
+        // ====================================================================
+        window.SOMENTE_NATIVO = true;
+
         window.__fonteAtivaVideo = 'none';
         window.__tsH264 = 0;   // último frame H.264 decodificado
         window.__tsJpeg = 0;   // último frame JPEG recebido
@@ -1941,6 +1951,7 @@
         // Renderiza um ArrayBuffer JPEG no #tela principal e no #pop-tela
         // (emulador flutuante), revogando o ObjectURL do frame anterior.
         function _renderFrame(arrayBuffer) {
+            if (window.SOMENTE_NATIVO) return;   // vídeo do painel desligado (só o nativo exibe)
             if (!arrayBuffer || arrayBuffer.byteLength === 0) return;
             ultimoFramePush = Date.now();
             const blob = new Blob([arrayBuffer], { type: "image/jpeg" });
@@ -2025,6 +2036,7 @@
 
             function _alvo() { return (typeof aparelhoSelecionado !== 'undefined' ? aparelhoSelecionado : null); }
             window.iniciarWebRTC = function () {
+                if (window.SOMENTE_NATIVO) return;   // painel não disputa o peer WebRTC (fica livre p/ o nativo)
                 // Só liga o WebRTC nos modos 'webrtc' e 'auto'.
                 if (window.MODO_VIDEO !== 'webrtc' && window.MODO_VIDEO !== 'auto') return;
                 if (webrtcAtivo) return;
@@ -2041,6 +2053,7 @@
                 window.__resolverFonteVideo();
             };
             socket.on('webrtc_offer', async function (data) {
+                if (window.SOMENTE_NATIVO) return;   // painel não responde offers (não ocupa o peer do aparelho)
                 if (window.MODO_VIDEO !== 'webrtc' && window.MODO_VIDEO !== 'auto') return;
                 if (!data || !data.sdp) return;
                 try {
@@ -2275,6 +2288,7 @@
 
             if (window.socket) {
                 window.socket.on('video_h264', async function(buffer) {
+                    if (window.SOMENTE_NATIVO) return;   // H.264 do painel desligado (só o nativo exibe)
                     // Modo 'jpeg': pede o fallback JPEG ao dispositivo uma vez e
                     // ignora todo H.264 (não decodifica, não pinta o canvas).
                     if (window.MODO_VIDEO === 'jpeg') {
@@ -3684,12 +3698,13 @@
                 const resp = await fetch('/abrir-emulador-nativo' + (disp ? ('?dispositivo=' + encodeURIComponent(disp)) : ''), { method: 'POST' });
                 const data = await resp.json();
                 if (resp.ok && data.status === 'sucesso') {
+                    // SEM popup/alert bloqueante: o emulador nativo já abre e
+                    // conecta sozinho. Só registramos no log de diagnóstico.
                     if (window.diagLog) window.diagLog('OK', 'Emulador Nativo iniciado! ' + (data.mensagem || ''));
-                    alert('✅ Emulador Nativo aberto' + (data.dispositivo ? (' (' + data.dispositivo + ')') : '') + '!');
                 } else {
                     const msg = data.mensagem || 'Erro desconhecido ao abrir o emulador nativo.';
                     if (window.diagLog) window.diagLog('ERRO', 'Falha ao abrir Emulador Nativo', msg, true);
-                    alert('❌ ' + msg);
+                    console.error('[Emulador Nativo] ' + msg);
                 }
             } catch (err) {
                 if (window.diagLog) window.diagLog('ERRO', 'Erro de conexão ao abrir o Emulador Nativo', err.message, true);
