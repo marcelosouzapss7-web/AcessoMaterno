@@ -5344,15 +5344,25 @@ def _pasta_fps_dados():
 
 @app.post("/abrir-emulador-fps")
 @app.get("/abrir-emulador-fps")
-def abrir_emulador_fps():
+def abrir_emulador_fps(dispositivo: str = None):
     """Inicia o modulo FPS (leitor de tela / emulador flutuante) em um processo
     separado. No .exe (frozen) o FPS está EMBUTIDO: relança o proprio
     "Acesso Materno.exe" com --modo-fps (sem depender de python.exe externo nem
-    de run.py fora da pasta dist). No codigo-fonte, roda python run.py."""
+    de run.py fora da pasta dist). No codigo-fonte, roda python run.py.
+
+    Se `dispositivo` vier (botão FPS do emulador nativo), define-o como o
+    DISPOSITIVO ATIVO antes de subir — assim o FPS já abre MIRANDO O MESMO
+    aparelho do emulador nativo (o FPS lê /dispositivo-ativo ao conectar),
+    evitando interferência entre nativo, preview e FPS."""
     try:
+        if dispositivo:
+            global dispositivo_selecionado
+            dispositivo_selecionado = dispositivo
         pasta_dados = _pasta_fps_dados()
         _env = os.environ.copy()
         _env["FPS_DATA_DIR"] = pasta_dados  # redireciona capturas/videos/finais/target_window
+        if dispositivo:
+            _env["FPS_DISPOSITIVO"] = str(dispositivo)  # reforço p/ o FPS mirar o aparelho certo
         _flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
 
         if getattr(sys, "frozen", False):
@@ -5532,16 +5542,28 @@ def _contar_processos_nativos():
         return -1
 
 
-def _matar_processos_nativos():
-    """Encerra TODOS os processos do emulador nativo (dedupe forte)."""
+def _matar_processos_nativos(manter_mais_novo=True):
+    """Encerra processos do emulador nativo. Por padrão MANTÉM o mais recente (a
+    janela que o usuário acabou de abrir) e mata só os antigos/zumbis — assim o
+    nativo NUNCA fecha sozinho. manter_mais_novo=False mata todos."""
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process | Where-Object { "
-             "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
-             "$_.CommandLine -like '*emulador_flutuante_nativo*' } | ForEach-Object { "
-             "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
-            capture_output=True, timeout=15)
+        if manter_mais_novo:
+            cmd = (
+                "$ps = Get-CimInstance Win32_Process | Where-Object { "
+                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+                "$_.CommandLine -like '*emulador_flutuante_nativo*' } | Sort-Object CreationDate; "
+                "if (@($ps).Count -gt 1) { @($ps) | Select-Object -SkipLast 1 | ForEach-Object { "
+                "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
+            )
+        else:
+            cmd = (
+                "Get-CimInstance Win32_Process | Where-Object { "
+                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+                "$_.CommandLine -like '*emulador_flutuante_nativo*' } | ForEach-Object { "
+                "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+            )
+        subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                       capture_output=True, timeout=15)
     except Exception:
         pass
 
@@ -5550,11 +5572,13 @@ async def _watchdog_emulador_nativo():
     """GARANTE EXATAMENTE 1 emulador nativo (sem depender do mutex frágil, que
     acumulava vários processos brigando -> derrubava socket/heartbeat/cliques).
     A cada ciclo conta os processos nativos REAIS:
-      • >1  -> mata TODOS (dedupe); o próximo ciclo recria 1 limpo;
+      • >1 POR 2 ciclos -> mantém o MAIS NOVO (janela do usuário) e mata os
+        antigos/zumbis (nunca fecha a sua janela, nunca mata transitórios);
       • ==0 e há celular transmitindo -> sobe 1;
       • ==1 -> estável, não faz nada.
     Autolimpa sozinho, sem restart. (Independe de heartbeat para a contagem.)"""
     await asyncio.sleep(5)   # dá tempo do servidor/painel subirem
+    _n_dup_seguidas = 0
     while True:
         try:
             agora = time.time()
@@ -5573,16 +5597,24 @@ async def _watchdog_emulador_nativo():
 
             n = _contar_processos_nativos()
             if n > 1:
-                registrar_log(f"[EMU NATIVO][WATCHDOG] {n} processos nativos vivos "
-                              f"(duplicados) -> matando todos (dedupe).")
-                _matar_processos_nativos()
-                await asyncio.sleep(2)   # deixa morrer antes de recriar
+                # Só deduplica se os duplicados PERSISTIREM por 2 ciclos — assim
+                # um secundário transitório (que já vai sair sozinho pelo mutex)
+                # NÃO faz a janela do usuário fechar. Mantém o mais novo.
+                _n_dup_seguidas += 1
+                if _n_dup_seguidas >= 2:
+                    registrar_log(f"[EMU NATIVO][WATCHDOG] {n} nativos vivos -> "
+                                  f"mantendo o mais novo, matando os antigos.")
+                    _matar_processos_nativos(manter_mais_novo=True)
+                    _n_dup_seguidas = 0
+                    await asyncio.sleep(2)
             elif n == 0 and nome_stream:
+                _n_dup_seguidas = 0
                 registrar_log(f"[EMU NATIVO][WATCHDOG] '{nome_stream}' transmitindo "
                               f"e 0 emulador nativo -> subindo 1.")
                 _lancar_emulador_nativo(nome_stream)
                 await asyncio.sleep(6)   # espera subir antes de recontar
-            # n == 1 (ou n == -1 não mediu): estável, não mexe.
+            else:
+                _n_dup_seguidas = 0   # n == 1 (ou -1): estável, zera o contador.
         except Exception as _e_wd2:
             registrar_log(f"[EMU NATIVO][WATCHDOG] erro: {_e_wd2}")
         await asyncio.sleep(4)

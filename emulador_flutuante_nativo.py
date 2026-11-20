@@ -1341,6 +1341,15 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         vl.addSpacing(10)
         vl.addWidget(nome_vertical)
 
+        # Botão FPS (na borda, ABAIXO do nome "KL TRINDADE"): abre o emulador FPS
+        # JÁ MIRANDO o mesmo aparelho deste nativo (sem interferência entre eles).
+        vl.addStretch(1)
+        self.btn_fps = criar_botao("FPS", "Abrir o emulador FPS neste mesmo aparelho",
+                                   cor_borda="#f59e0b", cor_fundo="#3a2a0a", cor_txt="#fde68a")
+        self.btn_fps.setFixedHeight(26)
+        self.btn_fps.clicked.connect(self._abrir_fps)
+        vl.addWidget(self.btn_fps)
+
         corpo.addWidget(lateral)
 
         # Vídeo
@@ -1479,6 +1488,27 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             resp.finished.connect(resp.deleteLater)
         except Exception:
             pass
+
+    def _abrir_fps(self):
+        """Botão FPS (barra lateral): abre o emulador FPS JÁ no MESMO aparelho
+        que está neste nativo. Manda o dispositivo atual para o servidor, que o
+        define como ativo antes de subir o FPS — assim os dois miram o mesmo
+        aparelho, sem interferência. Roda em thread p/ não travar a GUI."""
+        try:
+            alvo = self.ponte.alvo_comando() or ""
+        except Exception:
+            alvo = ""
+        base = self.ponte.url_base
+        def _go():
+            try:
+                import urllib.parse as _up
+                q = _up.urlencode({"dispositivo": alvo})
+                req = urllib.request.Request(f"{base}/abrir-emulador-fps?{q}", method="POST")
+                urllib.request.urlopen(req, timeout=5)
+                print(f"[FPS] Emulador FPS solicitado para '{alvo or 'ativo'}'.")
+            except Exception as e:
+                print(f"[FPS] Falha ao abrir o emulador FPS: {e}")
+        threading.Thread(target=_go, daemon=True).start()
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
     def keyPressEvent(self, ev):
