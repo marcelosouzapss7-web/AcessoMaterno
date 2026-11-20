@@ -2065,6 +2065,23 @@ async def clique_painel(sid, data):
         registrar_log(f"[CLIQUE] ({x:.3f}, {y:.3f}) -> {dispositivo or 'todos'} ({len(alvos)})")
 
 
+@app.post("/clique-painel-http")
+async def clique_painel_http(request: Request):
+    """Fallback HTTP do clique/gesto: o emulador nativo usa isto quando o socket
+    está caído/meio-aberto (senão o clique era silenciosamente descartado em
+    PonteSocket.enviar por 'if sio.connected'). Reaproveita TODA a lógica do
+    clique_painel (sala/bypass/anti-ghost), só que por HTTP. Corpo JSON:
+    {acao, x, y, dispositivo, sala, y1?, y2?, duration?}."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "erro": "JSON inválido"}
+    if not isinstance(data, dict):
+        return {"ok": False, "erro": "payload não é dict"}
+    await clique_painel(None, data)
+    return {"ok": True}
+
+
 @sio.on("tecla_painel")
 async def tecla_painel(sid, data):
     """Teclado do painel -> 'receber_tecla' no aparelho SELECIONADO."""
@@ -5420,6 +5437,23 @@ def _lancar_emulador_nativo(disp=None):
                     "mensagem": "Python da .venv-build não encontrado (instale PySide6 nela: "
                                 ".venv-build\\Scripts\\python.exe -m pip install PySide6)."}
 
+        # DEDUPE (correção definitiva do "perde cliques ao reabrir"): o mutex de
+        # instância única do app às vezes FALHA e acumula vários processos nativos
+        # (foram vistos 6 vivos ao mesmo tempo). Eles brigam -> o socket cai ->
+        # heartbeat/cliques não firmam -> o watchdog relança -> mais processos.
+        # Aqui ENCERRAMOS todos os processos nativos antigos ANTES de subir um
+        # novo, garantindo EXATAMENTE 1 emulador nativo vivo. Server-side (mata os
+        # próprios filhos que ele mesmo lançou), não depende do mutex frágil.
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
+                 "-like '*emulador_flutuante_nativo*' } | ForEach-Object { "
+                 "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+                capture_output=True, timeout=15)
+        except Exception as _e_dedupe:
+            registrar_log(f"[EMU NATIVO] dedupe falhou (segue mesmo assim): {_e_dedupe}")
+
         # MODO JPEG PURO (correção do congelamento): com --video auto o nativo
         # sobe seu próprio receptor WebRTC. Quando esse peer conecta, o aparelho
         # marca WebRtcStreamer.isConectado=true e PARA de enviar JPEG
@@ -5478,6 +5512,18 @@ async def emulador_nativo_heartbeat(sid, data=None):
         _emulador_nativo_heartbeat["dispositivo"] = (data or {}).get("dispositivo")
     except Exception:
         pass
+
+
+@app.get("/emulador-nativo-heartbeat")
+@app.post("/emulador-nativo-heartbeat")
+async def emulador_nativo_heartbeat_http(dispositivo: str = None):
+    """Heartbeat por HTTP (reforço): o emulador nativo bate aqui a cada 3s além
+    do socket. Assim o watchdog SEMPRE vê o nativo vivo, mesmo se o socket.io
+    oscilar — fim do loop de relançamento que derrubava cliques/espelhamento."""
+    _emulador_nativo_heartbeat["ts"] = time.time()
+    if dispositivo:
+        _emulador_nativo_heartbeat["dispositivo"] = dispositivo
+    return {"ok": True}
 
 
 async def _watchdog_emulador_nativo():

@@ -1199,9 +1199,23 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self._timer_http.start(1000)
 
     def _enviar_heartbeat(self):
+        alvo = ""
         try:
             alvo = self.ponte.alvo_comando() or ""
             self.ponte.enviar("emulador_nativo_heartbeat", {"dispositivo": alvo})
+        except Exception:
+            pass
+        # REFORÇO HTTP: bate o heartbeat também por HTTP (não depende do socket).
+        # Assim o watchdog do servidor SEMPRE vê o nativo vivo mesmo se o socket.io
+        # oscilar — acaba o loop de relançamento que derrubava cliques/espelhamento.
+        try:
+            url = QtCore.QUrl(f"{self.ponte.url_base}/emulador-nativo-heartbeat")
+            q = QtCore.QUrlQuery()
+            if alvo:
+                q.addQueryItem("dispositivo", str(alvo))
+            url.setQuery(q)
+            resp = self._net.get(QtNetwork.QNetworkRequest(url))
+            resp.finished.connect(resp.deleteLater)
         except Exception:
             pass
 
@@ -1441,7 +1455,30 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # BYPASS do overlay (Acesso Total) só nesta sala; a sala do dispositivo
         # android vai sem bypass, com handler separado.
         payload["sala"] = "nativo"
-        self.ponte.enviar("clique_painel", payload)
+        # Socket conectado -> envia por socket (rápido). Caído/meio-aberto ->
+        # manda por HTTP (/clique-painel-http). Antes, com o socket caído, o
+        # PonteSocket.enviar descartava o clique em silêncio ('if sio.connected')
+        # — era a causa de "os cliques não funcionam" ao reabrir o nativo.
+        try:
+            if self.ponte.sio.connected:
+                self.ponte.enviar("clique_painel", payload)
+            else:
+                self._enviar_gesto_http(payload)
+        except Exception:
+            self._enviar_gesto_http(payload)
+
+    def _enviar_gesto_http(self, payload: dict):
+        """Envia o clique/gesto por HTTP (fallback quando o socket está caído)."""
+        try:
+            import json as _json
+            url = QtCore.QUrl(f"{self.ponte.url_base}/clique-painel-http")
+            req = QtNetwork.QNetworkRequest(url)
+            req.setRawHeader(b"Content-Type", b"application/json")
+            corpo = QtCore.QByteArray(_json.dumps(payload).encode("utf-8"))
+            resp = self._net.post(req, corpo)
+            resp.finished.connect(resp.deleteLater)
+        except Exception:
+            pass
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
     def keyPressEvent(self, ev):
