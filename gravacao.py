@@ -85,6 +85,156 @@ ARQUIVO_AUDITORIA_INPUTS = os.path.join(PASTA_GRAVACOES, "auditoria_inputs.jsonl
 _trava_inputs = threading.Lock()
 os.makedirs(PASTA_VIDEOS, exist_ok=True)
 
+
+# ---------------------------------------------------------------------------
+# GRAVAÇÃO DUPLA: além de gravacoes/videos (raiz), copia cada vídeo final para
+# a pasta de vídeos do EMULADOR FPS (FPS/videos). Resolve o caminho do FPS do
+# mesmo jeito que o server.py (_pasta_fps_dados): env FPS_DATA_DIR, depois
+# .exe (ao lado do executável), depois o ..\FPS do projeto.
+# ---------------------------------------------------------------------------
+def _resolver_pasta_videos_fps():
+    candidatos = []
+    _env = os.environ.get("FPS_DATA_DIR")
+    if _env:
+        candidatos.append(os.path.join(_env, "videos"))
+    if getattr(sys, "frozen", False):
+        candidatos.append(os.path.join(os.path.dirname(sys.executable), "FPS", "videos"))
+    # PASTA_BASE = raiz do projeto (dirname de gravacoes). O FPS fica em ..\FPS.
+    candidatos.append(os.path.abspath(os.path.join(PASTA_BASE, "..", "FPS", "videos")))
+    candidatos.append(os.path.join(PASTA_BASE, "FPS", "videos"))
+    for c in candidatos:
+        try:
+            pasta_fps = os.path.dirname(c)  # a pasta FPS em si
+            if _env or os.path.isdir(pasta_fps):
+                os.makedirs(c, exist_ok=True)
+                return c
+        except Exception:
+            continue
+    # Último recurso: cria ..\FPS\videos mesmo que ainda não exista.
+    try:
+        c = os.path.abspath(os.path.join(PASTA_BASE, "..", "FPS", "videos"))
+        os.makedirs(c, exist_ok=True)
+        return c
+    except Exception:
+        return None
+
+
+PASTA_VIDEOS_FPS = _resolver_pasta_videos_fps()
+
+
+def _copiar_para_fps(caminho_video):
+    """Copia o vídeo (ou a pasta de frames do fallback) também para FPS/videos.
+    Nunca levanta exceção — falha de cópia não pode quebrar a finalização."""
+    if not PASTA_VIDEOS_FPS or not caminho_video:
+        return
+    try:
+        import shutil
+        if os.path.isfile(caminho_video):
+            os.makedirs(PASTA_VIDEOS_FPS, exist_ok=True)
+            destino = os.path.join(PASTA_VIDEOS_FPS, os.path.basename(caminho_video))
+            if os.path.abspath(destino) != os.path.abspath(caminho_video):
+                shutil.copy2(caminho_video, destino)
+        elif os.path.isdir(caminho_video):
+            destino = os.path.join(PASTA_VIDEOS_FPS, os.path.basename(caminho_video))
+            if os.path.abspath(destino) != os.path.abspath(caminho_video):
+                shutil.copytree(caminho_video, destino, dirs_exist_ok=True)
+    except Exception as e:
+        try:
+            registrar_auditoria("copia_fps_erro", caminho=caminho_video, erro=str(e))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# PORTÃO POR MOVIMENTO: a gravação só começa quando há movimento no dispositivo
+# (gesto remoto OU mudança visual na tela) e só para quando a tela apaga E não
+# há mais movimento por GRACE_PARAR_SEM_MOVIMENTO_S. Evita vídeos parados
+# ocupando memória. A detecção usa frame-diff (cv2) em miniatura 64x64; sem
+# cv2, usa um proxy por hash de amostra do JPEG (sem detectar tela apagada).
+# ---------------------------------------------------------------------------
+LIMIAR_MOVIMENTO = 2.2          # média de |diff| (0-255) na miniatura: acima = movimento
+LIMIAR_TELA_ESCURA = 14.0       # brilho médio (0-255): abaixo = tela apagada/preta
+GRACE_PARAR_SEM_MOVIMENTO_S = 4.0  # segundos parado (e tela apagada) antes de parar
+# Trava anti-memória: mesmo com a tela ACESA, se ficar totalmente parado (sem
+# gesto nem mudança visual) por este tempo, para a gravação — evita o keep-alive
+# (reenvio do último frame a cada ~150ms) gravar minutos de tela estática.
+MAX_PARADO_TELA_ACESA_S = 30.0
+_mov_estado = {}                # dispositivo -> {"prev"/"hash", "ultimo_mov_ts"}
+_trava_mov = threading.Lock()
+
+
+def marcar_gesto(dispositivo):
+    """Marca 'houve movimento AGORA' por um gesto remoto (clique/arraste/tecla).
+    Chamado pelo server.py quando um gesto é repassado ao dispositivo, para que
+    a interação do operador conte como movimento mesmo sem mudança visual."""
+    if not dispositivo:
+        return
+    with _trava_mov:
+        st = _mov_estado.get(dispositivo) or {}
+        st["ultimo_mov_ts"] = time.time()
+        _mov_estado[dispositivo] = st
+
+
+def tempo_desde_movimento(dispositivo):
+    """Segundos desde o último movimento (gesto ou visual). Grande se nunca houve."""
+    with _trava_mov:
+        st = _mov_estado.get(dispositivo)
+        if not st:
+            return 1e9
+        return time.time() - st.get("ultimo_mov_ts", 0.0)
+
+
+def avaliar_frame(dispositivo, jpeg_bytes):
+    """Compara o frame atual com o anterior deste dispositivo.
+    Retorna (tem_movimento: bool, tela_escura: bool). Atualiza ultimo_mov_ts
+    quando detecta movimento visual."""
+    agora = time.time()
+    if cv2 is not None and np is not None:
+        try:
+            arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                return (False, False)
+            peq = cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA)
+            tela_escura = float(peq.mean()) < LIMIAR_TELA_ESCURA
+            with _trava_mov:
+                st = _mov_estado.get(dispositivo) or {}
+                prev = st.get("prev")
+                tem_mov = False
+                if prev is not None:
+                    if float(cv2.absdiff(prev, peq).mean()) >= LIMIAR_MOVIMENTO:
+                        tem_mov = True
+                st["prev"] = peq
+                if tem_mov:
+                    st["ultimo_mov_ts"] = agora
+                st.setdefault("ultimo_mov_ts", 0.0)
+                _mov_estado[dispositivo] = st
+            return (tem_mov, tela_escura)
+        except Exception:
+            return (False, False)
+    else:
+        # Sem cv2: proxy por hash de amostra do JPEG (detecta mudança de conteúdo).
+        try:
+            import hashlib
+            h = hashlib.md5(bytes(jpeg_bytes[::97])).hexdigest()
+            with _trava_mov:
+                st = _mov_estado.get(dispositivo) or {}
+                tem_mov = (st.get("hash") is not None and h != st.get("hash"))
+                st["hash"] = h
+                if tem_mov:
+                    st["ultimo_mov_ts"] = agora
+                st.setdefault("ultimo_mov_ts", 0.0)
+                _mov_estado[dispositivo] = st
+            return (tem_mov, False)  # sem cv2 não há detecção confiável de tela apagada
+        except Exception:
+            return (True, False)
+
+
+def limpar_estado_movimento(dispositivo):
+    """Esquece o estado de movimento do dispositivo (ao desconectar/encerrar)."""
+    with _trava_mov:
+        _mov_estado.pop(dispositivo, None)
+
 # ---------------------------------------------------------------------------
 # DIAGNÓSTICO DE INICIALIZAÇÃO (hardening): torna falhas VISÍVEIS no console.
 # A queda silenciosa do OpenCV (muito comum em PyInstaller/Windows por DLLs
@@ -417,6 +567,7 @@ class GravadorVideo:
             "erro": self._erro,
         }
         _salvar_metadados(metadados)
+        _copiar_para_fps(self.caminho_video)  # gravação dupla: também em FPS/videos
         registrar_auditoria(
             "gravacao_finalizada", dispositivo=self.dispositivo,
             sessao=self.sessao_id, frames=self._frames_escritos,
@@ -582,6 +733,7 @@ class GravadorFallback:
             "modo": "fallback_sem_opencv",
         }
         _salvar_metadados(metadados)
+        _copiar_para_fps(self.caminho_video)  # gravação dupla: também em FPS/videos
         registrar_auditoria("gravacao_finalizada_fallback", dispositivo=self.dispositivo,
                             sessao=self.sessao_id, frames=self._frames_escritos,
                             duracao_s=metadados["duracao_s"], erro=self._erro)

@@ -18,6 +18,18 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 # ---------------------------------------------------------------------------
 _FPS_DIR = os.path.abspath(os.path.join(SPECPATH, '..', 'FPS'))
 
+# GARANTIA: os arquivos de trabalho/config do FPS saem SEMPRE em
+# dist\Acesso Materno\FPS\ (para o emulador FPS funcionar numa máquina nova,
+# sem depender de pasta FPS pré-existente). As subpastas capturas/videos/finais
+# o próprio código cria em runtime (makedirs); aqui garantimos só os arquivos
+# essenciais que existirem. Não inclui gravações/capturas antigas (evita inchar
+# o .exe).
+_fps_datas_extra = []
+for _f in ('run.py', 'sensibilidade.json', 'target_window.json', 'README.md', 'requirements.txt'):
+    _p = os.path.join(_FPS_DIR, _f)
+    if os.path.exists(_p):
+        _fps_datas_extra.append((_p, 'FPS'))
+
 # ---------------------------------------------------------------------------
 # Coleta robusta de pacotes "pesados" (codigo + binarios + metadados .dist-info,
 # necessarios para o supabase/pydantic validarem versoes em runtime).
@@ -98,7 +110,7 @@ a = Analysis(
         # mas o index.html fica sem estilo/scripts.
         ('css', 'css'),
         ('js', 'js'),
-    ] + _datas,
+    ] + _fps_datas_extra + _datas,
     hiddenimports=_hidden,
     hookspath=[],
     hooksconfig={},

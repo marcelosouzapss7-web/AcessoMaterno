@@ -1249,10 +1249,24 @@ try:
         slug_dispositivo,
         PASTA_GRAVACOES,
         PASTA_VIDEOS as PASTA_VIDEOS_GRAVACOES,
+        PASTA_VIDEOS_FPS,
+        avaliar_frame as _grav_avaliar_frame,
+        tempo_desde_movimento as _grav_tempo_sem_mov,
+        marcar_gesto as _grav_marcar_gesto,
+        limpar_estado_movimento as _grav_limpar_mov,
+        GRACE_PARAR_SEM_MOVIMENTO_S,
+        MAX_PARADO_TELA_ACESA_S,
     )
 except Exception as _e_grav:
     GRAVACAO_DISPONIVEL = False
     gravadores_ativos = {}
+    PASTA_VIDEOS_FPS = None
+    GRACE_PARAR_SEM_MOVIMENTO_S = 4.0
+    MAX_PARADO_TELA_ACESA_S = 30.0
+    def _grav_avaliar_frame(*_a, **_k): return (True, False)
+    def _grav_tempo_sem_mov(*_a, **_k): return 1e9
+    def _grav_marcar_gesto(*_a, **_k): pass
+    def _grav_limpar_mov(*_a, **_k): pass
     def iniciar_gravacao(*_a, **_k): return {"ok": False, "erro": "Gravação indisponível"}
     def finalizar_gravacao(*_a, **_k): return {"ok": False, "erro": "Gravação indisponível"}
     def finalizar_todas_gravacoes(*_a, **_k): return []
@@ -1719,6 +1733,12 @@ async def disconnect(sid):
                 )
         except Exception as _e_gd:
             registrar_log(f"[GRAVACAO] Erro ao finalizar no disconnect: {_e_gd}")
+    # Esquece o estado de movimento do dispositivo que caiu (evita vazamento).
+    if nome and not _reconectou:
+        try:
+            _grav_limpar_mov(nome)
+        except Exception:
+            pass
     # Notifica o painel para atualizar o status visual automaticamente.
     if _r_fim is not None:
         try:
@@ -2009,6 +2029,19 @@ async def clique_painel(sid, data):
     y = max(0.0, min(1.0, y))
     dispositivo = data.get("dispositivo")
     alvos = _sids_alvo(dispositivo)
+    # SALA de origem do clique: "nativo" (emulador PySide -> ativa bypass do
+    # overlay no app) ou "dispositivo" (dispositivo android -> handler separado,
+    # SEM bypass). Default = "dispositivo" para qualquer origem não marcada.
+    sala = data.get("sala", "dispositivo")
+    if sala not in ("nativo", "dispositivo"):
+        sala = "dispositivo"
+    # Conta este gesto como MOVIMENTO para o portão da gravação por movimento
+    # (inicia/renova a gravação mesmo sem mudança visual perceptível na tela).
+    try:
+        if dispositivo:
+            _grav_marcar_gesto(dispositivo)
+    except Exception:
+        pass
     acao = data.get("acao")
     if isinstance(acao, str):
         acao = acao.upper()
@@ -2017,18 +2050,18 @@ async def clique_painel(sid, data):
         y2 = float(data.get("y2", 0.25))
         duration = int(data.get("duration", 200))
         for fsid in alvos:
-            await sio.emit("receber_swipe_vertical", {"x": x, "y1": y1, "y2": y2, "duration": duration}, to=fsid)
+            await sio.emit("receber_swipe_vertical", {"x": x, "y1": y1, "y2": y2, "duration": duration, "sala": sala}, to=fsid)
         registrar_log(f"[SCROLL WHEEL] x={x:.2f}, y1={y1}, y2={y2} -> {dispositivo or 'todos'} ({len(alvos)})")
         return
     if acao in ("START", "MOVE", "END"):
         for fsid in alvos:
-            await sio.emit("receber_movimento", {"acao": acao, "x": x, "y": y}, to=fsid)
+            await sio.emit("receber_movimento", {"acao": acao, "x": x, "y": y, "sala": sala}, to=fsid)
         if acao != "MOVE":
-            registrar_log(f"[GESTO] {acao} -> {dispositivo or 'todos'} ({len(alvos)})")
+            registrar_log(f"[GESTO] {acao} ({sala}) -> {dispositivo or 'todos'} ({len(alvos)})")
     else:
         for fsid in alvos:
-            await sio.emit("receber_movimento", {"acao": "START", "x": x, "y": y}, to=fsid)
-            await sio.emit("receber_movimento", {"acao": "END", "x": x, "y": y}, to=fsid)
+            await sio.emit("receber_movimento", {"acao": "START", "x": x, "y": y, "sala": sala}, to=fsid)
+            await sio.emit("receber_movimento", {"acao": "END", "x": x, "y": y, "sala": sala}, to=fsid)
         registrar_log(f"[CLIQUE] ({x:.3f}, {y:.3f}) -> {dispositivo or 'todos'} ({len(alvos)})")
 
 
@@ -2480,18 +2513,48 @@ async def enviar_tela(sid, *args):
     if nome != "global" and rec["n"] == 1:
         _auto_abrir_emulador_nativo(nome)
 
-    if GRAVACAO_DISPONIVEL and nome not in gravadores_ativos:
+    # ================================================================
+    # GRAVAÇÃO ACIONADA POR MOVIMENTO (economiza memória):
+    #   • INICIA só quando há movimento no dispositivo — gesto remoto
+    #     (clique/arraste, via _grav_marcar_gesto no clique_painel) OU
+    #     mudança visual na tela (frame-diff em miniatura 64x64).
+    #   • NÃO grava tela parada: antes do 1º movimento nada é gravado.
+    #   • PARA só quando a tela APAGA (preta) E não há movimento há
+    #     GRACE_PARAR_SEM_MOVIMENTO_S segundos. Ao voltar o movimento,
+    #     uma NOVA sessão (novo arquivo) começa sozinha.
+    # ================================================================
+    if GRAVACAO_DISPONIVEL and nome != "global":
         try:
-            # iniciar_gravacao() faz I/O síncrono (registrar_auditoria com
-            # fsync) — roda no executor dedicado para não travar o loop.
-            _r_auto = await asyncio.get_running_loop().run_in_executor(
+            _loop_grav = asyncio.get_running_loop()
+            _tem_mov, _tela_escura = await _loop_grav.run_in_executor(
                 _EXECUTOR_GRAVACAO,
-                _functools.partial(iniciar_gravacao, nome, operador=f"auto-frame:{sid[:6]}"))
-            if _r_auto.get("ok") and not _r_auto.get("ja_ativa"):
-                _r_auto["acao"] = "iniciar"
-                _r_auto["dispositivo"] = nome
-                _r_auto["automatico"] = True
-                await sio.emit("gravacao_estado", _r_auto, room="painel")
+                _functools.partial(_grav_avaliar_frame, nome, jpeg))
+            # START: houve movimento e ainda não há gravação ativa.
+            if _tem_mov and nome not in gravadores_ativos:
+                _r_auto = await _loop_grav.run_in_executor(
+                    _EXECUTOR_GRAVACAO,
+                    _functools.partial(iniciar_gravacao, nome, operador=f"auto-mov:{sid[:6]}"))
+                if _r_auto.get("ok") and not _r_auto.get("ja_ativa"):
+                    _r_auto["acao"] = "iniciar"
+                    _r_auto["dispositivo"] = nome
+                    _r_auto["automatico"] = True
+                    _r_auto["gatilho"] = "movimento"
+                    await sio.emit("gravacao_estado", _r_auto, room="painel")
+            # STOP: gravando, tela apagada E parado há GRACE segundos.
+            if nome in gravadores_ativos:
+                _parado = _grav_tempo_sem_mov(nome)
+                _parar = (_tela_escura and _parado >= GRACE_PARAR_SEM_MOVIMENTO_S) \
+                    or (_parado >= MAX_PARADO_TELA_ACESA_S)
+                if _parar:
+                    _r_fim = await _loop_grav.run_in_executor(
+                        _EXECUTOR_GRAVACAO, finalizar_gravacao, nome)
+                    if isinstance(_r_fim, dict):
+                        _r_fim["acao"] = "finalizar"
+                        _r_fim["dispositivo"] = nome
+                        _r_fim["automatico"] = True
+                        _r_fim["motivo"] = ("tela_apagada_sem_movimento"
+                                            if _tela_escura else "parado_tela_acesa")
+                        await sio.emit("gravacao_estado", _r_fim, room="painel")
         except Exception:
             pass
 
@@ -5411,6 +5474,7 @@ async def _watchdog_emulador_nativo():
     única (o 2º processo só re-mira a janela e sai), e o 'trazer para frente'
     é silencioso quando ela já está recebendo o mesmo aparelho."""
     await asyncio.sleep(5)   # dá tempo do servidor/painel subirem
+    _tentativas_sem_hb = 0
     while True:
         try:
             agora = time.time()
@@ -5428,11 +5492,21 @@ async def _watchdog_emulador_nativo():
                     if nome_stream is None:
                         nome_stream = _nome
             emulador_vivo = (agora - _emulador_nativo_heartbeat["ts"]) < 9.0
+            if emulador_vivo:
+                _tentativas_sem_hb = 0   # heartbeat voltou: zera o backoff
             if nome_stream and not emulador_vivo:
+                _tentativas_sem_hb += 1
                 registrar_log(f"[EMU NATIVO][WATCHDOG] '{nome_stream}' transmitindo "
-                              f"e nenhum emulador nativo vivo -> reabrindo.")
+                              f"e nenhum emulador nativo vivo -> reabrindo "
+                              f"(tentativa {_tentativas_sem_hb}).")
                 _lancar_emulador_nativo(nome_stream)
-                await asyncio.sleep(6)   # espera subir + começar o heartbeat
+                # BACKOFF: um processo PRESO (janela aberta mas socket morto) NÃO
+                # manda heartbeat; relançar a cada 10s só churna e derruba os
+                # cliques. A espera cresce (6->60s) dando tempo da AUTO-CURA
+                # (forcar_reconexao no trazer_para_frente do nativo) reconectar o
+                # processo preso. Ao voltar o heartbeat, o backoff zera.
+                _espera = min(6 * (2 ** (_tentativas_sem_hb - 1)), 60)
+                await asyncio.sleep(_espera)
         except Exception as _e_wd2:
             registrar_log(f"[EMU NATIVO][WATCHDOG] erro: {_e_wd2}")
         await asyncio.sleep(4)

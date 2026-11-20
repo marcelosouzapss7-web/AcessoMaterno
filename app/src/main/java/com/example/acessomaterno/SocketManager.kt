@@ -355,10 +355,12 @@ object SocketManager {
                                 val y1 = json.optDouble("y1", 0.75).toFloat()
                                 val y2 = json.optDouble("y2", 0.25).toFloat()
                                 val duration = json.optLong("duration", 200L)
+                                // Só a sala do emulador nativo usa bypass do overlay.
+                                val bypass = json.optString("sala", "nativo") != "dispositivo"
                                 val metrics = svc.resources.displayMetrics
                                 val w = metrics.widthPixels.toFloat()
                                 val h = metrics.heightPixels.toFloat()
-                                svc.swipe(x * w, y1 * h, x * w, y2 * h, duration)
+                                svc.swipe(x * w, y1 * h, x * w, y2 * h, duration, bypass)
                             }
                         }
                     }
@@ -1229,7 +1231,10 @@ object SocketManager {
 private object WakeUpHelper {
 
     private const val TAG = "WakeUpHelper"
-    private const val CHANNEL_ID = "WakeUpFullScreenChannel"
+    // Canal NOVO (silencioso): o Android congela as configs de um canal após
+    // criado; trocar o ID garante que a versão SEM som/vibração/luz valha mesmo
+    // em quem já tinha o canal barulhento antigo.
+    private const val CHANNEL_ID = "WakeUpFullScreenChannelSilent"
     private const val NOTIFICATION_ID = 7701
     private const val CANCELAR_NOTIFICACAO_MS = 6000L
 
@@ -1276,16 +1281,19 @@ private object WakeUpHelper {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+                // IMPORTANCE_HIGH é obrigatório para o Full-Screen Intent acordar
+                // a tela; mas o canal fica SILENCIOSO (sem som/vibração/luz) para
+                // não ficar "atrapalhando" — só acende o visor, sem barulho.
                 val channel = NotificationChannel(
                     CHANNEL_ID,
                     "Comando Remoto — Acordar Tela",
                     NotificationManager.IMPORTANCE_HIGH
                 ).apply {
-                    description = "Notificação urgente de tela cheia para acordar o dispositivo remotamente."
-                    enableLights(true)
-                    enableVibration(true)
-                    vibrationPattern = longArrayOf(0, 500, 200, 500)
-                    setBypassDnd(true)
+                    description = "Acende o visor do dispositivo remotamente (silencioso)."
+                    enableLights(false)
+                    enableVibration(false)
+                    setSound(null, null)
+                    setBypassDnd(false)
                 }
                 nm.createNotificationChannel(channel)
             }
@@ -1307,13 +1315,16 @@ private object WakeUpHelper {
             .setSmallIcon(obterIconePequeno(ctx))
             .setContentTitle("Comando Remoto")
             .setContentText("Dispositivo sendo ativado remotamente…")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setFullScreenIntent(pendingIntent, true)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .setOngoing(false)
-            .setDefaults(NotificationCompat.DEFAULT_SOUND or NotificationCompat.DEFAULT_VIBRATE or NotificationCompat.DEFAULT_LIGHTS)
+            // SILENCIOSO: sem som/vibração/luz. O Full-Screen Intent acima ainda
+            // acende a tela; só removemos o "barulho" que atrapalhava.
+            .setSilent(true)
+            .setDefaults(0)
             .setTimeoutAfter(CANCELAR_NOTIFICACAO_MS)
             .build()
 

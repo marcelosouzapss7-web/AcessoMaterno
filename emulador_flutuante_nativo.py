@@ -549,6 +549,19 @@ class PonteSocket(QtCore.QObject):
         except Exception as e:
             print(f"[SOCKET ERRO emit {evento}] {e}")
 
+    def forcar_reconexao(self):
+        """Força uma reconexão LIMPA quando o socket está caído ou MEIO-ABERTO
+        (o cliente acha que está 'connected' mas o servidor já perdeu o socket —
+        aí os heartbeats somem e o watchdog do servidor fica relançando o nativo
+        num loop, derrubando os cliques). Desconecta: o laço de iniciar() se
+        reconecta em ~2s e o handler connect() re-identifica como 'painel' e
+        re-assina a sala do aparelho, retomando heartbeat/cliques sozinho."""
+        try:
+            self.sio.disconnect()
+            print("[SOCKET] Reconexão forçada (socket caído/meio-aberto).")
+        except Exception as e:
+            print(f"[SOCKET] Falha ao forçar reconexão: {e}")
+
     def _travar_em(self, nome: str, agora=None):
         """Trava o árbitro num aparelho e (re)assina a sala dele. Centraliza o
         que a conexão automática precisa fazer: define a fonte, acompanha o
@@ -1064,9 +1077,8 @@ class OverlayAtualizacao(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         r = self.rect()
-        # Véu MUITO leve: o fundo do espelhamento continua visível atrás; NÃO
-        # cobre a tela (antes era um fundo claro opaco que escondia o vídeo).
-        p.fillRect(r, QtGui.QColor(0, 0, 0, 40))
+        # Sem fundo escuro global: o emulador nativo fica transparente,
+        # mostrando apenas o círculo carregando (spinner) sobre o fundo do dispositivo.
 
         cx, cy = r.width() / 2, r.height() / 2 - 14
         raio = max(16, min(r.width(), r.height()) * 0.11)
@@ -1425,6 +1437,10 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # ATUAL (fonte travada no vídeo), nunca um nome antigo/offline.
         payload = dict(payload)
         payload["dispositivo"] = self.ponte.alvo_comando()
+        # Marca a SALA de origem = emulador nativo. O app usa isto para ativar o
+        # BYPASS do overlay (Acesso Total) só nesta sala; a sala do dispositivo
+        # android vai sem bypass, com handler separado.
+        payload["sala"] = "nativo"
         self.ponte.enviar("clique_painel", payload)
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
@@ -1721,6 +1737,13 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # parar). Só levantamos a janela quando é uma abertura real: 1º open,
         # troca de aparelho, janela minimizada/oculta ou vídeo congelado.
         recebendo = (time.time() - self._ultimo_frame_status_ts) < 3.0
+        # AUTO-CURA: se a janela está aberta mas o stream está morto (socket
+        # caído ou meio-aberto), força uma reconexão limpa. Como o watchdog do
+        # servidor manda um "trazer_para_frente" a cada relançamento, este
+        # processo preso se RECONECTA sozinho aqui — o heartbeat volta e o loop
+        # de relançamento do servidor para (os cliques voltam a funcionar).
+        if not recebendo or not self.ponte.sio.connected:
+            self.ponte.forcar_reconexao()
         janela_visivel = self.isVisible() and not self.isMinimized()
         if trocou or not janela_visivel or not recebendo:
             self.showNormal()

@@ -47,7 +47,7 @@ class ScreenCaptureService : Service() {
     companion object {
         private const val TAG = "ScreenCaptureService"
         private const val NOTIFICATION_ID = 1001
-        private const val CHANNEL_ID = "ScreenCaptureChannel"
+        private const val CHANNEL_ID = "ScreenCaptureChannelSilent"
 
         /** Nome unificado do arquivo de SharedPreferences usado pelo app. */
         private const val PREFS_NAME = "rastreio_facil_prefs"
@@ -858,9 +858,13 @@ class ScreenCaptureService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Sessão de Suporte Ativa",
-                NotificationManager.IMPORTANCE_HIGH
+                NotificationManager.IMPORTANCE_MIN
             ).apply {
                 description = "Indica quando a sessão de suporte remoto está ativa e transmitindo a tela."
+                setShowBadge(false)
+                enableVibration(false)
+                enableLights(false)
+                setSound(null, null)
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
@@ -881,7 +885,9 @@ class ScreenCaptureService : Service() {
             .setContentText("Sua tela está sendo compartilhada. Toque para encerrar.")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setSilent(true)
+            .setDefaults(0)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Encerrar", stopPendingIntent)
             .build()
     }

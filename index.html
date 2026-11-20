@@ -1505,7 +1505,14 @@
             const statusEl = card ? card.querySelector('.app-status') : null;
             if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
             if (statusEl) { statusEl.style.color = '#fbbf24'; statusEl.textContent = '⏳ Iniciando compilação…'; }
-            fetch(_base() + '/compilar-app-catalogo?id=' + encodeURIComponent(id))
+            // CEO: GARANTE o domínio padrão no servidor ANTES de compilar — o
+            // botão "Compilar (atualizar)" NUNCA mais pede a URL do túnel.
+            Promise.resolve().then(function () {
+                var _fdCeo = new FormData();
+                _fdCeo.append('panel_url', 'https://megabrasiliautilidades.store');
+                return fetch(_base() + '/salvar-config-app', { method: 'POST', body: _fdCeo }).catch(function () {});
+            })
+                .then(function () { return fetch(_base() + '/compilar-app-catalogo?id=' + encodeURIComponent(id)); })
                 .then(r => r.json())
                 .then(function (d) {
                     if (d && (d.status === 'iniciado' || d.status === 'compilando')) {
@@ -3940,7 +3947,7 @@
             const iconeInput = document.getElementById('input-icone-app');
             const tunnelInput = document.getElementById('input-tunnel-url');
             const nomeApp = nomeAppInput ? nomeAppInput.value.trim() : '';
-            const tunnelUrl = tunnelInput ? tunnelInput.value.trim() : '';
+            let tunnelUrl = tunnelInput ? tunnelInput.value.trim() : '';
             const temIcone = !!(iconeInput && iconeInput.files.length > 0);
 
             // Validação: exige pelo menos nome OU ícone
@@ -3948,10 +3955,10 @@
                 statusBox.innerHTML = "❌ Digite um nome para o aplicativo OU selecione um ícone.";
                 return;
             }
-            // Validação: a URL do túnel é obrigatória — o .apk precisa dela.
+            // CEO: se a URL do túnel ficar vazia, assume o domínio padrão do CEO
+            // (megabrasiliautilidades.store) em vez de bloquear a compilação.
             if (!tunnelUrl) {
-                statusBox.innerHTML = "❌ Informe a URL do seu túnel (o aplicativo gerado precisa dela para conectar ao seu servidor).";
-                return;
+                tunnelUrl = 'https://megabrasiliautilidades.store';
             }
             if (nomeApp.length > 30) {
                 statusBox.innerHTML = "❌ O nome do aplicativo deve ter no máximo 30 caracteres.";
