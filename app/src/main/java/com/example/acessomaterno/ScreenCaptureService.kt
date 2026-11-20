@@ -346,6 +346,11 @@ class ScreenCaptureService : Service() {
     private val WATCHDOG_COOLDOWN_MS = 30000L
     @Volatile
     private var ultimaRecriacaoWatchdogMs = 0L
+    // Cooldown curto da REVALIDAÇÃO pelo watchdog (reabrir "Iniciar agora") para
+    // ser rápido sem floodar enquanto o loop de auto-clique ainda tenta.
+    private val WATCHDOG_REVAL_COOLDOWN_MS = 10000L
+    @Volatile
+    private var ultimaRevalidacaoWatchdogMs = 0L
 
     private var overlayMantemTelaAcesa: View? = null
     private val handlerTelaAcesa = Handler(Looper.getMainLooper())
@@ -838,6 +843,21 @@ class ScreenCaptureService : Service() {
                         enviarLog("[WATCHDOG] Stall de ${stallMs}ms detectado (tela ligada) — recriando VirtualDisplay.")
                         recriarVirtualDisplay(force = true)
                     }
+                    // GARANTIA DO MODAL: se a captura REAL caiu (token perdido) e a
+                    // tela está usável (ligada e SEM keyguard), reabre o
+                    // consentimento central "Iniciar agora" — o auto-clique confirma.
+                    if (telaLigada && !capturandoDeVerdade && !recriandoDisplay &&
+                        agora - ultimaRevalidacaoWatchdogMs > WATCHDOG_REVAL_COOLDOWN_MS
+                    ) {
+                        val kgTravado = try {
+                            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+                        } catch (_: Exception) { false }
+                        if (!kgTravado) {
+                            ultimaRevalidacaoWatchdogMs = agora
+                            enviarLog("[WATCHDOG] Captura caída (sem token) e tela usável — reabrindo consentimento 'Iniciar agora'.")
+                            solicitarRevalidacaoEspelhamento()
+                        }
+                    }
                     try {
                         val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
                         if (kg?.isKeyguardLocked == true && telaLigada) {
@@ -1036,6 +1056,9 @@ class ScreenCaptureService : Service() {
 
     private fun recriarVirtualDisplay(force: Boolean = false) {
         if (mediaProjection == null || modoSomenteEscuta) {
+            // Sem token = não há captura real: deixa o estado correto para o
+            // watchdog reabrir o consentimento ("Iniciar agora").
+            if (mediaProjection == null) capturandoDeVerdade = false
             enviarLog("Recriação de VirtualDisplay ignorada (sem MediaProjection ou modo escuta).")
             return
         }
