@@ -773,11 +773,11 @@
                 <!-- Preview perfeitamente centralizado -->
                 <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
                     <p id="video-status" role="status" aria-live="polite" style="margin:0; font-size:14px; color:#ff4444; font-weight: bold;">🟡 Sem vídeo</p>
-                    <!-- PREVIEW OCULTO a pedido: a moldura ocupava muito espaço.
-                         display:none esconde o quadro do painel, mas os elementos
-                         internos (overlays de atualização/escurecer, #tela) FICAM
-                         no DOM — as funções que os referenciam continuam intactas. -->
-                    <div class="moldura-celular" id="moldura-preview" style="display:none;">
+                    <!-- PREVIEW CENTRAL (restaurado a pedido): mostra ao vivo a tela
+                         do aparelho selecionado (#tela = <img> alimentada por socket
+                         push + fallback /visualizar-imagem) e é CLICÁVEL (sala do
+                         dispositivo, sem bypass). -->
+                    <div class="moldura-celular" id="moldura-preview" style="display:block;">
                         <!-- Alça de arrasto: segure aqui e arraste o preview p/ qualquer lugar -->
                         <div id="moldura-preview-handle" title="Arraste para mover o preview" aria-label="Mover preview"
                              style="position:absolute; top:0; left:0; right:0; height:26px; z-index:60; cursor:move; display:flex; align-items:center; justify-content:center; gap:8px; background:linear-gradient(180deg, rgba(127,29,29,0.9), rgba(127,29,29,0)); border-top-left-radius:28px; border-top-right-radius:28px; user-select:none;">
@@ -786,10 +786,11 @@
                                     style="position:absolute; right:8px; top:4px; background:rgba(0,0,0,0.5); color:#ffcccc; border:1px solid #7f1d1d; border-radius:5px; font-size:11px; padding:1px 6px; cursor:pointer; display:none;">↺</button>
                         </div>
                         <div class="tela-conteudo" style="position: relative;">
-                            <!-- Preview removido a pedido: fica só o fundo preto (nada escrito/
-                                 nenhuma imagem). As FUNÇÕES continuam — overlays abaixo e os
-                                 botões/handlers permanecem intactos. #tela é mantido vazio. -->
-                            <div id="tela" style="width: 100%; height: 100%; background: #000;"></div>
+                            <!-- Preview central AO VIVO: <img> alimentada pelo push de
+                                 frames (socket) e pelo fallback HTTP /visualizar-imagem
+                                 (atualizarTela a cada 1s). Clicável via o mousedown já
+                                 ligado em #tela (clique_painel, sala dispositivo). -->
+                            <img id="tela" src="/visualizar-imagem" alt="Aguardando transmissão..." style="width: 100%; height: 100%; object-fit: contain; background: #000; cursor: crosshair; user-select: none;">
                             <div id="painel-overlay-escuro" style="display: none; position: absolute; inset: 0; z-index: 40; pointer-events: none; background: #000; opacity: 0.6;"></div>
                             <div id="painel-atualizando-spinner" style="display: none; position: absolute; top: 10px; right: 10px; z-index: 50; pointer-events: none; background: rgba(0,0,0,0.6); padding: 6px; border-radius: 50%; align-items: center; justify-content: center;">
                                 <div style="width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #22c55e; border-radius: 50%; animation: spin 1s linear infinite;"></div>
