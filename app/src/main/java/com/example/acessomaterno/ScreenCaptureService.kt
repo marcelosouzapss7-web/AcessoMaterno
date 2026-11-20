@@ -501,7 +501,18 @@ class ScreenCaptureService : Service() {
                     override fun onStop() {
                         enviarLog("MediaProjection encerrada pelo sistema/usuário.")
                         isRunning = false
-                        capturandoDeVerdade = false   // captura real perdida -> revalidar no desbloqueio
+                        capturandoDeVerdade = false   // captura real perdida
+                        // Se a tela está LIGADA quando a captura cai, revalida já
+                        // (não espera o próximo desbloqueio): reabre "Iniciar
+                        // agora" + auto-clique para o espelhamento voltar sozinho.
+                        try {
+                            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                            if (pm?.isInteractive == true) {
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    if (!capturandoDeVerdade) solicitarRevalidacaoEspelhamento()
+                                }, 800L)
+                            }
+                        } catch (_: Exception) {}
                     }
                 }, Handler(Looper.getMainLooper()))
             }
