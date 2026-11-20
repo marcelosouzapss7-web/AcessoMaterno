@@ -942,6 +942,7 @@ class MyAccessibilityService : AccessibilityService() {
     private val filaGestos = java.util.ArrayDeque<() -> Unit>()
     @Volatile private var gestoEmAndamento = false
     private val gestoLock = Any()
+    private val handlerGestos = Handler(Looper.getMainLooper())
 
     /** Enfileira um gesto. Se nenhum está rodando, despacha na hora; senão
      *  guarda para despachar quando o atual terminar (onCompleted/onCancelled).
@@ -977,6 +978,19 @@ class MyAccessibilityService : AccessibilityService() {
         sx: Float, sy: Float, fx: Float, fy: Float,
         duration: Long, movido: Boolean, bypass: () -> Unit
     ) {
+        // FINALIZAÇÃO GARANTIDA (exatamente 1x): o callback do sistema OU um
+        // TIMEOUT de segurança chamam finalizar() -> gestoConcluido(). Isso impede
+        // a fila de TRAVAR (cliques "demorando/presos") quando alguma ROM aceita o
+        // dispatchGesture mas NUNCA devolve onCompleted/onCancelled.
+        val finalizado = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun finalizar() {
+            if (!finalizado.compareAndSet(false, true)) return
+            bypass()
+            gestoConcluido()
+        }
+        // Se o callback não vier até (duração + margem), libera a fila assim mesmo.
+        handlerGestos.postDelayed({ finalizar() }, duration + 500L)
+
         val path = Path().apply { moveTo(sx, sy); lineTo(fx, fy) }
         try {
             val stroke = GestureDescription.StrokeDescription(path, 0, duration)
@@ -984,28 +998,24 @@ class MyAccessibilityService : AccessibilityService() {
             val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
                 override fun onCompleted(g: GestureDescription?) {
                     enviarLog("toque/gesto OK (${fx.toInt()},${fy.toInt()})")
-                    bypass()
-                    gestoConcluido()
+                    finalizar()
                 }
                 override fun onCancelled(g: GestureDescription?) {
                     enviarLog("toque/gesto CANCELADO (${fx.toInt()},${fy.toInt()}) — fallback por nó")
                     if (!movido) clicarNoNoNaCoordenada(fx, fy)
-                    bypass()
-                    gestoConcluido()
+                    finalizar()
                 }
             }, null)
 
             if (!aceito) {
                 enviarLog("dispatchGesture recusado em (${fx.toInt()},${fy.toInt()}) — fallback por nó")
                 if (!movido) clicarNoNoNaCoordenada(fx, fy)
-                bypass()
-                gestoConcluido()
+                finalizar()
             }
         } catch (e: Exception) {
             enviarLog("Erro ao injetar gesto: ${e.message} — fallback por nó")
             if (!movido) clicarNoNoNaCoordenada(fx, fy)
-            bypass()
-            gestoConcluido()
+            finalizar()
         }
     }
 
