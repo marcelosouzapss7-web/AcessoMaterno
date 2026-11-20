@@ -858,9 +858,18 @@
                             🗂️ Aplicativos
                         </button>
 
-                        <button id="btn-nova-atualizacao" onclick="novaAtualizacao(this)" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
-                            🔄 Nova Atualização
-                        </button>
+                        <!-- Switch Direita/Esquerda: tela de atualização discreta.
+                             Direita (verde) = Ativar | Esquerda (cinza) = Desativar. -->
+                        <div id="switch-atualizacao" role="switch" aria-checked="false"
+                             onclick="toggleAtualizacao()"
+                             title="Atualização discreta — Direita: Ativar | Esquerda: Desativar"
+                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; cursor:pointer; font-size:11px; user-select:none;">
+                            <span>🔄 Atualização</span>
+                            <span id="switch-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto;">
+                                <span id="switch-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s;"></span>
+                            </span>
+                            <span id="switch-estado" style="font-size:10px; color:#9ca3af; min-width:46px; text-align:right;">Desativado</span>
+                        </div>
 
                         <div style="display:flex; flex-direction:column; gap:4px; margin-top: 2px;">
                             <label style="color:#d4d4d8; font-size:10px; display:flex; align-items:center; gap:4px; cursor:pointer; user-select:none;">
@@ -1392,6 +1401,43 @@
             try { if (window.socket && window.socket.emit) { window.socket.emit('atualizacao_dispositivo', p); window.socket.emit('overlay_atualizacao_visual', p); } } catch (e) {}
             try { fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false')).catch(function () {}); } catch (e) {}
         }
+
+        // ── SWITCH Direita/Esquerda (ETAPA 1 e 4) ──────────────────────────────
+        // Direita (verde) = Ativar a tela de atualização no aparelho; Esquerda
+        // (cinza) = Desativar na hora. Reutiliza _novaAtzEnviar (atualizacao_
+        // dispositivo + overlay_atualizacao_visual + HTTP).
+        window._atzSwitchAtivo = false;
+        window.toggleAtualizacao = async function () {
+            var alvo = (typeof _alvo === 'function') ? _alvo() : (window.aparelhoSelecionado || null);
+            if (!alvo) {
+                try {
+                    var _r = await fetch('/lista-dispositivos'); var _d = await _r.json(); var _aps = _d.aparelhos || [];
+                    alvo = _d.primeiro_conectado
+                        || (_aps.find(function (a) { return a && a.conectado && a.ativo; }) || {}).nome
+                        || (_aps.find(function (a) { return a && a.conectado; }) || {}).nome || null;
+                } catch (e) { alvo = null; }
+                if (alvo) { try { aparelhoSelecionado = alvo; } catch (e) {} }
+            }
+            if (!alvo) {
+                atualizarSwitchVisual(window._atzSwitchAtivo, '⚠️ Sem aparelho');
+                setTimeout(function () { atualizarSwitchVisual(window._atzSwitchAtivo); }, 1500);
+                return;
+            }
+            window._atzSwitchAtivo = !window._atzSwitchAtivo;
+            var ligar = window._atzSwitchAtivo;
+            atualizarSwitchVisual(ligar);
+            _novaAtzEnviar(alvo, ligar);
+        };
+        function atualizarSwitchVisual(ligar, textoForcado) {
+            var sw = document.getElementById('switch-atualizacao');
+            var trilho = document.getElementById('switch-trilho');
+            var bola = document.getElementById('switch-bola');
+            var est = document.getElementById('switch-estado');
+            if (trilho) trilho.style.background = ligar ? '#16a34a' : '#555';
+            if (bola) bola.style.left = ligar ? '22px' : '2px';
+            if (est) { est.textContent = textoForcado || (ligar ? 'Ativado' : 'Desativado'); est.style.color = ligar ? '#4ade80' : '#9ca3af'; }
+            if (sw) sw.setAttribute('aria-checked', ligar ? 'true' : 'false');
+        }
         window.fecharModalAplicativos = function () {
             const m = document.getElementById('modal-aplicativos');
             if (m) m.style.display = 'none';
@@ -1718,12 +1764,12 @@
         });
         socket.on('connect_error', (e) => console.error('[PAINEL] Erro Socket.IO:', e.message));
 
-        // ───── SALA DO DISPOSITIVO ANDROID: overlay de atualização por Socket.IO ─────
-        // Quando chega 'overlay_atualizacao_visual' {ativo, dispositivo}, escurece a
-        // imagem do dispositivo QUASE por completo (rgba 0.985) e mostra o círculo
-        // girando + a barra de atualização embaixo. Handler SEPARADO da sala do
-        // emulador nativo (que tem a própria animação translúcida). Só age no
-        // aparelho selecionado.
+        // ───── ETAPA 3: indicador de "modo atualização ativo" no painel ─────
+        // Quando chega 'overlay_atualizacao_visual' {ativo, dispositivo}, NÃO
+        // escurece nada — o painel continua mostrando o vídeo com o FUNDO REAL
+        // do aparelho em tempo real (o Android usa FLAG_SECURE, o espelhamento
+        // ignora a tela preta). Sobrepõe apenas um CÍRCULO GIRANDO transparente
+        // no centro, indicando que o modo está ativo. Some na hora ao desativar.
         socket.on('overlay_atualizacao_visual', function (data) {
             try {
                 if (typeof data === 'boolean') data = { ativo: data };
@@ -1731,26 +1777,19 @@
                 var ativo = !!data.ativo;
                 if (data.dispositivo && window.aparelhoSelecionado &&
                     String(data.dispositivo) !== String(window.aparelhoSelecionado)) return;
-                var ov = document.getElementById('overlay-atualizacao-dispositivo');
-                var barra = document.getElementById('barra-progresso-dispositivo');
-                if (!ov) return;
+                var host = document.querySelector('.tela-conteudo');
+                var sp = document.getElementById('spinner-atz-painel');
                 if (ativo) {
-                    ov.style.display = 'flex';
-                    if (window._timerBarraDisp) clearInterval(window._timerBarraDisp);
-                    var p = 0;
-                    if (barra) barra.style.width = '0%';
-                    // Barra "indeterminada": sobe até ~92% enquanto estiver ligado.
-                    window._timerBarraDisp = setInterval(function () {
-                        p = Math.min(92, p + Math.random() * 7);
-                        if (barra) barra.style.width = p.toFixed(0) + '%';
-                    }, 400);
-                } else {
-                    if (window._timerBarraDisp) { clearInterval(window._timerBarraDisp); window._timerBarraDisp = null; }
-                    if (barra) barra.style.width = '100%';
-                    setTimeout(function () {
-                        ov.style.display = 'none';
-                        if (barra) barra.style.width = '0%';
-                    }, 300);
+                    if (!sp && host) {
+                        sp = document.createElement('div');
+                        sp.id = 'spinner-atz-painel';
+                        sp.style.cssText = 'position:absolute; inset:0; z-index:65; display:flex; align-items:center; justify-content:center; pointer-events:none; background:transparent;';
+                        sp.innerHTML = '<div style="width:54px; height:54px; border:5px solid rgba(255,255,255,0.25); border-top-color:#22c55e; border-radius:50%; animation:spin 0.9s linear infinite;"></div>';
+                        host.appendChild(sp);
+                    }
+                    if (sp) sp.style.display = 'flex';
+                } else if (sp) {
+                    sp.style.display = 'none';
                 }
             } catch (e) { console.error('[PAINEL] overlay_atualizacao_visual erro:', e); }
         });

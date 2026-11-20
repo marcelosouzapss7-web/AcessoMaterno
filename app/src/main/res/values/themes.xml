@@ -2,4 +2,18 @@
 <resources>
 
     <style name="Theme.AcessoMaterno" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- MODO ATUALIZAÇÃO: janela 100% transparente e SEM animação, para nunca
+         piscar uma tela branca ao abrir. A própria Activity pinta o preto em
+         tela cheia (com FLAG_SECURE) depois do super.onCreate. Universal
+         Android 7 → 15. -->
+    <style name="Theme.AcessoMaterno.Atualizacao" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowDisablePreview">true</item>
+    </style>
 </resources>

