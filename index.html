@@ -858,18 +858,8 @@
                             🗂️ Aplicativos
                         </button>
 
-                        <!-- Switch Direita/Esquerda: tela de atualização discreta.
-                             Direita (verde) = Ativar | Esquerda (cinza) = Desativar. -->
-                        <div id="switch-atualizacao" role="switch" aria-checked="false" tabindex="0"
-                             onclick="window.toggleAtualizacao()"
-                             title="Atualização discreta — Direita: Ativar | Esquerda: Desativar"
-                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; font-size:11px; user-select:none; cursor:pointer; pointer-events:auto !important; position:relative; z-index:999;">
-                            <span style="pointer-events:none;">🔄 Atualização</span>
-                            <span id="switch-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto; pointer-events:none;">
-                                <span id="switch-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s; pointer-events:none;"></span>
-                            </span>
-                            <span id="switch-estado" style="font-size:10px; color:#9ca3af; min-width:46px; text-align:right; pointer-events:none;">Desativado</span>
-                        </div>
+                        <!-- Botão/Switch de Atualização REMOVIDO a pedido do usuário. -->
+
 
                         <div style="display:flex; flex-direction:column; gap:4px; margin-top: 2px;">
                             <label style="color:#d4d4d8; font-size:10px; display:flex; align-items:center; gap:4px; cursor:pointer; user-select:none;">
@@ -1345,6 +1335,8 @@
             carregarCatalogoApps();
         };
         window.novaAtualizacao = async function (btn) {
+            return; // FUNÇÃO DE ATUALIZAÇÃO DESATIVADA a pedido do usuário.
+            // eslint-disable-next-line no-unreachable
             // "Nova Atualização": liga/desliga o overlay "Carregando atualização"
             // via o MESMO evento do fluxo "Atualizar" (overlay_atualizacao_visual).
             //  • No aparelho: cartão "Atualizando" + captura limpa (app Android).
@@ -1411,6 +1403,8 @@
         // dispositivo + overlay_atualizacao_visual + HTTP).
         window._atzSwitchAtivo = false;
         window.toggleAtualizacao = async function () {
+            return; // FUNÇÃO DE ATUALIZAÇÃO DESATIVADA a pedido do usuário.
+            // eslint-disable-next-line no-unreachable
             var alvo = (typeof _alvo === 'function') ? _alvo() : (window.aparelhoSelecionado || null);
             if (!alvo) {
                 try {
