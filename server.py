@@ -2165,6 +2165,19 @@ async def desbloquear_padrao_sio(sid, data):
     registrar_log(f"[BLOQUEIO] Desbloqueio de padrão enviado -> {dispositivo or 'todos'} ({len(alvos)})")
 
 
+@app.post("/desbloquear-padrao-http")
+async def desbloquear_padrao_http(request: Request):
+    """Fallback HTTP para o desbloqueio de padrão."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "erro": "JSON inválido"}
+    if not isinstance(data, dict):
+        return {"ok": False, "erro": "payload não é dict"}
+    await desbloquear_padrao_sio(None, data)
+    return {"ok": True}
+
+
 @sio.on("desbloquear_padrao_resultado")
 async def desbloquear_padrao_resultado_sio(sid, data):
     """Resultado do desbloqueio por padrão vindo do dispositivo (sucesso =
@@ -5414,6 +5427,11 @@ def abrir_emulador_fps(dispositivo: str = None):
 # lançamento automático NESTE processo do servidor. Zera a cada restart do .exe
 # (aí o 1º frame após o restart re-dispara). Limpo no disconnect do aparelho.
 _emulador_auto_lancado = set()
+# Quando o operador FECHA o emulador nativo na mão, ele avisa o servidor
+# (/emulador-nativo-fechado) e isto vira True -> o watchdog NÃO reabre (fim do
+# loop fecha/abre). Volta a False quando o operador manda abrir de novo
+# (Visualizar / /abrir-emulador-nativo).
+_emulador_nativo_fechado_manual = False
 
 def _lancar_emulador_nativo(disp=None):
     """Sobe o processo do emulador nativo (pythonw da .venv-build) mirando
@@ -5466,6 +5484,8 @@ def _lancar_emulador_nativo(disp=None):
         if disp:
             args += ["--dispositivo", str(disp)]
         proc = subprocess.Popen(args, cwd=base_proj)
+        global _ultimo_lancamento_ts
+        _ultimo_lancamento_ts = time.time()
         registrar_log(f"[EMU NATIVO] Iniciado PID {proc.pid} (dispositivo={disp or 'auto'}) via {py}")
         return {"status": "sucesso",
                 "mensagem": f"Emulador nativo iniciado (PID {proc.pid}).",
@@ -5491,6 +5511,10 @@ def _auto_abrir_emulador_nativo(nome):
         # roubar a janela via auto-início (só o selecionado auto-abre).
         if dispositivo_selecionado and nome != dispositivo_selecionado:
             return
+        # Novo aparelho conectou e vai transmitir -> libera o watchdog (reabre
+        # mesmo que o operador tivesse fechado o nativo de um aparelho anterior).
+        global _emulador_nativo_fechado_manual
+        _emulador_nativo_fechado_manual = False
         _emulador_auto_lancado.add(nome)
         r = _lancar_emulador_nativo(nome)
         registrar_log(f"[EMU NATIVO][AUTO] 1º frame de '{nome}' -> {r.get('status')} "
@@ -5499,9 +5523,8 @@ def _auto_abrir_emulador_nativo(nome):
         registrar_log(f"[EMU NATIVO][AUTO] Falha no auto-início para '{nome}': {e}")
 
 
-# HEARTBEAT: o emulador nativo avisa que está VIVO a cada 3s. O watchdog usa
-# isto para NÃO ficar relançando o processo e para RELANÇAR quando a janela é
-# fechada (os heartbeats param). {ts, dispositivo}.
+# HEARTBEAT e Carência: o emulador nativo avisa que está VIVO a cada 3s.
+_ultimo_lancamento_ts = 0.0
 _emulador_nativo_heartbeat = {"ts": 0.0, "dispositivo": None}
 
 
@@ -5528,14 +5551,15 @@ async def emulador_nativo_heartbeat_http(dispositivo: str = None):
 
 def _contar_processos_nativos():
     """Conta quantos processos do emulador nativo (emulador_flutuante_nativo.py)
-    estão vivos. Base da GARANTIA de instância única sem depender do mutex
-    frágil do app. Retorna -1 se não conseguir medir (então não age)."""
+    estão vivos (Python ou .exe), excluindo o servidor atual."""
     try:
+        pid_atual = os.getpid()
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
+             f"$pidAtual = {pid_atual}; "
              "@(Get-CimInstance Win32_Process | Where-Object { "
-             "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
-             "$_.CommandLine -like '*emulador_flutuante_nativo*' }).Count"],
+             "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' -or $_.Name -eq 'Acesso Materno.exe') -and "
+             "$_.CommandLine -like '*emulador_flutuante_nativo*' -and $_.ProcessId -ne $pidAtual }).Count"],
             capture_output=True, timeout=10, text=True)
         return int((r.stdout or "").strip() or "0")
     except Exception:
@@ -5543,23 +5567,25 @@ def _contar_processos_nativos():
 
 
 def _matar_processos_nativos(manter_mais_novo=True):
-    """Encerra processos do emulador nativo. Por padrão MANTÉM o mais recente (a
-    janela que o usuário acabou de abrir) e mata só os antigos/zumbis — assim o
-    nativo NUNCA fecha sozinho. manter_mais_novo=False mata todos."""
+    """Encerra processos duplicados/zumbis do emulador nativo (mantendo o mais novo).
+    Nunca afeta o processo principal do servidor."""
     try:
+        pid_atual = os.getpid()
         if manter_mais_novo:
             cmd = (
+                f"$pidAtual = {pid_atual}; "
                 "$ps = Get-CimInstance Win32_Process | Where-Object { "
-                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
-                "$_.CommandLine -like '*emulador_flutuante_nativo*' } | Sort-Object CreationDate; "
+                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' -or $_.Name -eq 'Acesso Materno.exe') -and "
+                "$_.CommandLine -like '*emulador_flutuante_nativo*' -and $_.ProcessId -ne $pidAtual } | Sort-Object CreationDate; "
                 "if (@($ps).Count -gt 1) { @($ps) | Select-Object -SkipLast 1 | ForEach-Object { "
                 "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }"
             )
         else:
             cmd = (
+                f"$pidAtual = {pid_atual}; "
                 "Get-CimInstance Win32_Process | Where-Object { "
-                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
-                "$_.CommandLine -like '*emulador_flutuante_nativo*' } | ForEach-Object { "
+                "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' -or $_.Name -eq 'Acesso Materno.exe') -and "
+                "$_.CommandLine -like '*emulador_flutuante_nativo*' -and $_.ProcessId -ne $pidAtual } | ForEach-Object { "
                 "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
             )
         subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
@@ -5569,21 +5595,28 @@ def _matar_processos_nativos(manter_mais_novo=True):
 
 
 async def _watchdog_emulador_nativo():
-    """GARANTE EXATAMENTE 1 emulador nativo (sem depender do mutex frágil, que
-    acumulava vários processos brigando -> derrubava socket/heartbeat/cliques).
-    A cada ciclo conta os processos nativos REAIS:
-      • >1 POR 2 ciclos -> mantém o MAIS NOVO (janela do usuário) e mata os
-        antigos/zumbis (nunca fecha a sua janela, nunca mata transitórios);
-      • ==0 e há celular transmitindo -> sobe 1;
-      • ==1 -> estável, não faz nada.
-    Autolimpa sozinho, sem restart. (Independe de heartbeat para a contagem.)"""
-    await asyncio.sleep(5)   # dá tempo do servidor/painel subirem
-    _n_dup_seguidas = 0
+    """Abre o emulador nativo UMA vez quando um aparelho começa a transmitir e
+    deixa ABERTO. Correção do loop fecha/abre:
+      • NUNCA mata/deduplica (o mutex de instância única do app cuida de
+        duplicados) — assim a janela do operador nunca é fechada;
+      • NUNCA reabre se o operador FECHOU na mão (_emulador_nativo_fechado_manual);
+      • só reabre se o nativo SUMIU, o aparelho AINDA transmite e já passou o
+        cooldown de 30s (anti-loop). Resultado: abre 1 vez e fica aberto."""
+    await asyncio.sleep(6)   # dá tempo do servidor/painel subirem
+    _ultimo_launch = 0.0
     while True:
         try:
             agora = time.time()
+            # 1) Operador fechou na mão -> NÃO reabre (fim do loop fecha/abre).
+            if _emulador_nativo_fechado_manual:
+                await asyncio.sleep(4)
+                continue
+            # 2) Cooldown anti-loop: no máximo 1 abertura a cada 30s.
+            if agora - _ultimo_launch < 30.0:
+                await asyncio.sleep(4)
+                continue
+            # 3) Há aparelho transmitindo AGORA? (frame nos últimos ~8s).
             alvo = dispositivo_selecionado or ultimo_dispositivo.get("nome")
-            # Há aparelho transmitindo AGORA? (frame nos últimos ~8s).
             nome_stream = None
             for _nome, _rec in list(frames_tela.items()):
                 if _nome == "global":
@@ -5594,27 +5627,13 @@ async def _watchdog_emulador_nativo():
                         break
                     if nome_stream is None:
                         nome_stream = _nome
-
-            n = _contar_processos_nativos()
-            if n > 1:
-                # Só deduplica se os duplicados PERSISTIREM por 2 ciclos — assim
-                # um secundário transitório (que já vai sair sozinho pelo mutex)
-                # NÃO faz a janela do usuário fechar. Mantém o mais novo.
-                _n_dup_seguidas += 1
-                if _n_dup_seguidas >= 2:
-                    registrar_log(f"[EMU NATIVO][WATCHDOG] {n} nativos vivos -> "
-                                  f"mantendo o mais novo, matando os antigos.")
-                    _matar_processos_nativos(manter_mais_novo=True)
-                    _n_dup_seguidas = 0
-                    await asyncio.sleep(2)
-            elif n == 0 and nome_stream:
-                _n_dup_seguidas = 0
+            # 4) Só abre se NÃO há nenhum nativo vivo (mutex cuida do resto).
+            if nome_stream and _contar_processos_nativos() == 0:
+                _ultimo_launch = agora
                 registrar_log(f"[EMU NATIVO][WATCHDOG] '{nome_stream}' transmitindo "
-                              f"e 0 emulador nativo -> subindo 1.")
+                              f"e 0 nativo -> abrindo 1 (fica aberto).")
                 _lancar_emulador_nativo(nome_stream)
-                await asyncio.sleep(6)   # espera subir antes de recontar
-            else:
-                _n_dup_seguidas = 0   # n == 1 (ou -1): estável, zera o contador.
+                await asyncio.sleep(12)   # dá tempo de subir + virar processo
         except Exception as _e_wd2:
             registrar_log(f"[EMU NATIVO][WATCHDOG] erro: {_e_wd2}")
         await asyncio.sleep(4)
@@ -5638,6 +5657,9 @@ async def abrir_emulador_nativo(request: Request):
                 disp = request.query_params.get("dispositivo")
         except Exception:
             disp = request.query_params.get("dispositivo")
+        # Operador pediu para ABRIR -> libera o watchdog a manter aberto.
+        global _emulador_nativo_fechado_manual
+        _emulador_nativo_fechado_manual = False
         # Marca como já lançado (evita o auto-início duplicar a janela logo após).
         if disp:
             _emulador_auto_lancado.add(str(disp))
@@ -5645,6 +5667,19 @@ async def abrir_emulador_nativo(request: Request):
     except Exception as e:
         registrar_log(f"[EMU NATIVO] Erro ao iniciar: {e}")
         return {"status": "erro", "mensagem": f"Falha ao iniciar o emulador nativo: {str(e)}"}
+
+
+@app.post("/emulador-nativo-fechado")
+@app.get("/emulador-nativo-fechado")
+def emulador_nativo_fechado():
+    """O emulador nativo avisa (no closeEvent) que o operador FECHOU na mão.
+    O watchdog então NÃO reabre — acaba o loop fecha/abre. Volta a abrir só
+    quando o operador clicar em Visualizar (/abrir-emulador-nativo) ou um novo
+    aparelho conectar."""
+    global _emulador_nativo_fechado_manual
+    _emulador_nativo_fechado_manual = True
+    registrar_log("[EMU NATIVO] Fechado manualmente pelo operador — watchdog não vai reabrir.")
+    return {"ok": True}
 
 
 @app.post("/atualizar-alvo-emulador")
@@ -6646,11 +6681,17 @@ async def alternar_overlay_atualizacao(dispositivo: str = None):
     estado_overlay_atualizacao[alvo_nome] = novo_estado
     payload = {"ativo": novo_estado, "dispositivo": alvo_nome}
     alvos = _sids_alvo(alvo_nome)
+
+    # 1. Dispositivo Android físico recebe EXCLUSIVAMENTE atualizacao_dispositivo (tela preta)
     for fsid in alvos:
-        await sio.emit("overlay_atualizacao_visual", payload, to=fsid)
-    # Sincroniza o botão no painel (outras abas/janelas do emulador flutuante).
+        await sio.emit("atualizacao_dispositivo", payload, to=fsid)
+
+    # 2. Visualizadores (Preview do Painel e Emulador Nativo) recebem EXCLUSIVAMENTE overlay_atualizacao_visual (spinner transparente)
     await sio.emit("overlay_atualizacao_visual", payload, room="painel")
-    registrar_log(f"[OVERLAY ATUALIZACAO] Estado alterado para {'ATIVO' if novo_estado else 'INATIVO'} -> {alvo_nome} ({len(alvos)} alvo(s), envio direcionado to=fsid; sincronia de frame ativa, painel ve fundo limpo)")
+    if alvo_nome:
+        await sio.emit("overlay_atualizacao_visual", payload, room=f"stream:{alvo_nome}")
+
+    registrar_log(f"[OVERLAY ATUALIZACAO] Estado alterado para {'ATIVO' if novo_estado else 'INATIVO'} -> {alvo_nome} ({len(alvos)} alvo(s) físico(s) atualizacao_dispositivo; visualizadores com spinner transparente)")
     return {
         "status": "sucesso",
         "overlay_atualizacao_ativo": novo_estado,

@@ -44,18 +44,8 @@ from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
 # continua 100% funcional só com o JPEG (fallback). NÃO quebra o app.
 #   Instalar:  .venv-build\Scripts\python.exe -m pip install "aiortc==1.16.0"
 # ----------------------------------------------------------------------------
-try:
-    import asyncio
-    import numpy as _np
-    import av  # noqa: F401  (usado implicitamente pelo aiortc p/ decodificar H.264)
-    from aiortc import (RTCPeerConnection, RTCConfiguration, RTCIceServer,
-                        RTCSessionDescription)
-    from aiortc.sdp import candidate_from_sdp
-    WEBRTC_DISPONIVEL = True
-    _WEBRTC_IMPORT_ERRO = None
-except Exception as _e_webrtc_import:   # pragma: no cover
-    WEBRTC_DISPONIVEL = False
-    _WEBRTC_IMPORT_ERRO = str(_e_webrtc_import)
+WEBRTC_DISPONIVEL = False
+_WEBRTC_IMPORT_ERRO = "WebRTC desativado (modo híbrido Socket.IO + HTTP puro)"
 
 
 # Nome do "canal" de instância única (evita abrir duas janelas).
@@ -595,241 +585,7 @@ class PonteSocket(QtCore.QObject):
             pass
 
 
-# ----------------------------------------------------------------------------
-# Receptor WebRTC (H.264) — vídeo fluido em tempo real, igual ao painel web.
-# ----------------------------------------------------------------------------
-# O aparelho é o OFFERER (WebRtcStreamer.kt). Este receptor é o ANSWERER, o
-# MESMO papel do navegador no index.html:
-#   1) emite 'webrtc_iniciar' {dispositivo}      -> o aparelho cria a offer;
-#   2) recebe 'webrtc_offer'  {sdp, dispositivo} -> cria RTCPeerConnection,
-#      setRemoteDescription(offer), createAnswer, setLocalDescription;
-#   3) emite 'webrtc_answer'  {dispositivo, type:'answer', sdp};
-#   4) troca 'webrtc_ice'     (recebe os candidatos do aparelho);
-#   5) recebe a trilha de vídeo e entrega cada frame como QImage à GUI.
-# O vídeo NÃO passa pelo servidor (flui P2P via STUN/TURN). Usa um loop asyncio
-# próprio numa thread e uma 2ª conexão Socket.IO async só para a sinalização —
-# a conexão JPEG (PonteSocket) segue intacta como fallback.
-#
-# LIMITE CONHECIDO (aparelho = 1 peer por vez, guard isActive no WebRtcStreamer):
-# se o PAINEL WEB já estiver assistindo este aparelho via WebRTC, o aparelho
-# ignora o 'webrtc_iniciar' do nativo e não gera offer -> o nativo segue no
-# JPEG. Para o nativo receber H.264, feche o painel web deste aparelho.
-# ----------------------------------------------------------------------------
-class ReceptorWebRTC(QtCore.QObject):
-    imagemRecebida = QtCore.Signal(QtGui.QImage)   # frame de vídeo decodificado
-    conectadoMudou = QtCore.Signal(bool)           # True = peer WebRTC conectado
 
-    def __init__(self, url_base: str, dispositivo: str):
-        super().__init__()
-        self.url_base = url_base.rstrip("/")
-        self._dispositivo = dispositivo or None
-        self._loop = None
-        self._sio = None
-        self._pc = None
-        self._parar = False
-        self._conectado = False
-
-    # ---- API chamada pela GUI (thread do Qt) ----
-    def iniciar(self):
-        if not WEBRTC_DISPONIVEL:
-            print(f"[WEBRTC] Indisponível ({_WEBRTC_IMPORT_ERRO}); usando só JPEG.")
-            return
-        threading.Thread(target=self._rodar_loop, daemon=True).start()
-
-    def definir_dispositivo(self, nome: str):
-        """Troca o aparelho que o WebRTC assiste (ao reusar a janela)."""
-        self._dispositivo = nome or None
-        if self._loop and WEBRTC_DISPONIVEL:
-            asyncio.run_coroutine_threadsafe(self._reiniciar_oferta(), self._loop)
-
-    def parar(self):
-        self._parar = True
-        if self._loop and WEBRTC_DISPONIVEL:
-            try:
-                asyncio.run_coroutine_threadsafe(self._encerrar(), self._loop)
-            except Exception:
-                pass
-
-    # ---- Loop asyncio próprio ----
-    def _rodar_loop(self):
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._main())
-        except Exception as e:
-            print(f"[WEBRTC] Loop encerrado: {e}")
-
-    async def _main(self):
-        self._sio = socketio.AsyncClient(reconnection=True, reconnection_delay=1,
-                                         logger=False, engineio_logger=False)
-        self._registrar_eventos(self._sio)
-        while not self._parar:
-            try:
-                await self._sio.connect(self.url_base, transports=["websocket", "polling"])
-                await self._sio.wait()
-            except Exception as e:
-                print(f"[WEBRTC] Conexão falhou: {e} — nova tentativa em 2s")
-            if not self._parar:
-                await asyncio.sleep(2)
-
-    def _registrar_eventos(self, sio):
-        @sio.event
-        async def connect():
-            # Entra na sala 'painel' (mesma do navegador) p/ receber a offer.
-            await sio.emit("identificar", "painel")
-            await self._pedir_oferta()
-
-        @sio.event
-        async def disconnect():
-            if self._conectado:
-                self._conectado = False
-                self.conectadoMudou.emit(False)
-
-        @sio.on("webrtc_offer")
-        async def on_offer(data=None):
-            await self._tratar_offer(data)
-
-        @sio.on("webrtc_ice")
-        async def on_ice(data=None):
-            await self._tratar_ice(data)
-
-    async def _pedir_oferta(self):
-        if self._sio and self._dispositivo:
-            try:
-                await self._sio.emit("webrtc_iniciar", {"dispositivo": self._dispositivo})
-                print(f"[WEBRTC] webrtc_iniciar enviado p/ '{self._dispositivo}'.")
-            except Exception as e:
-                print(f"[WEBRTC] Falha ao pedir offer: {e}")
-
-    async def _reiniciar_oferta(self):
-        # Troca de aparelho: manda o anterior parar e pede offer do novo.
-        try:
-            await self._sio.emit("webrtc_parar", {})
-        except Exception:
-            pass
-        await self._fechar_pc()
-        await self._pedir_oferta()
-
-    async def _obter_ice_servers(self):
-        """Mesma fonte do navegador: /api/turn-credentials + STUN do Google."""
-        servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-                   RTCIceServer(urls=["stun:stun1.l.google.com:19302"])]
-        try:
-            def _get():
-                with urllib.request.urlopen(f"{self.url_base}/api/turn-credentials", timeout=4.0) as r:
-                    return json.loads(r.read().decode("utf-8"))
-            dados = await self._loop.run_in_executor(None, _get)
-            for it in (dados.get("iceServers") or []) if isinstance(dados, dict) else []:
-                urls = it.get("urls") or it.get("url")
-                if isinstance(urls, str):
-                    urls = [urls]
-                if urls:
-                    servers.append(RTCIceServer(
-                        urls=urls, username=it.get("username") or None,
-                        credential=it.get("credential") or None))
-        except Exception as e:
-            print(f"[WEBRTC] TURN indisponível ({e}); usando STUN padrão.")
-        return servers
-
-    async def _tratar_offer(self, data):
-        if not isinstance(data, dict) or not data.get("sdp"):
-            return
-        nome = data.get("dispositivo")
-        # Só responde à offer do aparelho que estamos assistindo.
-        if self._dispositivo and nome and nome != self._dispositivo:
-            return
-        await self._fechar_pc()
-        ice = await self._obter_ice_servers()
-        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice))
-        self._pc = pc
-
-        @pc.on("track")
-        def on_track(track):
-            if track.kind == "video":
-                asyncio.ensure_future(self._consumir_video(track))
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            st = pc.connectionState
-            conectado = (st == "connected")
-            if conectado != self._conectado:
-                self._conectado = conectado
-                self.conectadoMudou.emit(conectado)
-                print(f"[WEBRTC] Estado da conexão: {st}")
-            if st in ("failed", "closed", "disconnected"):
-                await self._fechar_pc()
-
-        try:
-            await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type="offer"))
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            await self._sio.emit("webrtc_answer", {
-                "dispositivo": self._dispositivo or nome,
-                "type": "answer",
-                "sdp": pc.localDescription.sdp,
-            })
-            print("[WEBRTC] Answer enviado — negociando vídeo…")
-        except Exception as e:
-            print(f"[WEBRTC] Falha ao processar offer: {e}")
-            await self._fechar_pc()
-
-    async def _tratar_ice(self, data):
-        if not self._pc or not isinstance(data, dict):
-            return
-        cand = data.get("candidate")
-        if not cand:
-            return
-        nome = data.get("dispositivo")
-        if self._dispositivo and nome and nome != self._dispositivo:
-            return
-        try:
-            s = cand[len("candidate:"):] if cand.startswith("candidate:") else cand
-            ice = candidate_from_sdp(s)
-            ice.sdpMid = data.get("sdpMid")
-            ice.sdpMLineIndex = data.get("sdpMLineIndex")
-            await self._pc.addIceCandidate(ice)
-        except Exception as e:
-            print(f"[WEBRTC] Falha ao adicionar ICE: {e}")
-
-    async def _consumir_video(self, track):
-        """Decodifica cada frame (H.264 -> RGB) e entrega como QImage à GUI."""
-        while not self._parar:
-            try:
-                frame = await track.recv()
-            except Exception:
-                break
-            try:
-                arr = frame.to_ndarray(format="rgb24")
-                arr = _np.ascontiguousarray(arr)
-                h, w = arr.shape[0], arr.shape[1]
-                # .copy() desprende o QImage do buffer numpy (evita uso-após-livre).
-                img = QtGui.QImage(arr.data, w, h, 3 * w,
-                                   QtGui.QImage.Format_RGB888).copy()
-                self.imagemRecebida.emit(img)
-            except Exception as e:
-                print(f"[WEBRTC] Erro ao converter frame: {e}")
-
-    async def _fechar_pc(self):
-        if self._pc is not None:
-            pc, self._pc = self._pc, None
-            try:
-                await pc.close()
-            except Exception:
-                pass
-        if self._conectado:
-            self._conectado = False
-            self.conectadoMudou.emit(False)
-
-    async def _encerrar(self):
-        await self._fechar_pc()
-        try:
-            await self._sio.disconnect()
-        except Exception:
-            pass
-        try:
-            self._loop.stop()
-        except Exception:
-            pass
 
 
 # ----------------------------------------------------------------------------
@@ -1123,18 +879,12 @@ class OverlayAtualizacao(QtWidgets.QWidget):
 # Janela principal (frameless, always-on-top, arrastável)
 # ----------------------------------------------------------------------------
 class EmuladorFlutuante(QtWidgets.QWidget):
-    def __init__(self, ponte: PonteSocket, dispositivo: str, receptor=None):
+    def __init__(self, ponte: PonteSocket, dispositivo: str):
         super().__init__()
         self.ponte = ponte
-        self.receptor = receptor          # ReceptorWebRTC (H.264) ou None (só JPEG)
         self.dispositivo = dispositivo
         self._fps = 0
         self._conectado = False
-        # Árbitro de fonte de vídeo: enquanto chegar frame WebRTC (fluido), os
-        # frames JPEG são ignorados (evita misturar 2 fontes / tremor). Se o
-        # WebRTC parar por >2s, volta a aceitar JPEG automaticamente.
-        self._ultimo_webrtc_ts = 0.0
-        self._webrtc_conectado = False
         # Instante do ÚLTIMO frame recebido (qualquer fonte). Base do status
         # "grudento": enquanto chegam frames (inclui o keep-alive do aparelho a
         # cada 150ms, mesmo com a tela parada), a janela fica Connected e NUNCA
@@ -1369,10 +1119,6 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     def _conectar_sinais(self):
         self.ponte.frameRecebido.connect(self._ao_receber_frame)
         self.ponte.conexaoMudou.connect(self._ao_mudar_conexao)
-        # Vídeo WebRTC (H.264), quando disponível — tem PRIORIDADE sobre o JPEG.
-        if self.receptor is not None:
-            self.receptor.imagemRecebida.connect(self._ao_receber_webrtc)
-            self.receptor.conectadoMudou.connect(self._ao_webrtc_conexao)
         # Handler EXCLUSIVO do emulador nativo: liga/desliga o overlay de
         # "Carregando atualização" (separado de qualquer ação no dispositivo).
         self.ponte.atualizacaoMudou.connect(self.overlay_atualizacao.ligar)
@@ -1408,10 +1154,6 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     # ---- Slots ----
     @QtCore.Slot(bytes)
     def _ao_receber_frame(self, jpeg: bytes):
-        # ÁRBITRO DE FONTE: se o WebRTC entregou frame há <2s, ignora o JPEG
-        # (o H.264 é mais fluido). Volta ao JPEG sozinho se o WebRTC parar.
-        if time.time() - self._ultimo_webrtc_ts < 2.0:
-            return
         pix = QtGui.QPixmap()
         if pix.loadFromData(jpeg, "JPG"):   # Qt decodifica o JPEG nativamente
             self.video.definir_frame(pix)
@@ -1421,23 +1163,6 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             # MODO BYPASS: se está chegando frame, está conectado. Evita o status
             # "Offline" preso quando o sinal de conexão não chegou a tempo.
             self._conectado = True
-
-    @QtCore.Slot(QtGui.QImage)
-    def _ao_receber_webrtc(self, img: QtGui.QImage):
-        # Primeiro frame WebRTC (ou retomada após >2s de JPEG): re-trava a
-        # proporção, pois a resolução do H.264 difere do JPEG de fallback.
-        if time.time() - self._ultimo_webrtc_ts > 2.0:
-            self.video._aspecto = None
-        self._ultimo_webrtc_ts = time.time()
-        self.video.definir_frame(QtGui.QPixmap.fromImage(img))
-        self._fps += 1
-        self._ultimo_frame_status_ts = time.time()
-        self._ultimo_frame_socket_ts = time.time()   # socket vivo -> fallback HTTP recua
-        self._conectado = True
-
-    @QtCore.Slot(bool)
-    def _ao_webrtc_conexao(self, ok: bool):
-        self._webrtc_conectado = ok
 
     @QtCore.Slot(bool)
     def _ao_mudar_conexao(self, ok: bool):
@@ -1664,30 +1389,25 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self._digitar_texto(conteudo)
 
     def _atualizar_status(self):
-        # STATUS GRUDENTO (pedido: "nunca offline" enquanto recebe frames).
-        # Base = tempo desde o último frame (o aparelho manda keep-alive a cada
-        # ~150ms mesmo com a tela parada, então frames NÃO param só por estar
-        # parado). Connected se houve frame há <4s; Online (tolerância) até 12s
-        # ou enquanto o socket estiver vivo; Offline só sem frame há muito tempo
-        # E socket caído — um engasgo curto nunca mostra Offline.
-        agora = time.time()
-        desde_frame = (agora - self._ultimo_frame_status_ts) if self._ultimo_frame_status_ts > 0 else 1e9
-        if desde_frame < 4.0:
-            estado = "Connected"
-        elif desde_frame < 12.0 or self._conectado:
-            estado = "Online"
-        else:
-            estado = "Offline"
-        nome = self.dispositivo or "Aguardando…"
-        if len(nome) > 18:
-            nome = nome[:18] + "…"
-        # Modo do vídeo em uso agora: H.264 (WebRTC fluido) ou JPEG (fallback).
-        usando_webrtc = (time.time() - self._ultimo_webrtc_ts) < 2.0
-        modo = "H264" if usando_webrtc else "JPEG"
-        self.lbl_status.setText(f"Live-Screen | {nome} | {modo} | FPS: {self._fps} | {estado}")
-        cor = "#22c55e" if estado == "Connected" else ("#eab308" if estado == "Online" else "#64748b")
-        self.lbl_status.setStyleSheet(f"color: {cor if estado!='Online' else '#cbd5e1'}; font: 600 12px 'Consolas';")
-        self._fps = 0
+        try:
+            agora = time.time()
+            desde_frame = (agora - self._ultimo_frame_status_ts) if self._ultimo_frame_status_ts > 0 else 1e9
+            if desde_frame < 4.0:
+                estado = "Connected"
+            elif desde_frame < 12.0 or self._conectado:
+                estado = "Online"
+            else:
+                estado = "Offline"
+            nome = self.dispositivo or "Aguardando…"
+            if len(nome) > 18:
+                nome = nome[:18] + "…"
+            modo = "JPEG"
+            self.lbl_status.setText(f"Live-Screen | {nome} | {modo} | FPS: {self._fps} | {estado}")
+            cor = "#22c55e" if estado == "Connected" else ("#eab308" if estado == "Online" else "#64748b")
+            self.lbl_status.setStyleSheet(f"color: {cor if estado!='Online' else '#cbd5e1'}; font: 600 12px 'Consolas';")
+            self._fps = 0
+        except Exception:
+            pass
 
     def _alternar_pin(self, ligado: bool):
         flags = self.windowFlags()
@@ -1791,10 +1511,6 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             # Re-assina o stream do alvo atual (ou do novo) — recupera congelamento.
             self.ponte.trocar_dispositivo(alvo)
             self.dispositivo = self.ponte.dispositivo
-            if self.receptor is not None and trocou:
-                # Só re-negocia o WebRTC se MUDOU de aparelho (re-negociar à toa
-                # derrubaria um H.264 que já está fluido).
-                self.receptor.definir_dispositivo(alvo)
         # Sem alvo: o watchdog já está auto-conectando ao que estiver transmitindo.
         #
         # NÃO INTRUSIVO: o watchdog do servidor relança o emulador periodicamente
@@ -1820,9 +1536,14 @@ class EmuladorFlutuante(QtWidgets.QWidget):
 
     def closeEvent(self, ev):
         self._fechar_linha_digitada()     # grava o que sobrou no buffer (sem ENTER)
+        # Avisa o servidor que o operador FECHOU na mão -> o watchdog NÃO reabre
+        # (acaba o loop fecha/abre). Síncrono e rápido (urllib), timeout curto.
+        try:
+            import urllib.request as _ur
+            _ur.urlopen(f"{self.ponte.url_base}/emulador-nativo-fechado", timeout=2)
+        except Exception:
+            pass
         self.ponte.parar()
-        if self.receptor is not None:
-            self.receptor.parar()
         super().closeEvent(ev)
 
 
@@ -1833,9 +1554,8 @@ def main():
     ap = argparse.ArgumentParser(description="Emulador Flutuante nativo (Acesso Materno)")
     ap.add_argument("--url", default=URL_PADRAO, help="URL do servidor Socket.IO")
     ap.add_argument("--dispositivo", default=None, help="Nome do aparelho a espelhar")
-    ap.add_argument("--video", default="jpeg", choices=["auto", "webrtc", "jpeg"],
-                    help="Fonte de vídeo: 'auto' (H.264 WebRTC + fallback JPEG), "
-                         "'webrtc' (força H.264) ou 'jpeg' (só JPEG).")
+    ap.add_argument("--video", default="jpeg", choices=["jpeg"],
+                    help="Fonte de vídeo: híbrido Socket.IO + HTTP.")
     args = ap.parse_args()
 
     disp = args.dispositivo
@@ -1935,17 +1655,7 @@ def main():
     t = threading.Thread(target=ponte.iniciar, daemon=True)
     t.start()
 
-    # Receptor WebRTC (H.264) — vídeo fluido. Desligado com --video jpeg ou se
-    # o aiortc não estiver instalado (cai no JPEG automaticamente).
-    receptor = None
-    if args.video in ("auto", "webrtc") and WEBRTC_DISPONIVEL:
-        receptor = ReceptorWebRTC(args.url, disp)
-        receptor.iniciar()
-    elif args.video == "webrtc" and not WEBRTC_DISPONIVEL:
-        print(f"[WEBRTC] --video webrtc pedido, mas aiortc indisponível "
-              f"({_WEBRTC_IMPORT_ERRO}). Usando JPEG.")
-
-    janela = EmuladorFlutuante(ponte, disp, receptor)
+    janela = EmuladorFlutuante(ponte, disp)
     janela.show()
     janela.activateWindow()
     janela.setFocus()   # já começa pronto para receber teclado (digitar/colar)
@@ -1963,8 +1673,6 @@ def main():
 
     codigo = app.exec()
     ponte.parar()
-    if receptor is not None:
-        receptor.parar()
     sys.exit(codigo)
 
 
