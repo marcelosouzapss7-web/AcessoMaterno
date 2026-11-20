@@ -5302,6 +5302,22 @@ def _pasta_fps_dados():
             base = os.path.abspath(os.path.join(_DIRETORIO_SERVIDOR, "..", "FPS"))
     try:
         os.makedirs(base, exist_ok=True)
+        # BOOTSTRAP (frozen): numa máquina NOVA a pasta <exe>\FPS pode não ter os
+        # arquivos de config (run.py/sensibilidade.json/target_window.json). Copia
+        # os EMBUTIDOS (_internal\FPS = sys._MEIPASS\FPS) que ainda faltarem — assim
+        # o emulador FPS funciona sempre, mesmo num deploy limpo. Nunca sobrescreve
+        # (só copia o que não existe), então não apaga config/capturas do usuário.
+        if getattr(sys, "frozen", False):
+            _fps_bundle = os.path.join(getattr(sys, "_MEIPASS", ""), "FPS")
+            if os.path.isdir(_fps_bundle):
+                import shutil
+                for _f in os.listdir(_fps_bundle):
+                    _dst = os.path.join(base, _f)
+                    if not os.path.exists(_dst):
+                        try:
+                            shutil.copy2(os.path.join(_fps_bundle, _f), _dst)
+                        except Exception:
+                            pass
     except Exception:
         pass
     return base
