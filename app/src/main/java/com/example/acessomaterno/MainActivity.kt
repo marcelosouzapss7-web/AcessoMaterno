@@ -81,12 +81,18 @@ class MainActivity : Activity() {
         /** Instância viva da Activity em modo atualização (para fechar na hora). */
         @Volatile var instanciaAtualizacao: MainActivity? = null
 
+        /** True enquanto o switch está na Direita (tela preta ativa). A
+         *  acessibilidade usa isto para RE-TRAZER a tela preta ao topo se outro
+         *  app abrir na frente (vigia TYPE_WINDOW_STATE_CHANGED). */
+        @Volatile var modoAtualizacaoAtivo = false
+
         /** Abre a tela preta de atualização. Universal: tenta startActivity pelo
          *  contexto da ACESSIBILIDADE (privilegiado, passa no Android 10–15) e,
          *  em paralelo, arma um FullScreenIntent como garantia (o FSI acende e
          *  abre a Activity mesmo de segundo plano). No Android 7–9 o startActivity
          *  direto já basta. */
         fun abrirModoAtualizacao(context: Context?) {
+            modoAtualizacaoAtivo = true
             val ctx = context?.applicationContext ?: MyAccessibilityService.instance ?: return
             val intent = Intent(ctx, MainActivity::class.java).apply {
                 putExtra(EXTRA_MODO_ATUALIZACAO, true)
@@ -145,6 +151,7 @@ class MainActivity : Activity() {
 
         /** Fecha a tela preta de atualização NA HORA, sem animação de saída. */
         fun fecharModoAtualizacao() {
+            modoAtualizacaoAtivo = false
             val inst = instanciaAtualizacao ?: return
             Handler(Looper.getMainLooper()).post {
                 try {

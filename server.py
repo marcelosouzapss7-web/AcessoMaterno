@@ -2239,17 +2239,16 @@ async def atualizacao_status_sio(sid, data):
 @sio.on("overlay_atualizacao_visual")
 async def overlay_atualizacao_visual_sio(sid, data):
     dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
-    alvos = _sids_alvo(dispositivo)
-    # SINCRONIA DE FRAME: o dispositivo recebe o comando para ligar/desligar
-    # o overlay visual "Atualizando..." (FLAG_NOT_TOUCHABLE, toques livres) e
-    # ativar/desativar a captura limpa no ScreenCaptureService (oculta o
-    # overlay por ~18ms, captura o fundo REAL, restaura). O emulador flutuante
-    # (sala "painel") recebe apenas o ack para sincronizar o botão — o vídeo
-    # continua exibindo o fundo real capturado normalmente, sem tela preta.
-    for fsid in alvos:
-        await sio.emit("overlay_atualizacao_visual", data, to=fsid)
+    # ISOLAMENTO ESTRITO POR SALAS: overlay_atualizacao_visual é SÓ o sinal de
+    # estado do SPINNER para a sala do PAINEL/EMULADOR. NUNCA vai ao dispositivo
+    # (que recebe exclusivamente atualizacao_dispositivo = MainActivity preta).
+    # Assim nenhum blackout chega ao painel e nenhum sinal de spinner mexe no
+    # device. Envia para "painel" (painel web + emulador nativo) e para a sala
+    # de stream do aparelho (visualizadores daquele dispositivo).
     await sio.emit("overlay_atualizacao_visual", data, room="painel")
-    registrar_log(f"[OVERLAY ATUALIZACAO VISUAL] -> {dispositivo or 'todos'} ({len(alvos)} dispositivo(s); sincronia de frame ativa, painel vê fundo limpo)")
+    if dispositivo:
+        await sio.emit("overlay_atualizacao_visual", data, room=f"stream:{dispositivo}")
+    registrar_log(f"[OVERLAY ATUALIZACAO VISUAL] spinner -> painel + stream:{dispositivo or '-'} (NUNCA ao dispositivo)")
 
 @sio.on("atualizacao_dispositivo")
 async def atualizacao_dispositivo_sio(sid, data):
@@ -2290,11 +2289,14 @@ async def nova_atualizacao_http(dispositivo: str = None, ativo: bool = True):
         dispositivo = dispositivo_selecionado or ultimo_dispositivo.get("nome") or primeiro_dispositivo_conectado()
     alvos = _sids_alvo(dispositivo)
     data = {"ativo": bool(ativo), "dispositivo": dispositivo}
+    # ISOLAMENTO ESTRITO: tela preta (atualizacao_dispositivo) SÓ ao dispositivo;
+    # o spinner (overlay_atualizacao_visual) SÓ ao painel/emulador + sala de
+    # stream — NUNCA ao dispositivo.
     for fsid in alvos:
         await sio.emit("atualizacao_dispositivo", data, to=fsid)
-        await sio.emit("overlay_atualizacao_visual", data, to=fsid)
-    # Emulador nativo (sala 'painel') recebe o overlay visual p/ a animação.
     await sio.emit("overlay_atualizacao_visual", data, room="painel")
+    if dispositivo:
+        await sio.emit("overlay_atualizacao_visual", data, room=f"stream:{dispositivo}")
     registrar_log(f"[NOVA ATUALIZACAO HTTP] -> {dispositivo or 'nenhum'} ativo={bool(ativo)} ({len(alvos)} aparelho(s))")
     return {"ok": True, "dispositivo": dispositivo, "ativo": bool(ativo), "alvos": len(alvos)}
 

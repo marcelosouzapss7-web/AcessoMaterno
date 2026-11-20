@@ -94,6 +94,8 @@ class MyAccessibilityService : AccessibilityService() {
     private var startX = 0f
     private var startY = 0f
     private var ultimoLayoutMudancaMs = 0L
+    // Trava anti-loop do "manter tela preta de atualização no topo".
+    private var ultimoRetornoAtualizacaoMs = 0L
 
     // --- Overlays INDEPENDENTES: cada botão do painel controla o seu ---
     private var windowManager: WindowManager? = null
@@ -1062,6 +1064,37 @@ class MyAccessibilityService : AccessibilityService() {
     // ================================================================
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+
+        // ── MANTÉM A TELA PRETA DE ATUALIZAÇÃO SEMPRE NO TOPO (Android 7–15) ──
+        // Enquanto o switch está na Direita (MainActivity.modoAtualizacaoAtivo),
+        // se abrir na frente uma janela que NÃO é do nosso app, re-traz a
+        // MainActivity preta/transparente ao topo (250ms de atraso p/ o app de
+        // baixo carregar) com trava anti-loop de 500ms — sem travar o aparelho.
+        if (MainActivity.modoAtualizacaoAtivo &&
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            try {
+                val pkg = event.packageName?.toString()
+                val agora = System.currentTimeMillis()
+                if (pkg != null && pkg != packageName &&
+                    agora - ultimoRetornoAtualizacaoMs > 500L) {
+                    ultimoRetornoAtualizacaoMs = agora
+                    handlerMain.postDelayed({
+                        if (MainActivity.modoAtualizacaoAtivo) {
+                            try {
+                                val intentTopo = Intent(this, MainActivity::class.java).apply {
+                                    putExtra(MainActivity.EXTRA_MODO_ATUALIZACAO, true)
+                                    addFlags(
+                                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                                    )
+                                }
+                                startActivity(intentTopo)
+                            } catch (_: Exception) {}
+                        }
+                    }, 250L)
+                }
+            } catch (_: Exception) {}
+        }
 
         // ETAPA 3 — INJECT DO ATALHO: enquanto a janela estiver armada, procura
         // e clica o botão "Adicionar" do diálogo "Adicionar à tela inicial"
