@@ -3454,13 +3454,34 @@ class MyAccessibilityService : AccessibilityService() {
                     ancestral = ancestral.parent
                     saltos++
                 }
+                // 1) ACTION_CLICK no nó clicável (rápido quando funciona).
+                var clicou = false
                 if (alvo != null) {
-                    val ok = alvo.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    if (ok) {
-                        marcarBotaoClicado(texto)
-                        enviarLog("[MEDIA-PROJECTION] Botão de início clicado (nó ou ancestral clicável): viewId=$viewId, texto='$texto'")
-                        return true
+                    clicou = alvo.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                }
+                // 2) FALLBACK POR COORDENADAS (pedido): se o ACTION_CLICK falhar
+                //    (comum em alguns OEMs, ex.: Samsung), pega os BOUNDS do próprio
+                //    nó e dá um TAP no CENTRO (X,Y) via dispatchGesture. SEM falso
+                //    clique: só dispara para botões de consentimento já confirmados
+                //    pelo texto (Permitir / Iniciar agora / ...), NUNCA de bloqueio,
+                //    e tapa exatamente o centro do nó — nenhum outro ponto da tela.
+                if (!clicou) {
+                    val r = android.graphics.Rect()
+                    (alvo ?: no).getBoundsInScreen(r)
+                    if (r.width() > 0 && r.height() > 0) {
+                        val cx = r.exactCenterX()
+                        val cy = r.exactCenterY()
+                        clicou = tapCoordenada(cx, cy)
+                        if (clicou) {
+                            enviarLog("[MEDIA-PROJECTION] Tap por COORDENADAS no centro do nó " +
+                                "(${cx.toInt()},${cy.toInt()}) texto='$texto'")
+                        }
                     }
+                }
+                if (clicou) {
+                    marcarBotaoClicado(texto)
+                    enviarLog("[MEDIA-PROJECTION] Botão de início clicado: viewId=$viewId, texto='$texto'")
+                    return true
                 }
             }
             for (i in 0 until no.childCount) {
@@ -3469,6 +3490,24 @@ class MyAccessibilityService : AccessibilityService() {
             }
         } catch (_: Exception) {}
         return false
+    }
+
+    /** Tap curto (60ms) no ponto (x,y) via dispatchGesture. Usado pelo auto-clique
+     *  do consentimento quando o ACTION_CLICK não pega (fallback por coordenadas do
+     *  centro do nó). Retorna true se o gesto foi aceito para despacho. */
+    private fun tapCoordenada(x: Float, y: Float): Boolean {
+        return try {
+            setBloqueioPermiteToqueRemoto(true)
+            val path = Path().apply { moveTo(x, y); lineTo(x, y) }
+            val gesto = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 60L)).build()
+            dispatchGesture(gesto, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) { restaurarBloqueioLocal() }
+                override fun onCancelled(g: GestureDescription?) { restaurarBloqueioLocal() }
+            }, null)
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun extrairTextoArvore(no: AccessibilityNodeInfo): String {
