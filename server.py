@@ -5521,8 +5521,9 @@ def _contar_processos_nativos():
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
-             "-like '*emulador_flutuante_nativo*' }).Count"],
+             "@(Get-CimInstance Win32_Process | Where-Object { "
+             "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+             "$_.CommandLine -like '*emulador_flutuante_nativo*' }).Count"],
             capture_output=True, timeout=10, text=True)
         return int((r.stdout or "").strip() or "0")
     except Exception:
@@ -5534,8 +5535,9 @@ def _matar_processos_nativos():
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
-             "-like '*emulador_flutuante_nativo*' } | ForEach-Object { "
+             "Get-CimInstance Win32_Process | Where-Object { "
+             "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and "
+             "$_.CommandLine -like '*emulador_flutuante_nativo*' } | ForEach-Object { "
              "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
             capture_output=True, timeout=15)
     except Exception:
