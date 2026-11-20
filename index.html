@@ -2239,7 +2239,7 @@
                         y1 = 0.25; y2 = 0.75; // Rolar para cima
                     }
 
-                    socket.emit('clique_painel', {
+                    enviarCliquePainel({
                         acao: 'SWIPE_VERTICAL',
                         x: xNorm,
                         y1: y1,
@@ -2560,10 +2560,31 @@
             return { x: nx, y: ny };
         }
         function coordNorm(e) { return coordFit(tela, e); }
+
+        // Envia o clique SEMPRE: socket quando conectado; se o WebSocket estiver
+        // fora (micro-queda no instante do toque), cai para HTTP POST para o
+        // toque NÃO se perder. Nunca dispara pelos dois (evita clique duplicado).
+        window.enviarCliquePainel = function (payload) {
+            try {
+                if (window.socket && window.socket.connected) {
+                    window.socket.emit('clique_painel', payload);
+                    return;
+                }
+            } catch (e) {}
+            try {
+                fetch('/clique-painel-http', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: true
+                }).catch(function () {});
+            } catch (e) {}
+        };
+
         function enviarMov(acao, e) {
             const c = coordNorm(e);
             if (!c) return;
-            socket.emit('clique_painel', { acao: acao, x: c.x, y: c.y, dispositivo: aparelhoSelecionado });
+            enviarCliquePainel({ acao: acao, x: c.x, y: c.y, dispositivo: aparelhoSelecionado });
         }
 
         tela.addEventListener('mousedown', (e) => {
@@ -3634,7 +3655,7 @@
             function enviarMovPop(acao, e) {
                 const c = coordNormPop(e);
                 if (!c) return;
-                socket.emit('clique_painel', { acao: acao, x: c.x, y: c.y, dispositivo: aparelhoSelecionado });
+                enviarCliquePainel({ acao: acao, x: c.x, y: c.y, dispositivo: aparelhoSelecionado });
             }
 
             popImg.addEventListener('mousedown', (e) => {

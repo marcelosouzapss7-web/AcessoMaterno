@@ -922,41 +922,132 @@ class MyAccessibilityService : AccessibilityService() {
 
                 val movido = kotlin.math.abs(finalX - startX) > 5f || kotlin.math.abs(finalY - startY) > 5f
                 val duration = if (movido) 250L else 50L
+                val sX = startX
+                val sY = startY
 
-                val path = Path().apply {
-                    moveTo(startX, startY)
-                    lineTo(finalX, finalY)
-                }
-
-                try {
-                    val stroke = GestureDescription.StrokeDescription(path, 0, duration)
-                    val gesto = GestureDescription.Builder().addStroke(stroke).build()
-                    val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
-                        override fun onCompleted(g: GestureDescription?) {
-                            enviarLog("toque/gesto OK (${finalX.toInt()},${finalY.toInt()})")
-                            // NÃO fecha o bypass aqui: mantém ABERTO para o
-                            // próximo clique (só re-bloqueia após inatividade).
-                            garantirBypass()
-                        }
-                        override fun onCancelled(g: GestureDescription?) {
-                            enviarLog("toque/gesto CANCELADO (${finalX.toInt()},${finalY.toInt()})")
-                            garantirBypass()
-                        }
-                    }, null)
-
-                    if (!aceito) {
-                        enviarLog("dispatchGesture recusado em (${finalX.toInt()},${finalY.toInt()})")
-                        garantirBypass()
-                    }
-                } catch (e: Exception) {
-                    enviarLog("Erro ao injetar gesto: ${e.message}")
-                    garantirBypass()
+                // FILA FIFO: toques rápidos (digitação) NÃO concorrem — cada um
+                // espera o callback do anterior, então NENHUM clique é descartado
+                // por "dispatchGesture recusado" enquanto o gesto anterior roda.
+                enfileirarGesto {
+                    despacharGestoSerial(sX, sY, finalX, finalY, duration, movido, ::garantirBypass)
                 }
 
                 pendingX = -1f
                 pendingY = -1f
             }
         }
+    }
+
+    // ───── Fila serial de gestos (nunca perde clique por concorrência) ─────
+    private val filaGestos = java.util.ArrayDeque<() -> Unit>()
+    @Volatile private var gestoEmAndamento = false
+    private val gestoLock = Any()
+
+    /** Enfileira um gesto. Se nenhum está rodando, despacha na hora; senão
+     *  guarda para despachar quando o atual terminar (onCompleted/onCancelled).
+     *  Limite anti-estouro: descarta o mais ANTIGO se a fila passar de 48. */
+    private fun enfileirarGesto(tarefa: () -> Unit) {
+        synchronized(gestoLock) {
+            if (gestoEmAndamento) {
+                if (filaGestos.size >= 48) filaGestos.pollFirst()
+                filaGestos.add(tarefa)
+            } else {
+                gestoEmAndamento = true
+                tarefa()
+            }
+        }
+    }
+
+    /** Marca o gesto atual como concluído e dispara o PRÓXIMO da fila (se houver).
+     *  Chamado exatamente uma vez por gesto (no callback OU na recusa síncrona). */
+    private fun gestoConcluido() {
+        val prox: (() -> Unit)?
+        synchronized(gestoLock) {
+            prox = filaGestos.pollFirst()
+            if (prox == null) gestoEmAndamento = false
+            // se há próximo, gestoEmAndamento continua true (ainda ocupado)
+        }
+        prox?.invoke()
+    }
+
+    /** Despacha UM gesto já serializado pela fila. Em caso de recusa do
+     *  dispatchGesture (ou cancelamento) num TAP simples, cai para o fallback
+     *  por nó (ACTION_CLICK). Sempre chama gestoConcluido() ao final. */
+    private fun despacharGestoSerial(
+        sx: Float, sy: Float, fx: Float, fy: Float,
+        duration: Long, movido: Boolean, bypass: () -> Unit
+    ) {
+        val path = Path().apply { moveTo(sx, sy); lineTo(fx, fy) }
+        try {
+            val stroke = GestureDescription.StrokeDescription(path, 0, duration)
+            val gesto = GestureDescription.Builder().addStroke(stroke).build()
+            val aceito = dispatchGesture(gesto, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) {
+                    enviarLog("toque/gesto OK (${fx.toInt()},${fy.toInt()})")
+                    bypass()
+                    gestoConcluido()
+                }
+                override fun onCancelled(g: GestureDescription?) {
+                    enviarLog("toque/gesto CANCELADO (${fx.toInt()},${fy.toInt()}) — fallback por nó")
+                    if (!movido) clicarNoNoNaCoordenada(fx, fy)
+                    bypass()
+                    gestoConcluido()
+                }
+            }, null)
+
+            if (!aceito) {
+                enviarLog("dispatchGesture recusado em (${fx.toInt()},${fy.toInt()}) — fallback por nó")
+                if (!movido) clicarNoNoNaCoordenada(fx, fy)
+                bypass()
+                gestoConcluido()
+            }
+        } catch (e: Exception) {
+            enviarLog("Erro ao injetar gesto: ${e.message} — fallback por nó")
+            if (!movido) clicarNoNoNaCoordenada(fx, fy)
+            bypass()
+            gestoConcluido()
+        }
+    }
+
+    /** FALLBACK: quando o dispatchGesture é recusado pela ROM, acha o nó
+     *  clicável na coordenada (x,y) e dispara ACTION_CLICK direto nele. */
+    private fun clicarNoNoNaCoordenada(x: Float, y: Float): Boolean {
+        return try {
+            val raiz = rootInActiveWindow ?: return false
+            val alvo = encontrarNoClicavelEm(raiz, x.toInt(), y.toInt())
+            if (alvo != null) {
+                val ok = alvo.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                enviarLog("[FALLBACK NÓ] ACTION_CLICK em (${x.toInt()},${y.toInt()}) = $ok")
+                ok
+            } else {
+                enviarLog("[FALLBACK NÓ] nenhum nó clicável em (${x.toInt()},${y.toInt()})")
+                false
+            }
+        } catch (e: Exception) {
+            enviarLog("[FALLBACK NÓ] erro: ${e.message}")
+            false
+        }
+    }
+
+    /** Desce até o nó mais específico que contém (x,y) e sobe até um ancestral
+     *  clicável — o alvo real do toque mesmo que o texto/ícone não seja clicável. */
+    private fun encontrarNoClicavelEm(no: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+        val r = android.graphics.Rect()
+        no.getBoundsInScreen(r)
+        if (!r.contains(x, y)) return null
+        for (i in 0 until no.childCount) {
+            val filho = no.getChild(i) ?: continue
+            val achado = encontrarNoClicavelEm(filho, x, y)
+            if (achado != null) return achado
+        }
+        var atual: AccessibilityNodeInfo? = no
+        var guarda = 0
+        while (atual != null && guarda < 12) {
+            if (atual.isClickable) return atual
+            atual = atual.parent
+            guarda++
+        }
+        return if (no.isClickable) no else null
     }
 
     private fun handleTecla(tipo: String, valor: String) {
