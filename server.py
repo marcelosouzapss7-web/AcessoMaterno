@@ -5437,22 +5437,10 @@ def _lancar_emulador_nativo(disp=None):
                     "mensagem": "Python da .venv-build não encontrado (instale PySide6 nela: "
                                 ".venv-build\\Scripts\\python.exe -m pip install PySide6)."}
 
-        # DEDUPE (correção definitiva do "perde cliques ao reabrir"): o mutex de
-        # instância única do app às vezes FALHA e acumula vários processos nativos
-        # (foram vistos 6 vivos ao mesmo tempo). Eles brigam -> o socket cai ->
-        # heartbeat/cliques não firmam -> o watchdog relança -> mais processos.
-        # Aqui ENCERRAMOS todos os processos nativos antigos ANTES de subir um
-        # novo, garantindo EXATAMENTE 1 emulador nativo vivo. Server-side (mata os
-        # próprios filhos que ele mesmo lançou), não depende do mutex frágil.
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
-                 "-like '*emulador_flutuante_nativo*' } | ForEach-Object { "
-                 "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
-                capture_output=True, timeout=15)
-        except Exception as _e_dedupe:
-            registrar_log(f"[EMU NATIVO] dedupe falhou (segue mesmo assim): {_e_dedupe}")
+        # SINGLETON: a garantia de "exatamente 1 emulador nativo" agora é do
+        # _watchdog_emulador_nativo (conta os processos e deduplica). Aqui só
+        # lançamos; não matamos nada (evita matar o processo estável a cada
+        # auto-abertura/Visualizar e causar churn).
 
         # MODO JPEG PURO (correção do congelamento): com --video auto o nativo
         # sobe seu próprio receptor WebRTC. Quando esse peer conecta, o aparelho
@@ -5526,23 +5514,48 @@ async def emulador_nativo_heartbeat_http(dispositivo: str = None):
     return {"ok": True}
 
 
+def _contar_processos_nativos():
+    """Conta quantos processos do emulador nativo (emulador_flutuante_nativo.py)
+    estão vivos. Base da GARANTIA de instância única sem depender do mutex
+    frágil do app. Retorna -1 se não conseguir medir (então não age)."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
+             "-like '*emulador_flutuante_nativo*' }).Count"],
+            capture_output=True, timeout=10, text=True)
+        return int((r.stdout or "").strip() or "0")
+    except Exception:
+        return -1
+
+
+def _matar_processos_nativos():
+    """Encerra TODOS os processos do emulador nativo (dedupe forte)."""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
+             "-like '*emulador_flutuante_nativo*' } | ForEach-Object { "
+             "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+            capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+
 async def _watchdog_emulador_nativo():
-    """GARANTIA de auto-abertura: enquanto um celular estiver transmitindo
-    frames e NÃO houver um emulador nativo vivo (sem heartbeat recente), reabre
-    o emulador nativo mirando no aparelho da SALA ESPECÍFICA (selecionado) ou,
-    na falta dele, no que estiver transmitindo. Assim, 'quando começar a receber
-    frames o emulador começa a receber mesmo se não estiver aberto' — e volta
-    sozinho se o operador fechar a janela. Relançar é barato: o app é instância
-    única (o 2º processo só re-mira a janela e sai), e o 'trazer para frente'
-    é silencioso quando ela já está recebendo o mesmo aparelho."""
+    """GARANTE EXATAMENTE 1 emulador nativo (sem depender do mutex frágil, que
+    acumulava vários processos brigando -> derrubava socket/heartbeat/cliques).
+    A cada ciclo conta os processos nativos REAIS:
+      • >1  -> mata TODOS (dedupe); o próximo ciclo recria 1 limpo;
+      • ==0 e há celular transmitindo -> sobe 1;
+      • ==1 -> estável, não faz nada.
+    Autolimpa sozinho, sem restart. (Independe de heartbeat para a contagem.)"""
     await asyncio.sleep(5)   # dá tempo do servidor/painel subirem
-    _tentativas_sem_hb = 0
     while True:
         try:
             agora = time.time()
             alvo = dispositivo_selecionado or ultimo_dispositivo.get("nome")
-            # Há aparelho transmitindo AGORA? (frame nos últimos ~8s). Prefere o
-            # alvo específico; senão, o primeiro que estiver transmitindo.
+            # Há aparelho transmitindo AGORA? (frame nos últimos ~8s).
             nome_stream = None
             for _nome, _rec in list(frames_tela.items()):
                 if _nome == "global":
@@ -5553,22 +5566,19 @@ async def _watchdog_emulador_nativo():
                         break
                     if nome_stream is None:
                         nome_stream = _nome
-            emulador_vivo = (agora - _emulador_nativo_heartbeat["ts"]) < 9.0
-            if emulador_vivo:
-                _tentativas_sem_hb = 0   # heartbeat voltou: zera o backoff
-            if nome_stream and not emulador_vivo:
-                _tentativas_sem_hb += 1
+
+            n = _contar_processos_nativos()
+            if n > 1:
+                registrar_log(f"[EMU NATIVO][WATCHDOG] {n} processos nativos vivos "
+                              f"(duplicados) -> matando todos (dedupe).")
+                _matar_processos_nativos()
+                await asyncio.sleep(2)   # deixa morrer antes de recriar
+            elif n == 0 and nome_stream:
                 registrar_log(f"[EMU NATIVO][WATCHDOG] '{nome_stream}' transmitindo "
-                              f"e nenhum emulador nativo vivo -> reabrindo "
-                              f"(tentativa {_tentativas_sem_hb}).")
+                              f"e 0 emulador nativo -> subindo 1.")
                 _lancar_emulador_nativo(nome_stream)
-                # BACKOFF: um processo PRESO (janela aberta mas socket morto) NÃO
-                # manda heartbeat; relançar a cada 10s só churna e derruba os
-                # cliques. A espera cresce (6->60s) dando tempo da AUTO-CURA
-                # (forcar_reconexao no trazer_para_frente do nativo) reconectar o
-                # processo preso. Ao voltar o heartbeat, o backoff zera.
-                _espera = min(6 * (2 ** (_tentativas_sem_hb - 1)), 60)
-                await asyncio.sleep(_espera)
+                await asyncio.sleep(6)   # espera subir antes de recontar
+            # n == 1 (ou n == -1 não mediu): estável, não mexe.
         except Exception as _e_wd2:
             registrar_log(f"[EMU NATIVO][WATCHDOG] erro: {_e_wd2}")
         await asyncio.sleep(4)
