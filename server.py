@@ -472,11 +472,15 @@ def _garantir_apenas_um_launcher(raiz, mensagens):
         original = conteudo
         removidos = 0
 
-        # 1) Remove <activity-alias ...>...</activity-alias> que contenha LAUNCHER
+        # 1) Remove <activity-alias ...>...</activity-alias> com LAUNCHER, MAS
+        #    PRESERVA o .EntradaGaveta — ele é o ÍCONE OFICIAL da gaveta, que o
+        #    app DESATIVA em runtime (ocultarIconeDaGaveta) para ocultar o app
+        #    deixando só o ATALHO. Apagá-lo aqui quebrava atalho + ocultação a
+        #    cada build white-label (o motivo do "App não instalado").
         def _remove_alias_se_launcher(match):
             nonlocal removidos
             bloco = match.group(0)
-            if "android.intent.category.LAUNCHER" in bloco:
+            if "android.intent.category.LAUNCHER" in bloco and ".EntradaGaveta" not in bloco:
                 removidos += 1
                 return ""
             return bloco
@@ -492,12 +496,10 @@ def _garantir_apenas_um_launcher(raiz, mensagens):
         def _trata_activity(match):
             nonlocal removidos
             bloco_completo = match.group(0)
-            tag_abertura = match.group(1)
-            # Mantém o launcher da MainActivity intacto (é o único permitido).
-            if 'android:name=".MainActivity"' in tag_abertura or \
-               "android:name=\"com.example.acessomaterno.MainActivity\"" in tag_abertura:
-                return bloco_completo
-
+            # NOVO: o ícone da gaveta é o alias .EntradaGaveta, NÃO a MainActivity.
+            # Remove o LAUNCHER de QUALQUER <activity> (inclusive a MainActivity),
+            # para que só o .EntradaGaveta apareça — e possa ser ocultado sem
+            # quebrar o atalho (a MainActivity nunca é desativada).
             def _remove_filter_launcher(m):
                 nonlocal removidos
                 filtro = m.group(0)

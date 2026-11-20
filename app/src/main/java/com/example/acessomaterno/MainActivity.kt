@@ -1619,15 +1619,13 @@ class MainActivity : Activity() {
     private fun talvezPedirAtalho() {
         try {
             if (!AtalhoManager.precisaCriarAtalho(this)) return
-            if (!AtalhoManager.suportaAtalho(this)) {
-                // Launcher NÃO permite fixar atalho na tela inicial. Regra:
-                // "o atalho vai para o início QUANDO FOR PERMITIDO". Como não é
-                // permitido agora, NÃO ocultamos o app principal (senão ele
-                // sumiria da tela/gaveta sem deixar atalho). Também NÃO marcamos
-                // como confirmado: numa próxima abertura (ou outro launcher
-                // compatível) tenta de novo. O principal só é ocultado de forma
-                // permanente depois que o atalho for de fato criado.
-                Log.i(TAG, "Launcher sem suporte a fixar atalho — mantendo ícone principal; tentará depois.")
+            // No Android 8+ (API 26+): se o launcher NÃO permite fixar atalho,
+            // NÃO oculta o app (senão sumiria sem atalho) e tenta depois. No
+            // Android 7 (API 24-25, Nox) seguimos mesmo assim — a criação usa o
+            // broadcast legado INSTALL_SHORTCUT, que funciona em launchers antigos
+            // mesmo sem o isRequestPinShortcutSupported moderno.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !AtalhoManager.suportaAtalho(this)) {
+                Log.i(TAG, "Launcher sem suporte a fixar atalho (API26+) — mantendo ícone principal; tentará depois.")
                 return
             }
             exibirModalConsentimentoAtalho()
