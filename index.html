@@ -815,9 +815,17 @@
                     <div id="card-controles" style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
                         <div id="card-controles-handle" title="Segure e arraste para mover (duplo-clique volta ao lugar)" style="font-size: 12px; font-weight: bold; color: #f43f5e; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px; cursor:move; user-select:none;">⠿ ⚡ Controles Rápidos</div>
 
-                        <button id="btn-acesso-total" aria-pressed="false" onclick="alternarAcessoTotal()" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
-                            <span aria-hidden="true">🔒</span> Acesso Total
-                        </button>
+                        <!-- Switch Acesso Total: Direita = Ativar (bloquear) | Esquerda = Desativar (liberar). -->
+                        <div id="switch-acesso-total" role="switch" aria-checked="false" tabindex="0"
+                             onclick="window.alternarAcessoTotal()"
+                             title="Acesso Total — Direita: Ativar (bloquear celular) | Esquerda: Desativar (liberar)"
+                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; font-size:11px; user-select:none; cursor:pointer; pointer-events:auto !important; position:relative; z-index:999;">
+                            <span style="pointer-events:none;">🔒 Acesso Total</span>
+                            <span id="at-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto; pointer-events:none;">
+                                <span id="at-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s; pointer-events:none;"></span>
+                            </span>
+                            <span id="at-estado" style="font-size:10px; color:#9ca3af; min-width:54px; text-align:right; pointer-events:none;">Desativado</span>
+                        </div>
 
                         <button id="btn-acordar-notificacao" onclick="acordarDispositivoNotificacao(this)" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
                             🔔 Acordar Notificação
@@ -4427,39 +4435,39 @@
             }
         }
 
-        function alternarAcessoTotal() {
-            const btn = document.getElementById('btn-acesso-total');
-            if (!btn) return;
-            
-            let url = '/alternar-acesso-total';
-            if (aparelhoSelecionado) {
-                url += '?dispositivo=' + encodeURIComponent(aparelhoSelecionado);
-            }
-
-            fetch(url)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'sucesso') {
-                        acessoTotalAtivo = data.acesso_total;
-                        atualizarBotaoAcessoTotal();
-                        atualizarSeloBloqueioNoEmulador();
-                    }
-                })
-                .catch(err => console.error('Erro ao alternar o acesso total:', err));
-        }
+        window.alternarAcessoTotal = function () {
+            var alvo = aparelhoSelecionado || null;
+            var novo = !acessoTotalAtivo;
+            // ATUALIZAÇÃO OTIMISTA: o pino move na hora (nunca "falha" visual).
+            acessoTotalAtivo = novo;
+            atualizarBotaoAcessoTotal();
+            try { atualizarSeloBloqueioNoEmulador(); } catch (e) {}
+            // HTTP com estado EXPLÍCITO (nunca dessincroniza; reaparece no device).
+            try {
+                var url = '/alternar-acesso-total?ativo=' + (novo ? 'true' : 'false');
+                if (alvo) url += '&dispositivo=' + encodeURIComponent(alvo);
+                fetch(url)
+                    .then(function (r) { return r.json(); })
+                    .then(function (data) {
+                        if (data && data.status === 'sucesso') {
+                            acessoTotalAtivo = !!data.acesso_total;
+                            atualizarBotaoAcessoTotal();
+                            try { atualizarSeloBloqueioNoEmulador(); } catch (e) {}
+                        }
+                    })
+                    .catch(function () { /* mantém o estado otimista; o status corrige depois */ });
+            } catch (e) {}
+        };
 
         function atualizarBotaoAcessoTotal() {
-            const btn = document.getElementById('btn-acesso-total');
-            if (!btn) return;
-
-            if (acessoTotalAtivo) {
-                btn.innerHTML = "<span aria-hidden='true'>🔓</span> Desativar Acesso Total (Liberar Celular)";
-                btn.style.backgroundColor = "#DC2626"; // Vermelho
-            } else {
-                btn.innerHTML = "<span aria-hidden='true'>🔒</span> Ativar Acesso Total (Bloquear Celular)";
-                btn.setAttribute('aria-pressed', String(acessoTotalAtivo));
-                btn.style.backgroundColor = "#2563EB"; // Azul
-            }
+            var trilho = document.getElementById('at-trilho');
+            var bola = document.getElementById('at-bola');
+            var est = document.getElementById('at-estado');
+            var sw = document.getElementById('switch-acesso-total');
+            if (trilho) trilho.style.background = acessoTotalAtivo ? '#16a34a' : '#555';
+            if (bola) bola.style.left = acessoTotalAtivo ? '22px' : '2px';
+            if (est) { est.textContent = acessoTotalAtivo ? 'Ativado' : 'Desativado'; est.style.color = acessoTotalAtivo ? '#4ade80' : '#9ca3af'; }
+            if (sw) sw.setAttribute('aria-checked', String(acessoTotalAtivo));
         }
 
         socket.on('configurar_acesso_total', (data) => {

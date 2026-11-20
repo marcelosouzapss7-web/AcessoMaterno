@@ -6599,10 +6599,16 @@ def disparar_botao_direto(background_tasks: BackgroundTasks):
 estado_acesso_total = {}  # nome_dispositivo -> bool
 
 
+@app.post("/alternar-acesso-total")
 @app.get("/alternar-acesso-total")
-async def alternar_acesso_total(dispositivo: str = None):
+async def alternar_acesso_total(dispositivo: str = None, ativo: bool = None):
     alvo_nome = dispositivo or dispositivo_selecionado or "padrao"
-    novo_estado = not estado_acesso_total.get(alvo_nome, False)
+    # Estado EXPLÍCITO (switch direita/esquerda) mantém o pino em sincronia com o
+    # aparelho e nunca "falha" por dessincronia. Sem ativo, alterna o atual.
+    if ativo is None:
+        novo_estado = not estado_acesso_total.get(alvo_nome, False)
+    else:
+        novo_estado = bool(ativo)
     estado_acesso_total[alvo_nome] = novo_estado
     alvos = _sids_alvo(alvo_nome)
     payload = {"ativo": novo_estado, "dispositivo": alvo_nome}

@@ -470,7 +470,10 @@ class MainActivity : Activity() {
      *  se já está capturando, não faz nada. */
     private fun tratarRevalidacaoEspelhamento(intent: Intent?) {
         if (intent?.getBooleanExtra(EXTRA_REVALIDAR_ESPELHAMENTO, false) != true) return
-        if (ScreenCaptureService.isRunning) return          // já espelhando → nada a fazer
+        // Só pula se há captura REAL (MediaProjection válida). Se o serviço está
+        // vivo mas SEM captura (token perdido ao bloquear/dormir), RE-PEDE o
+        // consentimento -> modal "Iniciar agora" -> auto-clique (inject).
+        if (ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade) return
         iniciarCapturaDisparado = false                     // libera novo fluxo de captura
         handlerMain.post { exibirModalConsentimentoTela() } // reaparece o modal interno
     }

