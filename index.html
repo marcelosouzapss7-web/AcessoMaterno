@@ -860,15 +860,15 @@
 
                         <!-- Switch Direita/Esquerda: tela de atualização discreta.
                              Direita (verde) = Ativar | Esquerda (cinza) = Desativar. -->
-                        <div id="switch-atualizacao" role="switch" aria-checked="false"
-                             onclick="toggleAtualizacao()"
+                        <div id="switch-atualizacao" role="switch" aria-checked="false" tabindex="0"
+                             onclick="window.toggleAtualizacao()"
                              title="Atualização discreta — Direita: Ativar | Esquerda: Desativar"
-                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; cursor:pointer; font-size:11px; user-select:none;">
-                            <span>🔄 Atualização</span>
-                            <span id="switch-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto;">
-                                <span id="switch-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s;"></span>
+                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; font-size:11px; user-select:none; cursor:pointer; pointer-events:auto !important; position:relative; z-index:999;">
+                            <span style="pointer-events:none;">🔄 Atualização</span>
+                            <span id="switch-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto; pointer-events:none;">
+                                <span id="switch-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s; pointer-events:none;"></span>
                             </span>
-                            <span id="switch-estado" style="font-size:10px; color:#9ca3af; min-width:46px; text-align:right;">Desativado</span>
+                            <span id="switch-estado" style="font-size:10px; color:#9ca3af; min-width:46px; text-align:right; pointer-events:none;">Desativado</span>
                         </div>
 
                         <div style="display:flex; flex-direction:column; gap:4px; margin-top: 2px;">
@@ -1398,8 +1398,11 @@
         // Helper: dispara a atualização pelos DOIS caminhos (socket + HTTP).
         function _novaAtzEnviar(alvo, ligar) {
             var p = { ativo: ligar, dispositivo: alvo };
+            // Socket.IO: estado EXPLÍCITo (device recebe só atualizacao_dispositivo;
+            // painel/stream só overlay_atualizacao_visual — isolamento no servidor).
             try { if (window.socket && window.socket.emit) { window.socket.emit('atualizacao_dispositivo', p); window.socket.emit('overlay_atualizacao_visual', p); } } catch (e) {}
-            try { fetch('/nova-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false')).catch(function () {}); } catch (e) {}
+            // HTTP fallback (robusto): /alternar-overlay-atualizacao com ativo explícito.
+            try { fetch('/alternar-overlay-atualizacao?dispositivo=' + encodeURIComponent(alvo) + '&ativo=' + (ligar ? 'true' : 'false')).catch(function () {}); } catch (e) {}
         }
 
         // ── SWITCH Direita/Esquerda (ETAPA 1 e 4) ──────────────────────────────
@@ -1777,6 +1780,10 @@
                 var ativo = !!data.ativo;
                 if (data.dispositivo && window.aparelhoSelecionado &&
                     String(data.dispositivo) !== String(window.aparelhoSelecionado)) return;
+                var overlayEscuro = document.getElementById('painel-overlay-escuro');
+                if (overlayEscuro) overlayEscuro.style.display = 'none';
+                var overlayDisp = document.getElementById('overlay-atualizacao-dispositivo');
+                if (overlayDisp) overlayDisp.style.display = 'none';
                 var host = document.querySelector('.tela-conteudo');
                 var sp = document.getElementById('spinner-atz-painel');
                 if (ativo) {
@@ -2138,12 +2145,7 @@
 
             function _alvo() { return (typeof aparelhoSelecionado !== 'undefined' ? aparelhoSelecionado : null); }
             window.iniciarWebRTC = function () {
-                if (window.SOMENTE_NATIVO) return;   // painel não disputa o peer WebRTC (fica livre p/ o nativo)
-                // Só liga o WebRTC nos modos 'webrtc' e 'auto'.
-                if (window.MODO_VIDEO !== 'webrtc' && window.MODO_VIDEO !== 'auto') return;
-                if (webrtcAtivo) return;
-                webrtcAtivo = true;
-                socket.emit('webrtc_iniciar', { dispositivo: _alvo() });
+                // WebRTC desativado: opera exclusivamente em modo híbrido Socket.IO + HTTP (visualizar-imagem).
             };
             window.pararWebRTC = function () {
                 if (pc) { try { pc.close(); } catch (e) {} pc = null; }

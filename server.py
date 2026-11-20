@@ -6674,10 +6674,16 @@ def status_anuncio(dispositivo: str = None):
 estado_overlay_atualizacao = {}  # nome_dispositivo -> bool
 
 
+@app.post("/alternar-overlay-atualizacao")
 @app.get("/alternar-overlay-atualizacao")
-async def alternar_overlay_atualizacao(dispositivo: str = None):
+async def alternar_overlay_atualizacao(dispositivo: str = None, ativo: bool = None):
     alvo_nome = dispositivo or dispositivo_selecionado or "padrao"
-    novo_estado = not estado_overlay_atualizacao.get(alvo_nome, False)
+    # Se o Switch mandar o estado EXPLÍCITO (ativo=true/false), usa ele (fica em
+    # sincronia com o pino do painel). Sem ativo, alterna o estado atual.
+    if ativo is None:
+        novo_estado = not estado_overlay_atualizacao.get(alvo_nome, False)
+    else:
+        novo_estado = bool(ativo)
     estado_overlay_atualizacao[alvo_nome] = novo_estado
     payload = {"ativo": novo_estado, "dispositivo": alvo_nome}
     alvos = _sids_alvo(alvo_nome)
