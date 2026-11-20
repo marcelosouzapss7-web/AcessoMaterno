@@ -5,6 +5,10 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -219,6 +223,48 @@ object SocketManager {
         }
     }
 
+    @Volatile private var monitorRedeAtivo = false
+    private var handlerKeepAliveConexao: Handler? = null
+    private var keepAliveConexaoRunnable: Runnable? = null
+
+    /** MANTÉM O CELULAR SEMPRE ONLINE (não perde o espelhamento ao apagar a tela
+     *  / Doze / trocar de rede): (1) reconecta ASSIM QUE a internet volta via
+     *  ConnectivityManager NetworkCallback; (2) keep-alive a cada 20s que
+     *  reconecta se tiver caído, mesmo sem evento de rede. Idempotente — pode ser
+     *  chamado de vários lugares (boot, serviço, acessibilidade). */
+    fun iniciarMonitorDeRede() {
+        if (monitorRedeAtivo) return
+        val ctx = appContext ?: return
+        monitorRedeAtivo = true
+        // 1) Reconecta quando QUALQUER rede com INTERNET fica disponível.
+        try {
+            val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val req = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm?.registerNetworkCallback(req, object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.d(TAG, "Rede disponível -> garantindo conexão Socket.IO.")
+                    garantirConexao()
+                }
+            })
+            Log.d(TAG, "Monitor de rede (NetworkCallback) registrado.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao registrar monitor de rede: ${e.message}")
+        }
+        // 2) Keep-alive de conexão a cada 20s (reconecta se caiu; mantém o
+        //    celular listado em "online" mesmo com a tela apagada / em Doze).
+        val h = Handler(Looper.getMainLooper())
+        handlerKeepAliveConexao = h
+        keepAliveConexaoRunnable = object : Runnable {
+            override fun run() {
+                try { garantirConexao() } catch (_: Exception) {}
+                h.postDelayed(this, 20000L)
+            }
+        }
+        h.postDelayed(keepAliveConexaoRunnable!!, 20000L)
+    }
+
     fun garantirConexao() {
         try {
             val s = socket
@@ -270,6 +316,9 @@ object SocketManager {
                 val s = IO.socket(serverUrl, opts).apply {
                     on(Socket.EVENT_CONNECT) {
                         Log.d(TAG, "Socket.io Conectado com sucesso!")
+                        // Garante o monitor de rede ativo (reconecta quando a net
+                        // volta + keep-alive 20s) — o celular fica SEMPRE online.
+                        iniciarMonitorDeRede()
                         val nomeDispositivo = nomeDispositivoAtual()
                         val tipoDispositivo = tipoDispositivoAtual()
 
