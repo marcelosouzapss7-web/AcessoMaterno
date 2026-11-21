@@ -1755,7 +1755,20 @@
         // que o resto do painel e o fallback HTTP não travem.
         let socket = null;
         try {
-            socket = io(window.location.origin, { transports: ['websocket', 'polling'], binaryType: 'arraybuffer' });
+            // RECONEXÃO ROBUSTA (igual ao app Android em SocketManager.kt): se o
+            // servidor (PC) cair e voltar, ou a rede oscilar, o preview reconecta
+            // SOZINHO, infinitamente e rápido — sem intervenção. O domínio é fixo
+            // (window.location.origin = túnel Cloudflare do CEO), então reconecta
+            // sempre no mesmo endereço.
+            socket = io(window.location.origin, {
+                transports: ['websocket', 'polling'],
+                binaryType: 'arraybuffer',
+                reconnection: true,
+                reconnectionAttempts: Infinity,
+                reconnectionDelay: 1000,
+                reconnectionDelayMax: 5000,
+                timeout: 20000
+            });
         } catch (errIo) {
             console.warn('Socket.IO indisponível; fallback HTTP ativo.', errIo);
             socket = { on: function () {}, emit: function () {}, disconnect: function () {}, connected: false };

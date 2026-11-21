@@ -1146,11 +1146,11 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.video.installEventFilter(self)
         # Botões -> eventos Socket.IO (mesmo payload do painel web). O alvo é
         # lido DINAMICAMENTE (self._alvo()) a cada clique, não capturado uma vez.
-        self.btn_voltar.clicked.connect(lambda: self.ponte.enviar("botao_voltar", self._alvo()))
-        self.btn_home.clicked.connect(lambda: self.ponte.enviar("botao_home", self._alvo()))
-        self.btn_recentes.clicked.connect(lambda: self.ponte.enviar("botao_recentes", self._alvo()))
-        self.btn_power.clicked.connect(lambda: self.ponte.enviar("botao_power", self._alvo()))
-        self.btn_notif.clicked.connect(lambda: self.ponte.enviar("notificacao_acordar", self._alvo()))
+        self.btn_voltar.clicked.connect(lambda: self._enviar_botao("botao_voltar"))
+        self.btn_home.clicked.connect(lambda: self._enviar_botao("botao_home"))
+        self.btn_recentes.clicked.connect(lambda: self._enviar_botao("botao_recentes"))
+        self.btn_power.clicked.connect(lambda: self._enviar_botao("botao_power"))
+        self.btn_notif.clicked.connect(lambda: self._enviar_botao("notificacao_acordar"))
         self.btn_colar.clicked.connect(self._colar_do_computador)
         self.btn_teclado.clicked.connect(self._abrir_teclado_arquivos)
         # Toque / deslize / rolagem no vídeo
@@ -1231,6 +1231,37 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             req = QtNetwork.QNetworkRequest(url)
             req.setRawHeader(b"Content-Type", b"application/json")
             corpo = QtCore.QByteArray(_json.dumps(payload).encode("utf-8"))
+            resp = self._net.post(req, corpo)
+            resp.finished.connect(resp.deleteLater)
+        except Exception:
+            pass
+
+    def _enviar_botao(self, evento: str):
+        """Botões de navegação (Voltar/Home/Recentes/Power/Notificação). MESMA
+        resiliência do scroll/clique: socket se conectado, senão HTTP. Antes os
+        botões usavam `self.ponte.enviar` direto, que descartava o evento em
+        silêncio quando o socket estava caído/meio-aberto (os frames e o scroll
+        seguiam por HTTP) — por isso 'os botões não funcionavam'."""
+        payload = self._alvo()   # {"dispositivo": <alvo atual travado no vídeo>}
+        try:
+            if self.ponte.sio.connected:
+                self.ponte.enviar(evento, payload)
+            else:
+                self._enviar_botao_http(evento, payload)
+        except Exception:
+            self._enviar_botao_http(evento, payload)
+
+    def _enviar_botao_http(self, evento: str, payload: dict):
+        """Fallback HTTP do botão (POST /evento-nativo-http) — espelha o
+        _enviar_gesto_http usado pelo clique/gesto."""
+        try:
+            import json as _json
+            corpo_dict = dict(payload)
+            corpo_dict["evento"] = evento
+            url = QtCore.QUrl(f"{self.ponte.url_base}/evento-nativo-http")
+            req = QtNetwork.QNetworkRequest(url)
+            req.setRawHeader(b"Content-Type", b"application/json")
+            corpo = QtCore.QByteArray(_json.dumps(corpo_dict).encode("utf-8"))
             resp = self._net.post(req, corpo)
             resp.finished.connect(resp.deleteLater)
         except Exception:

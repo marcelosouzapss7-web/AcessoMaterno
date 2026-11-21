@@ -2100,6 +2100,34 @@ async def clique_painel_http(request: Request):
     return {"ok": True}
 
 
+@app.post("/evento-nativo-http")
+async def evento_nativo_http(request: Request):
+    """Fallback HTTP dos BOTÕES do emulador nativo (Voltar/Home/Recentes/Power/
+    Notificação). Quando o socket está caído/meio-aberto, o PonteSocket.enviar
+    descartava o evento em silêncio ('if sio.connected') e o botão 'não
+    funcionava' — enquanto o scroll/clique seguia por /clique-painel-http. Aqui
+    reusamos os MESMOS handlers de socket por HTTP. Corpo JSON: {evento, dispositivo}."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "erro": "JSON inválido"}
+    if not isinstance(data, dict):
+        return {"ok": False, "erro": "payload não é dict"}
+    evento = str(data.get("evento") or "").strip()
+    _handlers_botao = {
+        "botao_voltar": botao_voltar,
+        "botao_home": botao_home,
+        "botao_recentes": botao_recentes,
+        "botao_power": botao_power,
+        "notificacao_acordar": notificacao_acordar,
+    }
+    handler = _handlers_botao.get(evento)
+    if handler is None:
+        return {"ok": False, "erro": f"evento desconhecido: {evento}"}
+    await handler(None, data)
+    return {"ok": True}
+
+
 @sio.on("tecla_painel")
 async def tecla_painel(sid, data):
     """Teclado do painel -> 'receber_tecla' no aparelho SELECIONADO."""

