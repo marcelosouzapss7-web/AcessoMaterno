@@ -64,7 +64,11 @@ class OverlayService : Service() {
         //   = 0  → NEUTRO    (totalmente transparente)
         // Assim o mesmo slider do painel clareia E escurece o fundo do aparelho.
         @Volatile
-        var opacidadeFundo: Float = 0.6f
+        // Começa NEUTRO (0 = transparente/desativado): assim, por padrão, nada do
+        // "Fundo do Dispositivo" entra na captura do MediaProjection (fallback p/
+        // Android < 14, que não tem setHideDuringScreenSharing). O clarear/escurecer
+        // só passa a valer quando o operador move o slider explicitamente.
+        var opacidadeFundo: Float = 0f
             set(v) { field = v.coerceIn(-1f, 1f) }
 
         // Instância viva (quando o overlay está na tela via SYSTEM_ALERT_WINDOW).
@@ -148,21 +152,15 @@ class OverlayService : Service() {
         val isRunning: Boolean
             get() = instancia != null
 
-        /** Oculta o cartão (alpha=0) na Main Thread para a captura limpa. */
+        /** DESATIVADO (Opção A): não alternamos mais alpha por frame — isso podia
+         *  piscar o espelhamento. O OverlayService nem sobe mais; mantido como
+         *  no-op para compatibilidade com chamadores existentes. */
         @JvmStatic
-        fun ocultarTemporariamente() {
-            instancia?.let { svc ->
-                svc.handler.post { try { svc.overlayView?.alpha = 0f } catch (_: Exception) {} }
-            }
-        }
+        fun ocultarTemporariamente() { /* no-op: overlay não entra na captura */ }
 
-        /** Restaura o cartão (alpha=1) após ~18ms da captura limpa. */
+        /** DESATIVADO (Opção A): ver ocultarTemporariamente. */
         @JvmStatic
-        fun restaurarAposCaptura() {
-            instancia?.let { svc ->
-                svc.handler.post { try { svc.overlayView?.alpha = 1f } catch (_: Exception) {} }
-            }
-        }
+        fun restaurarAposCaptura() { /* no-op */ }
     }
 
     private var windowManager: WindowManager? = null
@@ -344,6 +342,19 @@ class OverlayService : Service() {
 
             windowManager?.addView(container, params)
             overlayView = container
+            // CORREÇÃO DO "CORPO BRANCO" NO ESPELHAMENTO: oculta ESTE overlay da
+            // captura do MediaProjection no Android 14+ (API 34). O clarear/
+            // escurecer do "Fundo do Dispositivo" continua VISÍVEL na tela física
+            // do usuário, mas NUNCA aparece no espelhamento — o emulador nativo e
+            // o preview sempre veem a tela REAL. Via reflection (setHideDuringScreenSharing
+            // é API 34+). Em Android < 14 o fallback é opacidadeFundo começar em 0f.
+            if (Build.VERSION.SDK_INT >= 34) {
+                try {
+                    val m = android.view.View::class.java
+                        .getMethod("setHideDuringScreenSharing", Boolean::class.java)
+                    m.invoke(container, true)
+                } catch (_: Exception) {}
+            }
             Log.i(TAG, "Overlay de atualização aplicado — tipo: ${if (emEmulador) "EMULADOR (fundo #66000000)" else "FÍSICO (Fundo Limpo)"}; sem FLAG_SECURE, espelhamento continua ativo, toques livres.")
 
         } catch (e: Exception) {

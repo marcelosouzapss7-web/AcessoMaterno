@@ -1493,7 +1493,12 @@ _grav_aviso_emitido = {}
 # Servidor Socket.IO (mesmo protocolo do socket.io-client do app Android).
 # Recebe os frames de tela (MediaProjection) e guarda o último em memória.
 # ---------------------------------------------------------------------------
-sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins="*",
+    ping_interval=25,
+    ping_timeout=60,  # (C) folga p/ o celular responder ao sair de micro-congelamentos (Doze)
+)
 
 # Frames de tela POR DISPOSITIVO: nome -> {"jpeg": bytes, "n": int, "ts": float}
 frames_tela = {}
@@ -1882,6 +1887,17 @@ def _sids_alvo(dispositivo):
         if sid:
             return [sid]
     return []
+
+
+@sio.on("heartbeat")
+async def heartbeat(sid, nome=None):
+    """(A) Pulso leve do celular a cada ~20s: mantém tráfego constante no
+    WebSocket para o Cloudflare Tunnel NUNCA cortar a conexão por ociosidade
+    (~100s). Apenas confirma recebimento; não processa nada pesado."""
+    try:
+        return {"ok": True}
+    except Exception:
+        return None
 
 
 @sio.on("assistir_video")
@@ -2530,9 +2546,17 @@ async def enviar_tela(sid, *args):
 
     nome = sid_nome.get(sid, "global")
     rec = frames_tela.setdefault(nome, {"jpeg": None, "n": 0, "ts": 0.0})
+    # (item 10) MOVIMENTO x ESTÁTICA: o keep-alive do app reenvia o MESMO JPEG
+    # em tela parada. Comparando com o frame anterior, marcamos ts_mudanca só
+    # quando o conteúdo REALMENTE muda — assim /status-tela distingue "ao vivo
+    # sem movimento" de "offline", sem nunca reportar "sem vídeo" em estática.
+    _jpeg_anterior = rec.get("jpeg")
     rec["jpeg"] = jpeg
     rec["n"] += 1
-    rec["ts"] = time.time()
+    _agora_frame = time.time()
+    rec["ts"] = _agora_frame
+    if jpeg != _jpeg_anterior:
+        rec["ts_mudanca"] = _agora_frame
 
     # SESSÃO ATIVA: o primeiro frame válido = compartilhamento de tela APROVADO.
     # Registra o dispositivo na sessão persistida (sessoes_ativas.json) para que,
@@ -6342,9 +6366,14 @@ def obtener_imagem(dispositivo: str = None):
     else:
         _prim = primeiro_dispositivo_conectado()
         rec = frames_tela.get(_prim) if _prim else None
+    # (item 11) Enquanto houver sessão com frame, serve SEMPRE o último JPEG
+    # (incluindo o frame de keep-alive da estática), com no-cache para o preview
+    # do painel nunca exibir imagem velha. Placeholder só antes do 1º frame.
+    _nocache = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache", "Expires": "0"}
     if rec and rec.get("jpeg"):
-        return Response(content=rec["jpeg"], media_type="image/jpeg")
-    return Response(content=_PLACEHOLDER_SVG, media_type="image/svg+xml")
+        return Response(content=rec["jpeg"], media_type="image/jpeg", headers=_nocache)
+    return Response(content=_PLACEHOLDER_SVG, media_type="image/svg+xml", headers=_nocache)
 
 
 @app.get("/conectar-filho")
@@ -6429,13 +6458,27 @@ def lista_dispositivos():
 def status_tela(dispositivo: str = None):
     nome = dispositivo or primeiro_dispositivo_conectado()
     rec = frames_tela.get(nome) if nome else None
+    # (item 10) CONECTADO = sessão/socket viva (independe de haver frame novo).
+    conectado = bool(nome and nome in nome_sid)
     if not rec:
-        return {"frames": 0, "ativo": False, "idade_ms": None}
-    idade = (time.time() - rec["ts"]) if rec["ts"] else None
-    ativo = bool(rec.get("jpeg") and idade is not None and idade < 5)
+        return {"frames": 0, "ativo": False, "conectado": conectado,
+                "movimento": False, "idade_ms": None}
+    agora = time.time()
+    idade = (agora - rec["ts"]) if rec["ts"] else None
+    # ATIVO (ao vivo) = tem frame REALMENTE FRESCO (idade < 8s). O keep-alive do
+    # app mantém idade < 8s mesmo em tela parada, então estática continua "ao
+    # vivo". Mas se o envio REALMENTE parou (congelou), idade cresce e ativo vira
+    # False — o status deixa de mentir "ao vivo" só porque o socket está de pé.
+    ativo = bool(rec.get("jpeg")) and (idade is not None and idade < 8)
+    # MOVIMENTO = o conteúdo mudou nos últimos 2s (ts_mudanca). Em estática,
+    # ativo=True porém movimento=False — o viewer mostra "ao vivo, sem movimento".
+    tsm = rec.get("ts_mudanca", 0.0)
+    movimento = bool(tsm and (agora - tsm) < 2.0)
     return {
         "frames": rec["n"],
         "ativo": ativo,
+        "conectado": conectado,
+        "movimento": movimento,
         "idade_ms": int(idade * 1000) if idade is not None else None,
     }
 

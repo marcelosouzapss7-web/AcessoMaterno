@@ -1770,6 +1770,22 @@
         socket.on('connect', () => {
             console.log('[PAINEL] Socket.IO conectado:', socket.id);
             socket.emit('identificar', 'painel');
+            // START RÁPIDO (igual ao Emulador FPS): assim que o socket conecta,
+            // busca o dispositivo ATIVO e entra na sala stream:{nome} na HORA —
+            // sem esperar o poll de /lista-dispositivos (400ms). O FPS faz o
+            // mesmo (fetch_active_device_name + assistir_video no on_connect),
+            // por isso "sempre inicia rápido". Idempotente: se já há um aparelho
+            // selecionado, respeita-o; senão adota o ativo como alvo de exibição.
+            try {
+                fetch('/dispositivo-ativo').then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (d) {
+                        var dev = d && d.dispositivo ? String(d.dispositivo).trim() : '';
+                        if (!dev) return;
+                        if (!aparelhoSelecionado) alvoExibicao = alvoExibicao || dev;
+                        var alvo = aparelhoSelecionado || dev;
+                        socket.emit('assistir_video', { dispositivo: alvo });
+                    }).catch(function () {});
+            } catch (e) {}
         });
         socket.on('connect_error', (e) => console.error('[PAINEL] Erro Socket.IO:', e.message));
 
@@ -2001,7 +2017,15 @@
         //  'jpeg'   = SÓ JPEG via Socket.IO (mais simples, porém mais lento)
         //  'auto'   = árbitro escolhe por prioridade WebRTC > H.264 > JPEG
         // Troque só esta linha e dê Ctrl+Shift+R no painel.
-        window.MODO_VIDEO = 'h264';
+        //
+        // ► JPEG = MESMO transporte do Emulador FPS e do Emulador Nativo: frames
+        //   são transmitidos pela sala stream:{nome} para QUALQUER número de
+        //   viewers ao mesmo tempo (broadcast). Não ocupa o ÚNICO peer
+        //   WebRTC/H264 do aparelho, então o preview do painel, o nativo e o FPS
+        //   funcionam SIMULTANEAMENTE sem um atrapalhar o outro (sem
+        //   incompatibilidade). Esta é a razão de o FPS "sempre iniciar rápido":
+        //   JPEG pela sala está SEMPRE disponível, sem handshake de peer.
+        window.MODO_VIDEO = 'jpeg';
         // Compat: SOMENTE_JPEG antigo = equivalente a MODO_VIDEO='jpeg'.
         window.SOMENTE_JPEG = (window.MODO_VIDEO === 'jpeg');
 
@@ -2013,8 +2037,14 @@
         // aceita 1 peer). Os CONTROLES do painel (selecionar aparelho, botões,
         // gestos) continuam funcionando — só o vídeo deixa de ser recebido aqui.
         // Para reativar o vídeo no painel, troque para false e dê Ctrl+Shift+R.
+        //
+        // ► AGORA false: com MODO_VIDEO='jpeg' o painel NÃO usa WebRTC/H264
+        //   (não responde webrtc_offer nem decodifica video_h264 — ver guardas
+        //   `MODO_VIDEO === 'jpeg'` abaixo), então reativar o vídeo do painel
+        //   NÃO disputa o peer único do aparelho com o Emulador Nativo. Os dois
+        //   (+ o FPS) consomem a MESMA sala JPEG em paralelo, sem conferência.
         // ====================================================================
-        window.SOMENTE_NATIVO = true;
+        window.SOMENTE_NATIVO = false;
 
         window.__fonteAtivaVideo = 'none';
         window.__tsH264 = 0;   // último frame H.264 decodificado
@@ -2068,7 +2098,15 @@
         function _renderFrame(arrayBuffer) {
             if (window.SOMENTE_NATIVO) return;   // vídeo do painel desligado (só o nativo exibe)
             if (!arrayBuffer || arrayBuffer.byteLength === 0) return;
+            // Liveness SEMPRE atualizada (status "ao vivo" não depende do throttle).
             ultimoFramePush = Date.now();
+            // (Opção B) PREVIEW LEVE ~5 FPS: o preview do painel pinta no máximo a
+            // cada 200ms, economizando CPU/bateria. O emulador nativo (processo
+            // PySide6 à parte) continua em FPS cheio/fluido. Frames excedentes são
+            // descartados AQUI, sem nem criar o blob/ObjectURL (mais leve ainda).
+            var _agoraR = Date.now();
+            if (_agoraR - (window.__ultimoPreviewRender || 0) < 200) return;
+            window.__ultimoPreviewRender = _agoraR;
             const blob = new Blob([arrayBuffer], { type: "image/jpeg" });
             const url = URL.createObjectURL(blob);
             requestAnimationFrame(() => {
@@ -2082,10 +2120,22 @@
                 let usado = false;
                 if (popImg) {
                     popImg.src = url;
+                    usado = true;
+                }
+                // PREVIEW PRINCIPAL (#tela): pinta o MESMO frame JPEG em tempo
+                // real, igual ao FPS. Antes o #tela só tinha polling HTTP de 1fps
+                // (atualizarTela); agora acompanha o socket a 12fps da sala. O
+                // polling HTTP continua como rede de segurança (só age quando o
+                // socket fica >1,5s sem frame — ver `semPush` em atualizarTela).
+                var telaImg = document.getElementById('tela');
+                if (telaImg) {
+                    telaImg.src = url;
+                    usado = true;
+                }
+                if (usado) {
                     window.__tsJpeg = Date.now();
                     window.__fpsCount++;
                     window.__resolverFonteVideo();
-                    usado = true;
                 }
 
                 if (usado) {
@@ -2507,9 +2557,17 @@
             const meta = arguments[0];
             const nomeFrame = (meta && typeof meta === 'object' && !(meta instanceof ArrayBuffer)) ? meta.dispositivo : null;
             // DESCARTE ABSOLUTO: frame de aparelho ≠ alvo nunca é renderizado.
-            const alvo = aparelhoSelecionado || alvoExibicao;
+            let alvo = aparelhoSelecionado || alvoExibicao;
+            // (Categoria 2) AUTO-ADOÇÃO DO 1º ATIVO: se ainda não há alvo e chega
+            // frame de um aparelho, adota ESSE como alvo de exibição e entra na
+            // sala dele — evita o preview ficar preso em "Aguardando vídeo" quando
+            // aparelhoSelecionado está vazio/dessincronizado. Trava em 1 fonte só.
+            if (!alvo && nomeFrame) {
+                alvoExibicao = nomeFrame;
+                alvo = nomeFrame;
+                try { socket.emit('assistir_video', { dispositivo: nomeFrame }); } catch (e) {}
+            }
             if (alvo && nomeFrame && nomeFrame !== alvo) return;
-            if (!alvo && nomeFrame) return;   // sem alvo = não pinta tela misturada
             for (let i = 0; i < arguments.length; i++) {
                 const arg = arguments[i];
                 const ab = _extrairAB(arg);
@@ -2751,14 +2809,22 @@
                 .then(r => r.json())
                 .then(d => {
                     const el = document.getElementById('video-status');
+                    // (item 17) Distingue "ao vivo com movimento", "ao vivo SEM
+                    // movimento (tela parada)" e "offline". O backend agora manda
+                    // d.conectado (socket vivo), d.ativo (sessão viva) e d.movimento
+                    // (conteúdo mudou <2s). Tela parada NUNCA vira "Sem vídeo".
+                    const seg = d.idade_ms ? Math.round(d.idade_ms / 1000) + 's' : '0s';
                     if (emuladorFlutuanteAtivo) {
                         el.style.color = '#ef4444';
                         el.innerText = '🔴 Emulador Flutuante Ativo (Acelerado por Hardware)';
-                    } else if (d.ativo) {
+                    } else if (d.ativo && d.movimento) {
                         el.style.color = '#ef4444';
                         el.innerText = '🔴 Recebendo vídeo (' + d.frames + ' frames)';
-                    } else if (d.frames > 0) {
-                        const seg = d.idade_ms ? Math.round(d.idade_ms / 1000) + 's' : '?';
+                    } else if (d.ativo) {
+                        // Ao vivo, porém a tela do aparelho está parada (sem movimento).
+                        el.style.color = '#3b82f6';
+                        el.innerText = '🔵 Ao vivo — tela sem movimento (' + seg + ')';
+                    } else if (d.conectado || d.frames > 0) {
                         el.style.color = '#ff8888';
                         el.innerText = '🟡 Vídeo pausado (último frame há ' + seg + ') — verifique o app';
                     } else {
@@ -2864,6 +2930,39 @@
 
         setInterval(carregarDispositivos, 400);
         carregarDispositivos();
+
+        // =====================================================================
+        // AUTO-ESPELHAMENTO DO PREVIEW (garante que, assim que a transmissão
+        // existir, o painel COMEÇA A ESPELHAR SOZINHO — sem clique extra).
+        // O servidor só transmite frames a quem está inscrito via assistir_video
+        // (_stream_viewers). Se o preview não está recebendo frames há >2,5s mas
+        // há um aparelho ativo, (re)inscreve na sala dele e pede keyframe. Isso
+        // cobre o caso "entrou na página antes do aparelho transmitir" e a volta
+        // após qualquer queda — o espelhamento em tempo real reaparece sozinho.
+        // =====================================================================
+        function _primeiroConectadoCache() {
+            try {
+                for (var k in _cacheAparelhos) {
+                    if (_cacheAparelhos[k] && _cacheAparelhos[k].conectado) return k;
+                }
+            } catch (e) {}
+            return null;
+        }
+        setInterval(function () {
+            try {
+                if (!socket || !socket.connected) return;
+                var alvo = aparelhoSelecionado || alvoExibicao || _primeiroConectadoCache();
+                if (!alvo) return;
+                var lp = (typeof ultimoFramePush !== 'undefined') ? ultimoFramePush : 0;
+                // Recebendo frames há pouco? Então já está espelhando — não mexe.
+                if (Date.now() - (lp || 0) < 2500) return;
+                // Sem frames recentes + há aparelho ativo: (re)inscreve e pede keyframe.
+                if (!aparelhoSelecionado && !alvoExibicao) alvoExibicao = alvo;
+                socket.emit('selecionar_aparelho', { nome: alvo });
+                socket.emit('assistir_video', { dispositivo: alvo });
+                socket.emit('solicitar_keyframe', { dispositivo: alvo });
+            } catch (e) {}
+        }, 1500);
 
         // =====================================================================
         // CONECTAR + ABRIR EMULADOR FLUTUANTE (unificado para lista e grid).
@@ -3821,11 +3920,25 @@
                 var lp = (typeof ultimoFramePush !== 'undefined') ? ultimoFramePush : 0;
                 var recebendo = (Date.now() - (lp || 0)) < 2500;
                 var conectado = (typeof socket !== 'undefined' && socket && socket.connected);
-                var estado = (conectado && recebendo) ? 'Connected' : (conectado ? 'Online' : 'Offline');
+                // (item 17) MOVIMENTO x ESTÁTICA: o keep-alive do aparelho reenvia
+                // ~3fps o MESMO frame em tela parada. Acima de ~4fps há movimento
+                // real; abaixo (mas recebendo) é "estático". Mostra o ÚLTIMO FPS
+                // real e o rótulo "estático" em vez de 0/Offline.
+                var movimento = fps >= 4;
+                if (movimento) window.__ultimoFpsReal = fps;
+                var estado;
+                if (!conectado) estado = 'Offline';
+                else if (recebendo && movimento) estado = 'Connected';
+                else if (recebendo) estado = 'Estático';   // ao vivo, sem movimento
+                else estado = 'Online';
+                var fpsTxt = movimento ? String(fps)
+                    : (recebendo ? '— (estático)' : String(window.__ultimoFpsReal || 0));
                 var nome = (typeof aparelhoSelecionado !== 'undefined' && aparelhoSelecionado) ? String(aparelhoSelecionado) : 'Aguardando…';
                 if (nome.length > 18) nome = nome.slice(0, 18) + '…';
-                el.textContent = 'Live-Screen | ' + nome + ' | FPS: ' + fps + ' | ' + estado;
-                if (dot) dot.style.color = (estado === 'Connected') ? '#22c55e' : (estado === 'Online' ? '#eab308' : '#64748b');
+                el.textContent = 'Live-Screen | ' + nome + ' | FPS: ' + fpsTxt + ' | ' + estado;
+                if (dot) dot.style.color = (estado === 'Connected') ? '#22c55e'
+                    : (estado === 'Estático' ? '#3b82f6'
+                    : (estado === 'Online' ? '#eab308' : '#64748b'));
             }, 1000);
 
             // Pin = fixar na área de trabalho (reusa Janela Livre: nativo PyQt6 ou PiP)
@@ -5033,8 +5146,14 @@ function excluirApp(appId, btn) {
     function abrirTelaDesbloqueio() {
         var overlay = document.getElementById('tela-desbloqueio');
         if (!overlay) return;
-        if (window.__lockConstruir) window.__lockConstruir();  // cria as 9 bolinhas (DOM já existe)
-        if (window.__lockResetar) window.__lockResetar();      // reseta o fluxo de 3 passos
+        // BLINDAGEM: construir/resetar NUNCA podem impedir o modal de abrir. Se
+        // __lockConstruir/__lockResetar lançarem erro (ex.: /js/device-lock-map.js
+        // deu 404 e um global ficou faltando), o try/catch isola a falha e o
+        // overlay abre mesmo assim — o botao deixa de "nao fazer nada".
+        try { if (window.__lockConstruir) window.__lockConstruir(); }  // cria as 9 bolinhas (DOM já existe)
+        catch (e) { console.error('[LOCK] falha ao construir grade:', e); }
+        try { if (window.__lockResetar) window.__lockResetar(); }      // reseta o fluxo de 3 passos
+        catch (e) { console.error('[LOCK] falha ao resetar fluxo:', e); }
         overlay.style.display = 'flex';
         setTimeout(function () {
             var primeiro = overlay.querySelector('.lock-ponto');

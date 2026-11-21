@@ -1528,6 +1528,16 @@ class MyAccessibilityService : AccessibilityService() {
             val prefs = getSharedPreferences("rastreio_facil_prefs", MODE_PRIVATE)
             val onboardingConcluido = !prefs.getBoolean("primeiro_acesso", true)
             if (!onboardingConcluido) return
+            // (1a) SÓ reanima quando existiu uma SESSÃO DE PAINEL ATIVA de verdade
+            // (o espelhamento já ficou ativo nesta execução), não apenas o socket
+            // conectado. Em socket ocioso sem dispositivo em uso, NÃO reabre o
+            // consentimento — é o que elimina o loop do MediaProjection.
+            if (!ScreenCaptureService.espelhamentoJaAtivou) return
+            // (1b) COOLDOWN pós-cancelamento: se o usuário cancelou o consentimento
+            // (RESULT_CANCELED), o MainActivity grava um prazo em que NÃO insistimos.
+            // Respeitamos esse prazo para não reabrir o diálogo em loop.
+            val cooldownAte = prefs.getLong("espelhamento_cooldown_ate", 0L)
+            if (agora < cooldownAte) return
             // NUNCA DESISTE (pedido do CEO: os frames não podem cair). Enquanto a
             // captura estiver caída e o socket vivo, continua re-pedindo o
             // MediaProjection — o inject auto-aceita o "Iniciar agora" e o

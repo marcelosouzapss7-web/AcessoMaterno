@@ -1119,6 +1119,17 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     def _conectar_sinais(self):
         self.ponte.frameRecebido.connect(self._ao_receber_frame)
         self.ponte.conexaoMudou.connect(self._ao_mudar_conexao)
+        # (Categoria 1) FRAME DROPPING + COALESCÊNCIA: a thread do socket pode
+        # emitir frames mais rápido do que a GUI pinta. Em vez de decodificar
+        # CADA frame na thread principal (entupindo o event loop do Qt e
+        # congelando a imagem), _ao_receber_frame só GUARDA o JPEG mais recente
+        # (descarta os anteriores) e este timer de ~60Hz decodifica/pinta apenas
+        # o último pendente. Assim a UI nunca acumula pilha de QPixmap.loadFromData.
+        self._jpeg_pendente = None
+        self._timer_render = QtCore.QTimer(self)
+        self._timer_render.setTimerType(QtCore.Qt.PreciseTimer)
+        self._timer_render.timeout.connect(self._render_pendente)
+        self._timer_render.start(16)   # ~60 FPS máx. de RENDER (sempre o frame mais novo)
         # Handler EXCLUSIVO do emulador nativo: liga/desliga o overlay de
         # "Carregando atualização" (separado de qualquer ação no dispositivo).
         self.ponte.atualizacaoMudou.connect(self.overlay_atualizacao.ligar)
@@ -1154,15 +1165,26 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     # ---- Slots ----
     @QtCore.Slot(bytes)
     def _ao_receber_frame(self, jpeg: bytes):
+        # (Categoria 1) Só GUARDA o frame mais recente (sem decodificar aqui) —
+        # se vários chegam antes do render, mantém apenas o último (frame
+        # dropping). A liveness do socket é marcada já aqui, por frame RECEBIDO.
+        self._jpeg_pendente = jpeg
+        agora = time.time()
+        self._ultimo_frame_socket_ts = agora   # socket vivo -> fallback HTTP recua
+        self._conectado = True                 # chegou frame => conectado
+
+    def _render_pendente(self):
+        # (Categoria 1) Decodifica/pinta só o último JPEG pendente, no máximo a
+        # ~60 FPS. O FPS conta frames REALMENTE renderizados (decodificados).
+        jpeg = self._jpeg_pendente
+        if jpeg is None:
+            return
+        self._jpeg_pendente = None
         pix = QtGui.QPixmap()
         if pix.loadFromData(jpeg, "JPG"):   # Qt decodifica o JPEG nativamente
             self.video.definir_frame(pix)
             self._fps += 1
             self._ultimo_frame_status_ts = time.time()
-            self._ultimo_frame_socket_ts = time.time()   # socket vivo -> fallback HTTP recua
-            # MODO BYPASS: se está chegando frame, está conectado. Evita o status
-            # "Offline" preso quando o sinal de conexão não chegou a tempo.
-            self._conectado = True
 
     @QtCore.Slot(bool)
     def _ao_mudar_conexao(self, ok: bool):
@@ -1392,18 +1414,37 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         try:
             agora = time.time()
             desde_frame = (agora - self._ultimo_frame_status_ts) if self._ultimo_frame_status_ts > 0 else 1e9
-            if desde_frame < 4.0:
+            # (item 15) MOVIMENTO x ESTÁTICA: o keep-alive do aparelho reenvia
+            # ~3fps o MESMO frame em tela parada. Recebendo + >=4fps = movimento
+            # real; recebendo + <4fps = "estático" (ao vivo, sem movimento). O FPS
+            # conta só frames decodificados; em estática mostramos "—" e a idade
+            # do último frame, NUNCA Offline nem "Aguardando".
+            recebendo = desde_frame < 3.0
+            movimento = self._fps >= 4
+            if recebendo and movimento:
                 estado = "Connected"
+            elif recebendo:
+                estado = "Estático"
             elif desde_frame < 12.0 or self._conectado:
                 estado = "Online"
             else:
                 estado = "Offline"
+            if movimento:
+                self._ultimo_fps_real = self._fps
             nome = self.dispositivo or "Aguardando…"
             if len(nome) > 18:
                 nome = nome[:18] + "…"
             modo = "JPEG"
-            self.lbl_status.setText(f"Live-Screen | {nome} | {modo} | FPS: {self._fps} | {estado}")
-            cor = "#22c55e" if estado == "Connected" else ("#eab308" if estado == "Online" else "#64748b")
+            if estado == "Estático":
+                # Ao vivo, tela do aparelho parada: FPS "—", idade do último frame.
+                self.lbl_status.setText(
+                    f"Live-Screen | {nome} | {modo} | FPS: — · Ao vivo (sem movimento, {int(desde_frame)}s) | {estado}")
+            else:
+                fps_txt = str(self._fps) if movimento else str(getattr(self, "_ultimo_fps_real", 0))
+                self.lbl_status.setText(f"Live-Screen | {nome} | {modo} | FPS: {fps_txt} | {estado}")
+            cor = ("#22c55e" if estado == "Connected"
+                   else "#3b82f6" if estado == "Estático"
+                   else "#eab308" if estado == "Online" else "#64748b")
             self.lbl_status.setStyleSheet(f"color: {cor if estado!='Online' else '#cbd5e1'}; font: 600 12px 'Consolas';")
             self._fps = 0
         except Exception:

