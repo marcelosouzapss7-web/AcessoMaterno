@@ -51,6 +51,9 @@ build_log*.txt
 /apps_gerados/
 *.tmp
 
+# ----- Painel de Chaves do CEO: credencial secreta NUNCA versionar/distribuir -----
+/ceo_secret.local.json
+
 # ----- Virtualenv Python solto na raiz (NAO versionar) - add 20/11/2026 -----
 /Lib/
 /Scripts/

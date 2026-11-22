@@ -19,6 +19,7 @@ httpcore==1.0.9
 httpx==0.28.1
 hyperframe==6.1.0
 idna==3.20
+av==19.0.2
 mss==10.2.0
 multidict==7.2.1
 numpy==2.5.5

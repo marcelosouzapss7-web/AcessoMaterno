@@ -31,12 +31,25 @@ import sys
 import os
 import time
 import json
+import queue
 import argparse
 import threading
 import urllib.request
 
 import socketio
 from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
+
+# Decoder H.264 da CÂMERA (botão "View"): PyAV (av) — já usado/instalado na
+# .venv-build. Guarda de import: sem o av, a janela da câmera cai no fallback
+# JPEG (camera_frame) sem quebrar o resto do emulador.
+try:
+    import av as _av
+    import numpy as _np
+    _AV_OK = True
+except Exception:
+    _av = None
+    _np = None
+    _AV_OK = False
 
 # ----------------------------------------------------------------------------
 # WebRTC (H.264) OPCIONAL — recepção de vídeo em tempo real, igual ao painel web.
@@ -272,6 +285,9 @@ class PonteSocket(QtCore.QObject):
         # Alvo EXPLÍCITO = usuário clicou em "Visualizar" neste aparelho
         # (veio em --dispositivo). Não forçamos troca automática nele.
         self._alvo_explicito = bool(dispositivo and str(dispositivo).strip())
+        # Último instante em que sondamos o socket com um heartbeat COM ACK
+        # (sio.call) para detectar socket MEIO-ABERTO. Ver o watchdog em iniciar().
+        self._ultimo_probe_ts = 0.0
         self.sio = socketio.Client(reconnection=True, reconnection_delay=1,
                                    logger=False, engineio_logger=False)
         self._registrar_eventos()
@@ -443,6 +459,32 @@ class PonteSocket(QtCore.QObject):
                 try:
                     if not self.sio.connected:
                         continue
+
+                    # ---------------------------------------------------------
+                    # SOCKET MEIO-ABERTO = botões "não fazem nada". O reforço de
+                    # heartbeat por HTTP mantém o watchdog do SERVIDOR satisfeito,
+                    # então ele não relança o nativo — e self.sio.connected segue
+                    # True mesmo com o socket MORTO. Nesse estado os botões
+                    # (Voltar/Home/Recentes/Power/🔔/📋/⌨) emitem para o vazio e
+                    # "nada acontece", enquanto o vídeo continua pelo fallback HTTP.
+                    # CURA: a cada ~5s mandamos um heartbeat COM ACK (sio.call); se
+                    # o servidor não responder dentro do timeout, o socket está
+                    # meio-aberto -> forçamos reconexão limpa e os botões voltam.
+                    # ---------------------------------------------------------
+                    _agora_probe = time.time()
+                    if _agora_probe - self._ultimo_probe_ts >= 5.0:
+                        self._ultimo_probe_ts = _agora_probe
+                        _alvo_hb = (self._fonte_travada or self._fonte_efetiva
+                                    or self.dispositivo or "")
+                        try:
+                            self.sio.call("emulador_nativo_heartbeat",
+                                          {"dispositivo": _alvo_hb}, timeout=4)
+                        except Exception:
+                            print("[WATCHDOG] Socket meio-aberto (heartbeat sem "
+                                  "ACK) — forçando reconexão para restaurar os "
+                                  "botões.")
+                            self.forcar_reconexao()
+                            continue
 
                     # ---------------------------------------------------------
                     # RECONCILIAÇÃO AUTOMÁTICA (o pedido do usuário): "primeiro
@@ -758,7 +800,9 @@ class TelaVideo(QtWidgets.QLabel):
         if p is None:
             return
         agora = time.time()
-        if agora - self._ultimo_move < 0.03:   # ~33/s, evita enxurrada
+        # ~60/s: amostragem fina do dedo para o deslize contínuo (tipo Nox) ficar
+        # suave, sem virar enxurrada de eventos.
+        if agora - self._ultimo_move < 0.016:
             return
         self._ultimo_move = agora
         self.gesto.emit({"acao": "MOVE", "x": p[0], "y": p[1]})
@@ -873,6 +917,228 @@ class OverlayAtualizacao(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(241, 245, 249))
         p.drawText(pilula, QtCore.Qt.AlignCenter, texto)
         p.end()
+
+
+# ----------------------------------------------------------------------------
+# Janela "View": CÂMERA do dispositivo ao vivo (novo monitor separado)
+# ----------------------------------------------------------------------------
+def _extrair_jpeg(args):
+    """Procura bytes JPEG em QUALQUER posição/estrutura dos args do Socket.IO
+    (bytes puros, dentro de uma lista [{meta}, jpeg] ou de um dict)."""
+    pilha = list(args)
+    while pilha:
+        a = pilha.pop(0)
+        if isinstance(a, (bytes, bytearray)):
+            return bytes(a)
+        if isinstance(a, (list, tuple)):
+            pilha.extend(a)
+        elif isinstance(a, dict):
+            pilha.extend(a.values())
+    return None
+
+
+class JanelaCamera(QtWidgets.QWidget):
+    """Monitor separado só com a CÂMERA do dispositivo ao vivo. Tem seu PRÓPRIO
+    cliente Socket.IO: entra na sala camera:{dispositivo}, recebe 'camera_frame'
+    (JPEG) e desenha. Botão 'Trocar câmera' alterna frontal/traseira. Ao fechar,
+    manda parar_camera e sai da sala (libera a câmera do aparelho)."""
+    frameRecebido = QtCore.Signal(bytes)          # JPEG (fallback)
+    frameRGB = QtCore.Signal(bytes, int, int)     # H.264 decodificado (rgb24 + w,h)
+    conexaoMudou = QtCore.Signal(bool)
+
+    def __init__(self, url_base: str, dispositivo: str):
+        super().__init__()
+        self.url_base = (url_base or "").rstrip("/")
+        self.dispositivo = dispositivo
+        self._parar = False
+        self.setWindowTitle(f"View — Câmera · {dispositivo}")
+        self.resize(380, 660)
+        self.setStyleSheet("background:#0b0b0d;")
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        self.lbl_video = QtWidgets.QLabel("Conectando à câmera do dispositivo…")
+        self.lbl_video.setAlignment(QtCore.Qt.AlignCenter)
+        self.lbl_video.setStyleSheet("color:#94a3b8; font:600 13px 'Segoe UI';")
+        self.lbl_video.setMinimumSize(200, 200)
+        lay.addWidget(self.lbl_video, 1)
+
+        barra = QtWidgets.QHBoxLayout()
+        self.lbl_status = QtWidgets.QLabel("•")
+        self.lbl_status.setStyleSheet("color:#64748b; font:600 12px 'Consolas';")
+        self.btn_trocar = QtWidgets.QPushButton("Trocar câmera")
+        self.btn_trocar.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_trocar.setStyleSheet(
+            "QPushButton{color:#a5f3fc;background:#0a2f36;border:1px solid #06b6d4;"
+            "border-radius:6px;padding:6px 12px;font:600 12px 'Segoe UI';}"
+            "QPushButton:hover{background:#0e3b44;}")
+        self.btn_trocar.clicked.connect(self._trocar_camera)
+        barra.addWidget(self.lbl_status)
+        barra.addStretch(1)
+        barra.addWidget(self.btn_trocar)
+        lay.addLayout(barra)
+
+        self.frameRecebido.connect(self._desenhar)
+        self.frameRGB.connect(self._desenhar_rgb)
+        self.conexaoMudou.connect(self._ao_mudar_conexao)
+        self._ultimo_pix = None
+
+        # Decodificação H.264 (PyAV) em thread separada: a interface nunca trava.
+        # Fila LIMITADA: se atrasar, descarta e ressincroniza no próximo keyframe
+        # (~1s) — mantém tempo real sem acumular latência (fim das travadas).
+        self._fila_h264 = queue.Queue(maxsize=45)
+        self._dec_run = True
+        self._dec_thread = threading.Thread(target=self._loop_decodificar, daemon=True)
+        self._dec_thread.start()
+
+        self.sio = socketio.Client(reconnection=True, reconnection_delay=1,
+                                   logger=False, engineio_logger=False)
+        self._registrar_eventos()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _registrar_eventos(self):
+        sio = self.sio
+
+        @sio.event
+        def connect():
+            try:
+                sio.emit("identificar", "painel")
+                sio.emit("assistir_camera", {"dispositivo": self.dispositivo})
+                sio.emit("iniciar_camera",
+                         {"dispositivo": self.dispositivo, "camera": "frontal"})
+            except Exception:
+                pass
+            self.conexaoMudou.emit(True)
+
+        @sio.event
+        def disconnect():
+            self.conexaoMudou.emit(False)
+
+        @sio.on("camera_frame")
+        def on_camera_frame(*args):
+            jpeg = _extrair_jpeg(args)
+            if jpeg:
+                self.frameRecebido.emit(jpeg)
+
+        @sio.on("camera_h264")
+        def on_camera_h264(*args):
+            nal = _extrair_jpeg(args)   # mesma varredura serve p/ bytes do H.264
+            if not nal:
+                return
+            try:
+                self._fila_h264.put_nowait(nal)
+            except queue.Full:
+                # Atrasou: limpa a fila para não acumular latência; o próximo
+                # keyframe (~1s) ressincroniza o decoder.
+                try:
+                    while True:
+                        self._fila_h264.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._fila_h264.put_nowait(nal)
+                except queue.Full:
+                    pass
+
+    def _loop(self):
+        while not self._parar:
+            try:
+                self.sio.connect(self.url_base, transports=["websocket", "polling"])
+                self.sio.wait()
+            except Exception as e:
+                print(f"[VIEW SOCKET] {e} — tentando de novo em 2s")
+            if not self._parar:
+                time.sleep(2)
+
+    @QtCore.Slot(bytes)
+    def _desenhar(self, jpeg: bytes):
+        pix = QtGui.QPixmap()
+        if pix.loadFromData(jpeg, "JPG"):
+            self._ultimo_pix = pix
+            self.lbl_video.setPixmap(
+                pix.scaled(self.lbl_video.size(), QtCore.Qt.KeepAspectRatio,
+                           QtCore.Qt.SmoothTransformation))
+
+    def _loop_decodificar(self):
+        """Decodifica o H.264 da câmera (PyAV) numa thread separada e entrega os
+        frames RGB para a GUI. Erros de decode (pedaço perdido) são ignorados — o
+        próximo keyframe ressincroniza sozinho."""
+        if not _AV_OK:
+            return
+        codec = None
+        while self._dec_run:
+            try:
+                data = self._fila_h264.get()
+            except Exception:
+                break
+            if data is None:
+                break
+            try:
+                if codec is None:
+                    codec = _av.CodecContext.create("h264", "r")
+                for packet in codec.parse(data):
+                    for frame in codec.decode(packet):
+                        arr = frame.to_ndarray(format="rgb24")
+                        h, w = arr.shape[0], arr.shape[1]
+                        self.frameRGB.emit(arr.tobytes(), int(w), int(h))
+            except Exception:
+                # Pedaço corrompido/perdido: recria o decoder e espera o próximo
+                # keyframe (evita ficar preso num estado ruim).
+                codec = None
+
+    @QtCore.Slot(bytes, int, int)
+    def _desenhar_rgb(self, buf: bytes, w: int, h: int):
+        if w <= 0 or h <= 0:
+            return
+        img = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(img)   # fromImage copia os pixels
+        if not pix.isNull():
+            self._ultimo_pix = pix
+            self.lbl_video.setPixmap(
+                pix.scaled(self.lbl_video.size(), QtCore.Qt.KeepAspectRatio,
+                           QtCore.Qt.SmoothTransformation))
+
+    @QtCore.Slot(bool)
+    def _ao_mudar_conexao(self, ok: bool):
+        self.lbl_status.setText("● ao vivo" if ok else "○ offline")
+        self.lbl_status.setStyleSheet(
+            f"color:{'#22c55e' if ok else '#64748b'}; font:600 12px 'Consolas';")
+
+    def resizeEvent(self, ev):
+        if self._ultimo_pix is not None:
+            self.lbl_video.setPixmap(
+                self._ultimo_pix.scaled(self.lbl_video.size(), QtCore.Qt.KeepAspectRatio,
+                                        QtCore.Qt.SmoothTransformation))
+        super().resizeEvent(ev)
+
+    def _trocar_camera(self):
+        try:
+            if self.sio.connected:
+                self.sio.emit("trocar_camera", {"dispositivo": self.dispositivo})
+        except Exception as e:
+            print(f"[VIEW] Falha ao trocar câmera: {e}")
+
+    def closeEvent(self, ev):
+        self._parar = True
+        # Encerra a thread de decodificação H.264.
+        self._dec_run = False
+        try:
+            self._fila_h264.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            if self.sio.connected:
+                self.sio.emit("parar_camera", {"dispositivo": self.dispositivo})
+                self.sio.emit("sair_camera", {"dispositivo": self.dispositivo})
+        except Exception:
+            pass
+        try:
+            self.sio.disconnect()
+        except Exception:
+            pass
+        super().closeEvent(ev)
 
 
 # ----------------------------------------------------------------------------
@@ -1074,13 +1340,19 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.btn_power = criar_botao("⏻", "Ligar a tela", cor_borda="#22c55e", cor_fundo="#14341f", cor_txt="#86efac")
         self.btn_notif = criar_botao("🔔", "Acordar via notificação", cor_borda="#3b82f6", cor_fundo="#17295c", cor_txt="#bfdbfe")
         self.btn_colar = criar_botao("📋", "Colar o texto do computador no aparelho (Ctrl+V)")
-        self.btn_teclado = criar_botao("⌨", "Digitar um arquivo de texto da pasta 'teclado' no aparelho",
-                                       cor_borda="#8b5cf6", cor_fundo="#241a3a", cor_txt="#ddd6fe")
+        # [REMOVIDO] Botão de teclado (⌨ "Digitar arquivo da pasta teclado"): a
+        # pedido do usuário, o botão e sua função foram removidos. A captura da
+        # digitação física (pasta_teclado/digitado.txt) NÃO depende dele e segue
+        # funcionando.
+        # Botão "View": abre a CÂMERA do dispositivo ao vivo numa janela separada
+        # (um novo monitor só da câmera). Alterna frontal/traseira dentro dela.
+        self.btn_view = criar_botao("View", "Abrir a câmera do dispositivo ao vivo (nova janela)",
+                                    cor_borda="#06b6d4", cor_fundo="#0a2f36", cor_txt="#a5f3fc")
         for b in (self.btn_voltar, self.btn_home, self.btn_recentes):
             vl.addWidget(b)
         linha = QtWidgets.QFrame(); linha.setFixedHeight(1); linha.setStyleSheet("background:#2a2a2e;")
         vl.addWidget(linha)
-        for b in (self.btn_power, self.btn_notif, self.btn_colar, self.btn_teclado):
+        for b in (self.btn_power, self.btn_notif, self.btn_colar, self.btn_view):
             vl.addWidget(b)
 
         # Nome vertical "KL TRINDADE" (letra por letra, uma embaixo da outra),
@@ -1152,7 +1424,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.btn_power.clicked.connect(lambda: self._enviar_botao("botao_power"))
         self.btn_notif.clicked.connect(lambda: self._enviar_botao("notificacao_acordar"))
         self.btn_colar.clicked.connect(self._colar_do_computador)
-        self.btn_teclado.clicked.connect(self._abrir_teclado_arquivos)
+        self.btn_view.clicked.connect(self._abrir_camera_view)
         # Toque / deslize / rolagem no vídeo
         self.video.gesto.connect(self._ao_gesto)
 
@@ -1288,6 +1560,24 @@ class EmuladorFlutuante(QtWidgets.QWidget):
                 print(f"[FPS] Falha ao abrir o emulador FPS: {e}")
         threading.Thread(target=_go, daemon=True).start()
 
+    def _abrir_camera_view(self):
+        """Botão 'View': abre a CÂMERA do dispositivo ao vivo numa janela nova
+        (um novo monitor só da câmera). Uma janela por vez; se já estiver aberta,
+        só a traz para frente."""
+        try:
+            alvo = self.ponte.alvo_comando() or self.dispositivo
+        except Exception:
+            alvo = self.dispositivo
+        jc = getattr(self, "_janela_camera", None)
+        if jc is not None and jc.isVisible():
+            jc.showNormal(); jc.raise_(); jc.activateWindow()
+            return
+        try:
+            self._janela_camera = JanelaCamera(self.ponte.url_base, alvo)
+            self._janela_camera.show()
+        except Exception as e:
+            print(f"[VIEW] Falha ao abrir a câmera: {e}")
+
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
     def keyPressEvent(self, ev):
         mod = ev.modifiers()
@@ -1407,39 +1697,35 @@ class EmuladorFlutuante(QtWidgets.QWidget):
                                    "dispositivo": self.ponte.alvo_comando()})
 
     def _colar_do_computador(self):
-        """Lê o texto da área de transferência do Windows e DIGITA no aparelho."""
-        self._digitar_texto(QtWidgets.QApplication.clipboard().text())
+        """Cola EXATAMENTE o conteúdo ATUAL da área de transferência do Windows
+        no campo focado do aparelho.
 
-    def _abrir_teclado_arquivos(self):
-        """Mostra os arquivos .txt da pasta 'teclado' e DIGITA o escolhido no
-        aparelho. O conteúdo é lido como texto UTF-8, preservando tudo como
-        texto e números (nada é convertido nem perdido)."""
-        pasta, nomes = listar_arquivos_teclado()
-        if not nomes:
-            QtWidgets.QMessageBox.information(
-                self, "Pasta teclado",
-                "A pasta 'teclado' está vazia.\n\nColoque arquivos .txt em:\n" + pasta)
-            return
-        nome, ok = QtWidgets.QInputDialog.getItem(
-            self, "Digitar do teclado",
-            "Escolha o arquivo para digitar no aparelho:",
-            nomes, 0, False)
-        if not ok or not nome:
-            return
-        caminho = os.path.join(pasta, nome)
+        - Lê o clipboard do sistema EM TEMPO REAL (QApplication.clipboard() já é
+          a área de transferência do Windows), sem usar cache/variável antiga.
+        - Envia UM comando único de inserção limpa (send_text, ACTION_SET_TEXT no
+          agente) em vez de digitar caractere a caractere — não perde símbolos/
+          acentos nem aciona corretor automático.
+        - `inserir=True`: insere na posição do cursor; o agente trata o
+          hint/placeholder ("Mensagem", etc.) como vazio, então num campo vazio
+          entra SÓ o texto colado (nunca "Mensagem"+texto). Nunca usa o clipboard
+          antigo do próprio celular (ACTION_PASTE)."""
         try:
-            with open(caminho, "r", encoding="utf-8") as f:
-                conteudo = f.read()
-        except (OSError, UnicodeDecodeError):
-            # Fallback tolerante: se não for UTF-8 válido, lê sem perder bytes.
-            try:
-                with open(caminho, "r", encoding="utf-8", errors="replace") as f:
-                    conteudo = f.read()
-            except OSError as e:
-                QtWidgets.QMessageBox.warning(self, "Pasta teclado",
-                                              f"Não consegui ler o arquivo:\n{e}")
-                return
-        self._digitar_texto(conteudo)
+            texto = QtWidgets.QApplication.clipboard().text() or ""
+        except Exception:
+            texto = ""
+        if not texto:
+            return
+        self.ponte.enviar("wireframe_control_painel", {
+            "comando": "send_text",
+            "texto": texto,
+            "inserir": True,
+            "dispositivo": self.ponte.alvo_comando(),
+        })
+
+    # [REMOVIDO] _abrir_teclado_arquivos: a pedido do usuário, o botão de teclado
+    # (⌨) e sua função de digitar um arquivo da pasta 'teclado' foram removidos.
+    # Os helpers pasta_teclado()/listar_arquivos_teclado() continuam existindo
+    # porque a captura da digitação física (digitado.txt) usa pasta_teclado().
 
     def _atualizar_status(self):
         try:

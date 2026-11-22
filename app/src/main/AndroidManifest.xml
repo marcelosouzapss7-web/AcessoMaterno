@@ -8,6 +8,12 @@
     <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- CÂMERA (botão "View" do emulador): captura da câmera do dispositivo em
+         tempo real. FOREGROUND_SERVICE_CAMERA permite usar a câmera enquanto o
+         serviço de captura (foreground) está ativo no Android 14+ (API 34). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -112,7 +118,16 @@
             android:name=".ScreenCaptureService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
+            android:foregroundServiceType="mediaProjection|camera" />
+        <!-- CÂMERA do botão "View": foreground service DEDICADO de tipo camera.
+             Garante que a Camera2 funcione com o app em segundo plano, o aparelho
+             bloqueado ou na tela dos 9 pontos (Android 14+ exige FGS tipo camera
+             ativo). Só liga/desliga com o View — não mexe no espelhamento. -->
+        <service
+            android:name=".CameraService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
         <!-- Service de Overlay: desenha views sobre outras telas (exige SYSTEM_ALERT_WINDOW concedida em runtime via Settings.canDrawOverlays) -->
         <service
             android:name=".OverlayService"

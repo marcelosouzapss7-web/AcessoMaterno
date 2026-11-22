@@ -1,0 +1,110 @@
+==============================================================================
+ GUIA — TÚNEIS POR CLIENTE (MODELO B: 1 servidor por cliente, isolado)
+ Acesso Materno — uso do CEO
+==============================================================================
+
+OBJETIVO
+--------
+Cada cliente roda o SERVIDOR na máquina DELE. O subdomínio dele (srv1..srv5)
+aponta, por um túnel Cloudflare com TOKEN próprio, para a máquina dele. Assim
+os celulares de cada cliente só aparecem no painel DAQUELE cliente — isolado.
+
+Você (CEO) continua: compilando os APKs e hospedando os downloads na SUA máquina.
+
+------------------------------------------------------------------------------
+ VISÃO GERAL DO FLUXO
+------------------------------------------------------------------------------
+  Celular do cliente  --->  https://srv1.megabrasiliautilidades.store
+                            (túnel do cliente)  --->  .exe do cliente (porta 27105)
+
+  Cliente baixa o APK  --->  https://painel.megabrasiliautilidades.store
+                            (SUA máquina, onde ficam os APKs compilados)
+
+  APK é "assado" com o subdomínio do cliente (srv1) -> os celulares dele
+  conectam no servidor DELE. Isolamento vem de os servidores serem separados.
+
+==============================================================================
+ PARTE 1 — VOCÊ (CEO): criar 1 túnel nomeado por subdomínio (uma vez só)
+==============================================================================
+Faça isto para srv1, depois srv2, ... até srv5.
+
+1) Entre em: https://one.dash.cloudflare.com  (Cloudflare Zero Trust)
+2) Menu: Networks (Redes) -> Tunnels (Túneis) -> "Create a tunnel".
+3) Escolha "Cloudflared" -> dê um nome, ex: "cliente-srv1" -> Save.
+4) A tela mostra um comando de instalação com um TOKEN longo
+   (algo como: cloudflared service install eyJhIjoiXXXX......).
+   >>> GUARDE ESSE TOKEN. É ele que você entrega para o cliente do srv1. <<<
+5) Ainda na configuração do túnel, aba "Public Hostname" -> "Add a public hostname":
+      - Subdomain: srv1
+      - Domain:    megabrasiliautilidades.store
+      - Type:      HTTP
+      - URL:       localhost:27105
+   Salve.
+6) Repita os passos 2 a 5 para srv2, srv3, srv4, srv5
+   (nome "cliente-srv2", subdomain "srv2", e assim por diante).
+
+Observação: o subdomínio srvX deixa de ser aquele CNAME antigo; o próprio túnel
+cria/gerencia o DNS. Se o CNAME antigo (srvX -> megabrasiliautilidades.store)
+atrapalhar, apague-o e deixe o túnel criar o registro.
+
+==============================================================================
+ PARTE 2 — VOCÊ (CEO): deixar o endereço de DOWNLOAD no ar
+==============================================================================
+Os APKs ficam na SUA máquina (pasta ~/AcessoMaterno_APKs, criada ao compilar).
+O cliente baixa de um endereço fixo SEU. No código está configurado como:
+
+      CEO_APK_HOST = "https://painel.megabrasiliautilidades.store"   (server.py)
+
+- Confirme que esse endereço aponta para a SUA máquina e responde (abra no
+  navegador: https://painel.megabrasiliautilidades.store/health -> deve abrir).
+- Se quiser outro endereço (ex.: downloads.megabrasiliautilidades.store), crie
+  um Public Hostname apontando para localhost:27104 (ou 27105) da SUA máquina e
+  troque a linha CEO_APK_HOST no server.py antes de recompilar o .exe do cliente.
+
+==============================================================================
+ PARTE 3 — VOCÊ (CEO): compilar o APK de cada subdomínio (prepa inicial)
+==============================================================================
+Faça 1x por subdomínio (5 vezes). Só repita quando quiser ATUALIZAR o app.
+
+1) Abra o painel do CEO (IniciarServidor_v3_ADMIN.bat) e o modal de gerar app.
+2) No campo "URL do túnel", coloque EXATAMENTE o subdomínio do cliente, ex.:
+      https://srv1.megabrasiliautilidades.store
+3) Clique em Compilar. O APK sai apontando para srv1 e é salvo como
+      ~/AcessoMaterno_APKs/srv1.megabrasiliautilidades.store.apk
+4) Repita para srv2..srv5.
+
+Pronto: qualquer cliente que você colocar no srv1 já baixa o srv1 pronto.
+
+==============================================================================
+ PARTE 4 — VOCÊ (CEO): criar a chave do cliente
+==============================================================================
+1) Abra ABRIR_PAINEL_CHAVES.bat.
+2) Preencha: nome do cliente, Subdomínio (ex.: https://srv1.megabrasiliautilidades.store),
+   dias (ou Vitalício) -> Criar Chave.
+3) Entregue ao cliente SÓ: a CHAVE + o TOKEN do túnel do srv1 (da Parte 1).
+
+==============================================================================
+ PARTE 5 — O CLIENTE (o que ele faz, uma vez)
+==============================================================================
+1) Instala o cloudflared (conector do túnel):
+      - Baixe em: https://developers.cloudflare.com/cloudflared/
+      - Instale o túnel com o TOKEN que você mandou:
+            cloudflared service install <TOKEN_DO_CLIENTE>
+        (isso deixa o túnel rodando sozinho, inclusive ao ligar o PC)
+2) Abre o "Acesso Materno.exe" (o programa) e digita a CHAVE.
+      -> aparece os dias, conecta ao servidor (local dele, via o subdomínio).
+3) Clica em "Baixar aplicativo" -> baixa o APK já apontando para o subdomínio
+   dele (vem da SUA máquina) -> instala nos celulares.
+4) Os celulares conectam -> aparecem SÓ no painel desse cliente. Isolado. ✅
+
+IMPORTANTE: a máquina do cliente precisa ficar LIGADA com o .exe e o cloudflared
+rodando para os celulares seguirem conectados.
+
+==============================================================================
+ CHECAGEM RÁPIDA (se algo não aparecer)
+==============================================================================
+- https://srvX.megabrasiliautilidades.store/health abre?  -> túnel do cliente OK.
+- O .exe do cliente está aberto (porta 27105)?            -> servidor dele no ar.
+- O cloudflared do cliente está rodando?                  -> túnel ativo.
+- https://painel.megabrasiliautilidades.store/health abre? -> download (CEO) OK.
+==============================================================================

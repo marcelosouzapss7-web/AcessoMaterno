@@ -31,7 +31,7 @@ object RegistroPainel {
     var baseUrl: String = BuildConfig.PANEL_URL
 
     fun registrar(
-        nome: String = "${Build.MANUFACTURER}-${Build.MODEL}",
+        nome: String = SocketManager.nomeDispositivoAtual(),
         onResultado: ((Boolean) -> Unit)? = null
     ) {
         val base = baseUrl.trim().trimEnd('/')

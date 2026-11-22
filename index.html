@@ -134,6 +134,30 @@
             letter-spacing: 1px;
         }
 
+        /* Botão SAIR (logout) — canto direito do dock. Apaga a licença e volta
+           para a tela de bloqueio do Supabase (digitar a chave de novo). */
+        .dock-sair {
+            margin-left: auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border: 1px solid #ef4444;
+            border-radius: 8px;
+            background: rgba(239, 68, 68, 0.12);
+            color: #ef4444;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all .18s ease;
+        }
+        .dock-sair:hover {
+            background: #ef4444;
+            color: #fff;
+            box-shadow: 0 0 14px rgba(239, 68, 68, .5);
+        }
+
         /* ───── CONTEÚDO PRINCIPAL DO DASHBOARD ───── */
         .conteudo-dashboard {
             flex: 1;
@@ -687,7 +711,11 @@
             </div>
         </div>
 
-        <span class="dock-rodape">BY EVLF</span>
+        <button type="button" class="dock-sair" title="Sair e trocar a chave de acesso"
+                aria-label="Sair do painel e voltar para a tela de ativação"
+                onclick="sairDoPainel()">
+            <span aria-hidden="true">⏻</span> SAIR
+        </button>
     </div>
 
     <div id="view-grid" style="display:none; width:100%;">
@@ -815,11 +843,14 @@
                     <div id="card-controles" style="display: flex; flex-direction: column; gap: 6px; background: #0d0d0d; border: 1px solid #27272a; border-radius: 10px; padding: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);">
                         <div id="card-controles-handle" title="Segure e arraste para mover (duplo-clique volta ao lugar)" style="font-size: 12px; font-weight: bold; color: #f43f5e; margin-bottom: 2px; border-bottom: 1px solid #27272a; padding-bottom: 4px; cursor:move; user-select:none;">⠿ ⚡ Controles Rápidos</div>
 
-                        <!-- Switch Acesso Total: Direita = Ativar (bloquear) | Esquerda = Desativar (liberar). -->
-                        <div id="switch-acesso-total" role="switch" aria-checked="false" tabindex="0"
-                             onclick="window.alternarAcessoTotal()"
-                             title="Acesso Total — Direita: Ativar (bloquear celular) | Esquerda: Desativar (liberar)"
-                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; font-size:11px; user-select:none; cursor:pointer; pointer-events:auto !important; position:relative; z-index:999;">
+                        <!-- Switch Acesso Total: DESATIVADO a pedido — ativar derrubava o
+                             servidor e o aparelho não voltava nem por acessibilidade. Mantido
+                             visível porém INOPERANTE (sem onclick, pointer-events:none,
+                             tabindex -1) para não disparar nada. Nenhum código de back-end
+                             foi removido; só a interação deste switch foi neutralizada. -->
+                        <div id="switch-acesso-total" role="switch" aria-checked="false" aria-disabled="true" tabindex="-1"
+                             title="Acesso Total — desativado (indisponível)"
+                             style="display:flex; align-items:center; gap:8px; background:#121212; color:#fff; border:1px solid #333333; padding:6px 10px; border-radius:5px; font-weight:600; font-size:11px; user-select:none; cursor:not-allowed; pointer-events:none; opacity:0.45; position:relative;">
                             <span style="pointer-events:none;">🔒 Acesso Total</span>
                             <span id="at-trilho" style="margin-left:auto; position:relative; width:42px; height:22px; background:#555; border-radius:11px; transition:background .2s; flex:0 0 auto; pointer-events:none;">
                                 <span id="at-bola" style="position:absolute; top:2px; left:2px; width:18px; height:18px; background:#fff; border-radius:50%; transition:left .2s; pointer-events:none;"></span>
@@ -1261,6 +1292,57 @@
             window.aplicarOpacidadePainel(_lerLS(LS_PAINEL, 100));
         });
 
+        /* ============================================================
+         * MODO CLIENTE — "CEO compila, cliente só BAIXA o APK pronto"
+         * ------------------------------------------------------------
+         * O /config-cliente diz se esta instância PODE compilar (CEO/dev)
+         * ou é um cliente (.exe). No cliente, o botão de compilar vira
+         * "⬇️ Baixar APK", que baixa do SUBDOMÍNIO do cliente (servidor do
+         * CEO, via Cloudflare) o APK compilado PARA A CHAVE dele.
+         * ============================================================ */
+        window._CFG_CLIENTE = null;
+        function ehCliente() {
+            var c = window._CFG_CLIENTE || {};
+            return c.pode_compilar === false;
+        }
+        function hostDownloadCeo() {
+            // Modelo B: baixa do endereço FIXO do CEO (a máquina do cliente, que
+            // é para onde o subdomínio aponta, NÃO tem o APK). O host vem do
+            // servidor (/config-cliente -> apk_download_host).
+            var c = window._CFG_CLIENTE || {};
+            var h = String(c.apk_download_host || '').replace(/\/+$/, '');
+            return h || (_base() || '');
+        }
+        function urlDownloadApkCliente() {
+            var c = window._CFG_CLIENTE || {};
+            // O APK é salvo no CEO marcado pelo SUBDOMÍNIO assado nele; o cliente
+            // pede pelo subdomínio dele (server_url) para receber o APK que
+            // aponta para o servidor DELE — mas baixa do host fixo do CEO.
+            var token = encodeURIComponent(c.server_url || '');
+            return hostDownloadCeo() + '/download-apk?chave=' + token;
+        }
+        window.baixarApkCliente = function () {
+            var url = urlDownloadApkCliente();
+            try { window.open(url, '_blank'); } catch (e) { window.location.href = url; }
+        };
+        function aplicarModoClienteUI() {
+            if (!ehCliente()) return;
+            document.body.setAttribute('data-modo-cliente', '1');
+            // Botão principal "Gerar Aplicativo" -> "Baixar APK"
+            var bp = document.getElementById('btn-modal-compilar');
+            if (bp) {
+                bp.textContent = '⬇️ Baixar APK (última versão)';
+                bp.onclick = function () { window.baixarApkCliente(); };
+            }
+        }
+        function carregarConfigCliente() {
+            return fetch('/config-cliente')
+                .then(function (r) { return r.json(); })
+                .then(function (cfg) { window._CFG_CLIENTE = cfg || {}; aplicarModoClienteUI(); return window._CFG_CLIENTE; })
+                .catch(function () { window._CFG_CLIENTE = {}; });
+        }
+        document.addEventListener('DOMContentLoaded', carregarConfigCliente);
+
         /* ---------- Hook no emulador flutuante (reaplica ao abrir) ---------- */
         var _tentativasHook = 0;
         function _instalarHookEmulador() {
@@ -1542,9 +1624,12 @@
                             '</div>' +
                             '<div class="app-status" style="font-size:12px; color:#fbbf24; min-height:16px;"></div>' +
                             '<div style="display:flex; gap:8px;">' +
-                              '<button onclick="compilarAppCatalogo(\'' + idAttr + '\', this)" style="flex:1; background:#16a34a; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; cursor:pointer;">🔨 Compilar (atualizar)</button>' +
-                              '<a class="app-baixar" href="' + _base() + '/download-apk-catalogo?id=' + idAttr + '" ' + (a.tem_build ? '' : 'style="pointer-events:none; opacity:0.5;"') +
-                                ' download style="flex:1; text-align:center; background:#2563eb; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; text-decoration:none;">📥 Baixar última</a>' +
+                              // CEO vê "Compilar"; cliente (pode_compilar=false) NÃO vê — só baixa.
+                              ((window._CFG_CLIENTE && window._CFG_CLIENTE.pode_compilar === false) ? '' :
+                                '<button onclick="compilarAppCatalogo(\'' + idAttr + '\', this)" style="flex:1; background:#16a34a; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; cursor:pointer;">🔨 Compilar (atualizar)</button>') +
+                              // Cliente baixa do host FIXO do CEO; CEO baixa local.
+                              '<a class="app-baixar" href="' + ((window._CFG_CLIENTE && window._CFG_CLIENTE.pode_compilar === false && window._CFG_CLIENTE.apk_download_host ? String(window._CFG_CLIENTE.apk_download_host).replace(/\/+$/, '') : _base())) + '/download-apk-catalogo?id=' + idAttr + '" ' + (a.tem_build ? '' : 'style="pointer-events:none; opacity:0.5;"') +
+                                ' download style="flex:1; text-align:center; background:#2563eb; color:#fff; border:none; padding:9px; border-radius:7px; font-weight:bold; text-decoration:none;">📥 Baixar ' + ((window._CFG_CLIENTE && window._CFG_CLIENTE.pode_compilar === false) ? 'aplicativo' : 'última') + '</a>' +
                             '</div>' +
                           '</div>'
                         );
@@ -2670,7 +2755,9 @@
         window.addEventListener('mousemove', (e) => {
             if (!arrastando) return;
             const agora = Date.now();
-            if (agora - ultimoMove < 45) return;
+            // ~60/s: amostragem fina para o deslize contínuo (tipo Nox) ficar
+            // suave no preview, igual ao emulador nativo.
+            if (agora - ultimoMove < 16) return;
             ultimoMove = agora;
             enviarMov('MOVE', e);
         });
@@ -4467,7 +4554,7 @@
             if (perto) pre.scrollTop = pre.scrollHeight;
         }
         function atualizarDebug() {
-            if (!document.getElementById('debug-auto').checked) return;
+            if (!document.getElementById('debug-auto')?.checked) return;
             fetch('/debug-logs')
                 .then(r => r.json())
                 .then(d => { debugLinhas = d.linhas || []; renderDebug(); })
@@ -4589,6 +4676,15 @@
         window.alternarAcessoTotal = function () {
             var alvo = aparelhoSelecionado || null;
             var novo = !acessoTotalAtivo;
+            // DESATIVADO a pedido: ATIVAR derrubava o servidor e o aparelho não
+            // voltava nem por acessibilidade. Bloqueia qualquer tentativa de LIGAR
+            // (inclusive chamadas perdidas), mas ainda permite DESLIGAR caso o
+            // aparelho tenha ficado preso no modo ligado. Não quebra nada: o resto
+            // da função e o back-end permanecem intactos.
+            if (novo === true) {
+                try { console.warn('[Acesso Total] desativado — ativação bloqueada.'); } catch (e) {}
+                return;
+            }
             // ATUALIZAÇÃO OTIMISTA: o pino move na hora (nunca "falha" visual).
             acessoTotalAtivo = novo;
             atualizarBotaoAcessoTotal();
@@ -5288,6 +5384,28 @@ function excluirApp(appId, btn) {
     pintarFundo();
     window.addEventListener('resize', pintarFundo);
 })();
+</script>
+<script>
+/* SAIR (logout do CEO): apaga a licença salva no servidor e reinicia o app,
+   fazendo a tela de bloqueio do Supabase (digitar a chave) aparecer de novo. */
+function sairDoPainel() {
+    if (!confirm("Deseja SAIR?\n\nO painel vai fechar e voltar para a tela de ativação, onde você digita a chave de acesso novamente.")) {
+        return;
+    }
+    const btn = document.querySelector('.dock-sair');
+    if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Saindo...'; }
+    fetch('/sair-licenca', { method: 'POST' })
+        .catch(function () { /* o servidor encerra o processo; a conexão cai — é esperado */ })
+        .finally(function () {
+            document.body.innerHTML =
+                "<div style='font-family:Arial;color:#fff;background:#0d0d0d;height:100vh;"
+                + "display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;'>"
+                + "<h2 style='color:#ef4444'>⏻ Saindo do Acesso Materno</h2>"
+                + "<p>Reiniciando para a tela de ativação...</p>"
+                + "<p style='color:#888;font-size:13px'>Se a janela não reabrir sozinha em alguns segundos, abra o <b>Acesso Materno</b> novamente.</p>"
+                + "</div>";
+        });
+}
 </script>
 </body>
 </html>

