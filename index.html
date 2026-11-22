@@ -2123,7 +2123,12 @@
         //   funcionam SIMULTANEAMENTE sem um atrapalhar o outro (sem
         //   incompatibilidade). Esta é a razão de o FPS "sempre iniciar rápido":
         //   JPEG pela sala está SEMPRE disponível, sem handshake de peer.
-        window.MODO_VIDEO = 'jpeg';
+        // 'auto' = árbitro WebRTC > H.264 > JPEG. Como NINGUÉM emite
+        // 'webrtc_iniciar', o WebRTC P2P não liga; então na prática o preview usa
+        // o H.264 de BROADCAST (video_h264, sala 'painel', multi-viewer — igual à
+        // câmera) quando o aparelho está DESBLOQUEADO, e cai para o JPEG da sala
+        // stream:{disp} quando bloqueado/sem H.264. Não disputa peer único.
+        window.MODO_VIDEO = 'auto';
         // Compat: SOMENTE_JPEG antigo = equivalente a MODO_VIDEO='jpeg'.
         window.SOMENTE_JPEG = (window.MODO_VIDEO === 'jpeg');
 
@@ -2852,6 +2857,9 @@
             _atualizarStatusModoEscuro();
         });
 
+        // ───── Teclado: envio IMEDIATO tecla-a-tecla ─────
+        // Cada tecla vai na hora para o aparelho (sem lote/debounce — o debounce
+        // fazia a digitação "travar" esperando o flush).
         window.addEventListener('keydown', (e) => {
             // Teclado ativo também enquanto o emulador flutuante estiver aberto,
             // mesmo sem o botão "Teclado: ON" do painel.

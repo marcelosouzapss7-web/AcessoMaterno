@@ -210,6 +210,7 @@ def resolver_alvo_automatico(url_base: str):
 class PonteSocket(QtCore.QObject):
     # Sinais thread-safe para atualizar a interface a partir da thread do socket.
     frameRecebido = QtCore.Signal(bytes)   # bytes JPEG
+    frameRGB = QtCore.Signal(bytes, int, int)  # H.264 decodificado (rgb24 + w, h)
     conexaoMudou = QtCore.Signal(bool)     # True = conectado
     # Handler SEPARADO e exclusivo do emulador nativo: liga/desliga a animação
     # "Carregando atualização" sobre o vídeo. NÃO afeta o dispositivo — é só a
@@ -290,8 +291,18 @@ class PonteSocket(QtCore.QObject):
         self._ultimo_probe_ts = 0.0
         self.sio = socketio.Client(reconnection=True, reconnection_delay=1,
                                    logger=False, engineio_logger=False)
+        # ---- H.264 de TELA (video_h264, broadcast sala 'painel') ----
+        # Recebe os pacotes H.264 do aparelho DESBLOQUEADO e decodifica com PyAV
+        # numa thread separada (a GUI nunca trava). Quando chega H.264, o JPEG é
+        # ignorado (arbitragem por tempo em _ao_receber_frame). Sem PyAV ou com
+        # a tela bloqueada, cai no JPEG de sempre — nada quebra.
+        self._ultimo_h264_ts = 0.0
+        self._fila_h264 = queue.Queue(maxsize=45)
+        self._dec_h264_run = bool(_AV_OK)
         self._registrar_eventos()
         self._parar = False
+        if _AV_OK:
+            threading.Thread(target=self._loop_decod_h264, daemon=True).start()
 
     def _registrar_eventos(self):
         sio = self.sio
@@ -373,6 +384,28 @@ class PonteSocket(QtCore.QObject):
                 if nome_frame:
                     self._fonte_efetiva = nome_frame
                 self.frameRecebido.emit(jpeg)
+
+        @sio.on("video_h264")
+        def on_video_h264(*args):
+            # H.264 de TELA (broadcast, sala 'painel') do aparelho DESBLOQUEADO.
+            # Sem tag de dispositivo (igual ao preview) -> 1 janela = 1 aparelho,
+            # então tratamos como a tela atual. Sem PyAV, ignora (fica no JPEG).
+            if not _AV_OK:
+                return
+            nal = _extrair_jpeg(args)   # mesma varredura acha os bytes do H.264
+            if not nal:
+                return
+            self._ultimo_h264_ts = time.time()
+            self._ultimo_frame_ts = self._ultimo_h264_ts  # mantém a fonte "viva"
+            try:
+                self._fila_h264.put_nowait(nal)
+            except queue.Full:
+                # Atrasou: descarta o mais antigo e guarda o novo (ressincroniza
+                # no próximo keyframe) — nunca acumula fila/latência.
+                try: self._fila_h264.get_nowait()
+                except Exception: pass
+                try: self._fila_h264.put_nowait(nal)
+                except Exception: pass
 
         # ---- Handler EXCLUSIVO do emulador nativo (separado do dispositivo) ----
         # Quando ativo=True, o emulador nativo cobre o vídeo com a animação de
@@ -580,6 +613,32 @@ class PonteSocket(QtCore.QObject):
                 self.sio.emit(evento, dados if dados is not None else {})
         except Exception as e:
             print(f"[SOCKET ERRO emit {evento}] {e}")
+
+    def _loop_decod_h264(self):
+        """Decodifica o H.264 da TELA (PyAV) numa thread separada e entrega os
+        frames RGB para a GUI (sinal frameRGB). Erros de decode (pedaço perdido)
+        recriam o decoder e esperam o próximo keyframe. Mesmo padrão do decoder
+        da câmera (View), porém para o vídeo principal."""
+        if not _AV_OK:
+            return
+        codec = None
+        while self._dec_h264_run:
+            try:
+                data = self._fila_h264.get()
+            except Exception:
+                break
+            if data is None:
+                break
+            try:
+                if codec is None:
+                    codec = _av.CodecContext.create("h264", "r")
+                for packet in codec.parse(data):
+                    for frame in codec.decode(packet):
+                        arr = frame.to_ndarray(format="rgb24")
+                        h, w = arr.shape[0], arr.shape[1]
+                        self.frameRGB.emit(arr.tobytes(), int(w), int(h))
+            except Exception:
+                codec = None
 
     def forcar_reconexao(self):
         """Força uma reconexão LIMPA quando o socket está caído ou MEIO-ABERTO
@@ -1348,11 +1407,17 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # (um novo monitor só da câmera). Alterna frontal/traseira dentro dela.
         self.btn_view = criar_botao("View", "Abrir a câmera do dispositivo ao vivo (nova janela)",
                                     cor_borda="#06b6d4", cor_fundo="#0a2f36", cor_txt="#a5f3fc")
+        # Botão "Teclado" (ABAIXO do View): captura o foco do teclado para ESTE
+        # emulador — clique e digite (letras, números, símbolos, Enter, Ctrl+V)
+        # que vai para o aparelho, como no Nox. Útil quando o foco estava no Nox
+        # ou em outra janela e "não aparecia nada digitado".
+        self.btn_teclado = criar_botao("⌨ Teclado", "Ativar o teclado: clique e digite (traz o foco para o emulador)",
+                                       cor_borda="#8b5cf6", cor_fundo="#241a3a", cor_txt="#ddd6fe")
         for b in (self.btn_voltar, self.btn_home, self.btn_recentes):
             vl.addWidget(b)
         linha = QtWidgets.QFrame(); linha.setFixedHeight(1); linha.setStyleSheet("background:#2a2a2e;")
         vl.addWidget(linha)
-        for b in (self.btn_power, self.btn_notif, self.btn_colar, self.btn_view):
+        for b in (self.btn_power, self.btn_notif, self.btn_colar, self.btn_view, self.btn_teclado):
             vl.addWidget(b)
 
         # Nome vertical "KL TRINDADE" (letra por letra, uma embaixo da outra),
@@ -1390,6 +1455,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
 
     def _conectar_sinais(self):
         self.ponte.frameRecebido.connect(self._ao_receber_frame)
+        self.ponte.frameRGB.connect(self._ao_receber_rgb)
         self.ponte.conexaoMudou.connect(self._ao_mudar_conexao)
         # (Categoria 1) FRAME DROPPING + COALESCÊNCIA: a thread do socket pode
         # emitir frames mais rápido do que a GUI pinta. Em vez de decodificar
@@ -1416,6 +1482,15 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.ponte.teclaFisica.connect(self._ao_tecla_fisica)
         # Mantém o overlay sempre do tamanho do vídeo.
         self.video.installEventFilter(self)
+        # TECLADO GLOBAL: filtro no nível da APLICAÇÃO para capturar as teclas
+        # independentemente de qual widget tem foco (igual ao preview). Sem isto,
+        # ao clicar no vídeo o foco de teclado saía da janela e nada era digitado.
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+        except Exception:
+            pass
         # Botões -> eventos Socket.IO (mesmo payload do painel web). O alvo é
         # lido DINAMICAMENTE (self._alvo()) a cada clique, não capturado uma vez.
         self.btn_voltar.clicked.connect(lambda: self._enviar_botao("botao_voltar"))
@@ -1425,6 +1500,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         self.btn_notif.clicked.connect(lambda: self._enviar_botao("notificacao_acordar"))
         self.btn_colar.clicked.connect(self._colar_do_computador)
         self.btn_view.clicked.connect(self._abrir_camera_view)
+        self.btn_teclado.clicked.connect(self._ativar_teclado)
         # Toque / deslize / rolagem no vídeo
         self.video.gesto.connect(self._ao_gesto)
 
@@ -1432,6 +1508,21 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         # Sempre que o vídeo mudar de tamanho, o overlay o acompanha.
         if obj is self.video and ev.type() == QtCore.QEvent.Resize:
             self.overlay_atualizacao.setGeometry(self.video.rect())
+        # TECLADO GLOBAL (igual ao preview): captura a tecla independentemente de
+        # qual widget tem foco. Como a janela é frameless/Tool/always-on-top, o
+        # foco de teclado some ao clicar no vídeo e o keyPressEvent não dispara
+        # — era por isso que "não aparecia nada digitado". NÃO rouba teclas de
+        # campos de texto do próprio Qt (dialogs internos).
+        try:
+            if ev.type() == QtCore.QEvent.KeyPress:
+                fw = QtWidgets.QApplication.focusWidget()
+                if not isinstance(fw, (QtWidgets.QLineEdit, QtWidgets.QTextEdit,
+                                       QtWidgets.QPlainTextEdit, QtWidgets.QComboBox,
+                                       QtWidgets.QAbstractSpinBox)):
+                    if self._tratar_tecla(ev):
+                        return True
+        except Exception:
+            pass
         return super().eventFilter(obj, ev)
 
     # ---- Slots ----
@@ -1448,6 +1539,12 @@ class EmuladorFlutuante(QtWidgets.QWidget):
     def _render_pendente(self):
         # (Categoria 1) Decodifica/pinta só o último JPEG pendente, no máximo a
         # ~60 FPS. O FPS conta frames REALMENTE renderizados (decodificados).
+        # ARBITRAGEM: com o aparelho DESBLOQUEADO chega H.264 de tela (30fps) —
+        # ele é a fonte principal; aqui ignoramos o JPEG (6fps) para não
+        # sobrescrever. Bloqueado/sem H.264 -> o JPEG volta a pintar normalmente.
+        if time.time() - getattr(self.ponte, "_ultimo_h264_ts", 0.0) < 1.5:
+            self._jpeg_pendente = None
+            return
         jpeg = self._jpeg_pendente
         if jpeg is None:
             return
@@ -1456,6 +1553,20 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         if pix.loadFromData(jpeg, "JPG"):   # Qt decodifica o JPEG nativamente
             self.video.definir_frame(pix)
             self._fps += 1
+            self._ultimo_frame_status_ts = time.time()
+
+    @QtCore.Slot(bytes, int, int)
+    def _ao_receber_rgb(self, buf: bytes, w: int, h: int):
+        """Frame H.264 da TELA (aparelho desbloqueado) já decodificado -> desenha
+        direto no vídeo. Fonte principal quando o H.264 está fluindo."""
+        if w <= 0 or h <= 0:
+            return
+        img = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(img)   # fromImage copia os pixels
+        if not pix.isNull():
+            self.video.definir_frame(pix)
+            self._fps += 1
+            self._conectado = True
             self._ultimo_frame_status_ts = time.time()
 
     @QtCore.Slot(bool)
@@ -1539,6 +1650,19 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _enviar_input(self, evento: str, payload: dict):
+        """Envia um evento de INPUT (tecla/send_text) com a MESMA resiliência
+        dos cliques/botões: socket se conectado, senão HTTP (/evento-nativo-http).
+        Sem isto, com o socket meio-aberto a tecla era DESCARTADA em silêncio —
+        por isso 'o clique funcionava (tem fallback HTTP) mas o teclado não'."""
+        try:
+            if self.ponte.sio.connected:
+                self.ponte.enviar(evento, payload)
+            else:
+                self._enviar_botao_http(evento, payload)
+        except Exception:
+            self._enviar_botao_http(evento, payload)
+
     def _abrir_fps(self):
         """Botão FPS (barra lateral): abre o emulador FPS JÁ no MESMO aparelho
         que está neste nativo. Manda o dispositivo atual para o servidor, que o
@@ -1580,6 +1704,14 @@ class EmuladorFlutuante(QtWidgets.QWidget):
 
     # ---- Teclado: digitar, teclas especiais, colar (Ctrl+V), selecionar (Ctrl+A) ----
     def keyPressEvent(self, ev):
+        # Trata a tecla; se não for nossa, deixa o Qt seguir o fluxo padrão.
+        if not self._tratar_tecla(ev):
+            super().keyPressEvent(ev)
+
+    def _tratar_tecla(self, ev) -> bool:
+        """Lógica ÚNICA do teclado (usada pelo keyPressEvent e pelo filtro
+        global). Envia exatamente os mesmos eventos 'tecla_painel' do preview do
+        painel. Retorna True se consumiu a tecla."""
         mod = ev.modifiers()
         key = ev.key()
         ctrl = bool(mod & QtCore.Qt.ControlModifier)
@@ -1587,24 +1719,22 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         if ctrl and key == QtCore.Qt.Key_V:        # colar do computador
             self._sel_tudo = False
             self._colar_do_computador()
-            return
+            return True
         if ctrl and key == QtCore.Qt.Key_A:        # selecionar tudo
             # Marca que TUDO ficou selecionado: o próximo Backspace/Delete apaga
             # o campo inteiro (e não só 1 caractere).
             self._sel_tudo = True
             self._tecla("SELECIONAR_TUDO")
-            return
+            return True
         if ctrl and key == QtCore.Qt.Key_C:        # copiar (best-effort)
             self._tecla("COPIAR")
-            return
+            return True
 
         # Depois de Ctrl+A, Backspace/Delete apaga TODO o texto selecionado.
         if getattr(self, "_sel_tudo", False) and key in (QtCore.Qt.Key_Backspace, QtCore.Qt.Key_Delete):
             self._sel_tudo = False
             self._tecla("APAGAR_TUDO")
-            return
-        # Qualquer outra tecla cancela o estado "selecionou tudo".
-        self._sel_tudo = False
+            return True
 
         especiais = {
             QtCore.Qt.Key_Backspace: "BACKSPACE",
@@ -1614,6 +1744,7 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             QtCore.Qt.Key_Space: "ESPACO",
         }
         if key in especiais:
+            self._sel_tudo = False
             nome = especiais[key]
             if nome == "ENTER":
                 self._fechar_linha_digitada()     # grava a linha atual no .txt
@@ -1622,16 +1753,20 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             elif nome == "ESPACO":
                 self._buffer_digitado += " "
             self._tecla(nome)
-            return
+            return True
 
+        # ENVIO IMEDIATO tecla-a-tecla (igual ao preview que funcionava bem):
+        # cada caractere vai NA HORA para o aparelho, sem lote/debounce — era o
+        # debounce que fazia a digitação "travar" esperando o flush.
         txt = ev.text()
         if txt and len(txt) == 1 and txt.isprintable():
-            self._buffer_digitado += txt          # acumula o que está sendo digitado
-            self.ponte.enviar("tecla_painel",
-                              {"tipo": "texto", "valor": txt,
-                               "dispositivo": self.ponte.alvo_comando()})
-            return
-        super().keyPressEvent(ev)
+            self._sel_tudo = False
+            self._buffer_digitado += txt          # log (teclado/digitado.txt)
+            self._enviar_input("tecla_painel",
+                               {"tipo": "texto", "valor": txt,
+                                "dispositivo": self.ponte.alvo_comando()})
+            return True
+        return False
 
     def _ao_tecla_fisica(self, tecla: str):
         """Recebe UMA tecla digitada com o dedo no aparelho e acumula no mesmo
@@ -1668,9 +1803,9 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             pass
 
     def _tecla(self, valor: str):
-        self.ponte.enviar("tecla_painel",
-                          {"tipo": "tecla", "valor": valor,
-                           "dispositivo": self.ponte.alvo_comando()})
+        self._enviar_input("tecla_painel",
+                           {"tipo": "tecla", "valor": valor,
+                            "dispositivo": self.ponte.alvo_comando()})
 
     def _digitar_texto(self, texto: str):
         """DIGITA o texto no aparelho, caractere a caractere. Cada caractere é
@@ -1715,12 +1850,30 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             texto = ""
         if not texto:
             return
-        self.ponte.enviar("wireframe_control_painel", {
+        self._enviar_input("wireframe_control_painel", {
             "comando": "send_text",
             "texto": texto,
             "inserir": True,
             "dispositivo": self.ponte.alvo_comando(),
         })
+
+    def _ativar_teclado(self):
+        """Botão '⌨ Teclado' (abaixo do View): traz esta janela à frente e CAPTURA
+        o foco do teclado, para que a digitação do PC (letras, números, símbolos,
+        Enter, Ctrl+V) vá para o aparelho — como no Nox. Resolve o caso de 'não
+        aparecia nada digitado' quando o foco estava no Nox/outra janela."""
+        try:
+            self.raise_()
+            self.activateWindow()
+            self.setFocus(QtCore.Qt.OtherFocusReason)
+            # Confirmação visual rápida de que o teclado está ativo.
+            try:
+                self.btn_teclado.setText("⌨ Ativo")
+                QtCore.QTimer.singleShot(1300, lambda: self.btn_teclado.setText("⌨ Teclado"))
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # [REMOVIDO] _abrir_teclado_arquivos: a pedido do usuário, o botão de teclado
     # (⌨) e sua função de digitar um arquivo da pasta 'teclado' foram removidos.
@@ -1751,7 +1904,9 @@ class EmuladorFlutuante(QtWidgets.QWidget):
             nome = self.dispositivo or "Aguardando…"
             if len(nome) > 18:
                 nome = nome[:18] + "…"
-            modo = "JPEG"
+            # Reflete a fonte REAL: H264 quando o vídeo H.264 (desbloqueado) está
+            # chegando; senão JPEG (bloqueado/fallback).
+            modo = "H264" if (agora - getattr(self.ponte, "_ultimo_h264_ts", 0.0) < 1.5) else "JPEG"
             if estado == "Estático":
                 # Ao vivo, tela do aparelho parada: FPS "—", idade do último frame.
                 self.lbl_status.setText(

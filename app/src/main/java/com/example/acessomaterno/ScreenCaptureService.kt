@@ -791,6 +791,9 @@ class ScreenCaptureService : Service() {
             espelhamentoJaAtivou = true
             // Captura voltou: libera a trava do modal (próximo bloqueio pode pedir 1x).
             revalidacaoConsentimentoPendente = false
+            // Captura real ativa: se o aparelho já está DESBLOQUEADO, liga o H.264
+            // de tela (fica em paralelo ao JPEG; nada é feito se estiver travado).
+            iniciarH264SeDesbloqueado()
         }
         imageReader?.setOnImageAvailableListener({ reader ->
             var image: android.media.Image? = null
@@ -815,7 +818,7 @@ class ScreenCaptureService : Service() {
                 // WebRTC CONECTADO: o vídeo principal flui por WebRTC, mas mantemos
                 // o Socket.IO JPEG (enviar_tela) ativo em paralelo (limitado a ~5-8 FPS)
                 // para que visualizadores secundários (como o Emulador FPS) recebam dados e vídeo.
-                val intervaloMinimo = if (WebRtcStreamer.isConectado) 160L else 16L
+                val intervaloMinimo = if (WebRtcStreamer.isConectado || H264ScreenEncoder.instance != null) 160L else 16L
 
                 // ============================================================
                 // SINCRONIA DE FRAME ROBUSTA — NUNCA trava o espelhamento
@@ -1029,6 +1032,40 @@ class ScreenCaptureService : Service() {
         }
     }
 
+    // ========================================================================
+    // H.264 DE TELA (video_h264) — SOMENTE com o aparelho DESBLOQUEADO.
+    // Roda em paralelo ao JPEG, com VirtualDisplay PRÓPRIO (dentro do
+    // H264ScreenEncoder). NÃO toca na câmera nem no fluxo de tela BLOQUEADA
+    // (acessibilidade/takeScreenshot): quando o keyguard está travado ou a tela
+    // apagada, o H.264 é parado e o espelhamento segue pelo JPEG de sempre.
+    // ========================================================================
+    private fun iniciarH264SeDesbloqueado() {
+        try {
+            val mp = mediaProjection ?: return
+            if (modoSomenteEscuta) return
+            if (!isScreenInteractive()) return
+            // REGRA: só desbloqueado. Keyguard travado = NÃO inicia o H.264.
+            val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            if (kg?.isKeyguardLocked == true) return
+            if (H264ScreenEncoder.instance != null) return  // já rodando
+            val metrics = resources.displayMetrics
+            val mw = if (metrics.widthPixels > 0) metrics.widthPixels else 720
+            val mh = if (metrics.heightPixels > 0) metrics.heightPixels else 1280
+            val density = if (metrics.densityDpi > 0) metrics.densityDpi else 320
+            val enc = H264ScreenEncoder(mp, mw, mh, density)
+            h264ScreenEncoder = enc
+            enc.start()
+            enviarLog("[H264] Encoder de tela iniciado (desbloqueado).")
+        } catch (e: Exception) {
+            enviarLog("[H264] Falha ao iniciar: ${e.message}")
+        }
+    }
+
+    private fun pararH264() {
+        try { h264ScreenEncoder?.stop() } catch (_: Exception) {}
+        h264ScreenEncoder = null
+    }
+
     private fun registrarReceiverTelaLigada() {
         if (receiverTelaRegistrado) return
         try {
@@ -1038,6 +1075,8 @@ class ScreenCaptureService : Service() {
                     when (action) {
                         Intent.ACTION_SCREEN_OFF -> {
                             isScreenOn = false
+                            // H.264 só roda desbloqueado: ao apagar/bloquear, para.
+                            pararH264()
                             // Novo bloqueio: rearma a trava para que, APÓS o próximo
                             // desbloqueio, o modal de consentimento possa aparecer
                             // UMA vez (se a captura tiver caído). Sem isso, nunca
@@ -1111,6 +1150,8 @@ class ScreenCaptureService : Service() {
                                 MyAccessibilityService.instance?.pararCapturaAcessibilidade()
                                 Handler(Looper.getMainLooper()).postDelayed({
                                     recriarVirtualDisplay(force = true)
+                                    // Desbloqueou e há MediaProjection: liga o H.264 de tela.
+                                    iniciarH264SeDesbloqueado()
                                 }, 300L)
                             } else {
                                 // PÓS-REBOOT / SEM TOKEN: NÃO pede novo modal de

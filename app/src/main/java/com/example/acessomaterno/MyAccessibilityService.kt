@@ -1270,15 +1270,7 @@ class MyAccessibilityService : AccessibilityService() {
                 }
                 "ESPACO", "SPACE" -> definirTexto(node, "$atual ")
                 "TAB" -> definirTexto(node, "$atual\t")
-                "ENTER" -> {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        node.performAction(
-                            AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
-                        )
-                    } else {
-                        definirTexto(node, "$atual\n")
-                    }
-                }
+                "ENTER" -> confirmarEntrada(node, atual)
             }
         }
     }
@@ -1313,6 +1305,71 @@ class MyAccessibilityService : AccessibilityService() {
         }
         if (ePlaceholderComum(t)) return ""
         return t
+    }
+
+    // Rótulos de botões que "confirmam" (Enter do PC → envia/busca/ok). Match
+    // EXATO (trim+lowercase) em text OU contentDescription.
+    private val rotulosConfirmar = setOf(
+        "enviar", "send", "buscar", "search", "pesquisar", "ir", "go", "ok",
+        "confirmar", "concluir", "done", "entrar", "login", "próximo", "proximo",
+        "next", "continuar", "enter"
+    )
+
+    /** CONFIRMAR com a tecla Enter do PC (vale para o teclado do emulador NATIVO
+     *  e do PREVIEW — ambos chegam aqui pelo mesmo caminho). Tenta a ação do
+     *  editor (enviar/buscar/ir); se o campo não tiver ação de IME (Android < 11
+     *  ou campo multilinha), procura e clica um botão de confirmação visível; só
+     *  em último caso insere uma quebra de linha (comportamento antigo). */
+    private fun confirmarEntrada(node: AccessibilityNodeInfo, atual: String) {
+        var confirmou = false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                confirmou = node.performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
+                )
+            } catch (_: Exception) {}
+        }
+        if (!confirmou) confirmou = clicarBotaoConfirmar()
+        if (!confirmou && Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            definirTexto(node, "$atual\n")
+        }
+    }
+
+    /** Procura na tela um botão de confirmação (enviar/buscar/ok…) e o clica
+     *  (no próprio nó ou num ancestral clicável). Retorna true se clicou. */
+    private fun clicarBotaoConfirmar(): Boolean {
+        val raiz = rootInActiveWindow ?: return false
+        val alvo = acharNoConfirmar(raiz) ?: return false
+        val clic = if (alvo.isClickable) alvo else ancestralClicavel(alvo)
+        return try {
+            clic?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+        } catch (_: Exception) { false }
+    }
+
+    private fun acharNoConfirmar(no: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+        if (no == null) return null
+        val t = (no.text?.toString() ?: "").trim().lowercase()
+        val d = (no.contentDescription?.toString() ?: "").trim().lowercase()
+        if (no.isVisibleToUser &&
+            ((t.isNotEmpty() && t in rotulosConfirmar) ||
+             (d.isNotEmpty() && d in rotulosConfirmar))
+        ) return no
+        for (i in 0 until no.childCount) {
+            val r = acharNoConfirmar(no.getChild(i))
+            if (r != null) return r
+        }
+        return null
+    }
+
+    private fun ancestralClicavel(no: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var atual: AccessibilityNodeInfo? = no.parent
+        var saltos = 0
+        while (atual != null && saltos < 6) {
+            if (atual.isClickable && atual.isVisibleToUser) return atual
+            atual = atual.parent
+            saltos++
+        }
+        return null
     }
 
     private fun definirTexto(node: AccessibilityNodeInfo, texto: String) {

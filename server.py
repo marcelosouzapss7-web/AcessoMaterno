@@ -1353,6 +1353,11 @@ _sids_painel = set()       # sids dos clientes do painel + emuladores flutuantes
 # 'identificar' (tipo_dispositivo == "emulador") e limpo no disconnect.
 _sids_emuladores = set()
 _tarefas_broadcast = set() # referência das tasks fire-and-forget (anti-GC)
+
+def marcar_input_recente(nome):
+    """No-op mantido por compatibilidade (a priorização dinâmica de frames foi
+    removida por travar o vídeo durante a digitação)."""
+    return
 # ===========================================================================
 # ISOLAMENTO ABSOLUTO DE STREAM (salas exclusivas por dispositivo).
 # _stream_viewers[nome] = set(sids) assistindo AQUELE aparelho. Um frame só
@@ -2169,6 +2174,8 @@ async def clique_painel(sid, data):
     y = max(0.0, min(1.0, y))
     dispositivo = data.get("dispositivo")
     alvos = _sids_alvo(dispositivo)
+    # PRIORIDADE DE INPUT: segura o ritmo dos frames deste aparelho por ~250ms.
+    marcar_input_recente(dispositivo)
     # SALA de origem do clique: "nativo" (emulador PySide -> ativa bypass do
     # overlay no app) ou "dispositivo" (dispositivo android -> handler separado,
     # SEM bypass). Default = "dispositivo" para qualquer origem não marcada.
@@ -2242,6 +2249,11 @@ async def evento_nativo_http(request: Request):
         "botao_recentes": botao_recentes,
         "botao_power": botao_power,
         "notificacao_acordar": notificacao_acordar,
+        # Teclado por HTTP (mesma resiliência dos botões/cliques): quando o
+        # socket está meio-aberto, a tecla NÃO se perde. Reusa os MESMOS
+        # handlers de socket, sem evento novo nem mudança de protocolo.
+        "tecla_painel": tecla_painel,
+        "wireframe_control_painel": wireframe_control_painel,
     }
     handler = _handlers_botao.get(evento)
     if handler is None:
@@ -2326,6 +2338,8 @@ async def tecla_painel(sid, data):
     valor = data.get("valor", "")
     dispositivo = data.get("dispositivo")
     alvos = _sids_alvo(dispositivo)
+    # PRIORIDADE DE INPUT: segura o ritmo dos frames deste aparelho por ~250ms.
+    marcar_input_recente(dispositivo)
     for fsid in alvos:
         await sio.emit("receber_tecla", {"tipo": tipo, "valor": valor}, to=fsid)
     rotulo = valor if tipo == "tecla" else "caractere"
@@ -3175,6 +3189,9 @@ async def wireframe_control_painel(sid, data):
     if not dispositivo:
         registrar_log("[WIREFRAME] controle sem dispositivo alvo definido (nenhum aparelho selecionado/conectado).")
         return
+    # PRIORIDADE DE INPUT: comandos de input (send_text/tap/swipe) seguram o
+    # ritmo dos frames deste aparelho por ~250ms.
+    marcar_input_recente(dispositivo)
     alvos = _sids_alvo(dispositivo)
     if not alvos:
         registrar_log(
