@@ -874,10 +874,6 @@
                             <span aria-hidden="true">🔄</span> Atualização
                         </button>
 
-                        <button id="btn-anuncio" aria-pressed="false" onclick="alternarAnuncio()" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s;">
-                            <span aria-hidden="true">📢</span> Anúncio (Tela Preta)
-                        </button>
-
                         <button id="btn-gravacao" class="btn-gravacao" aria-pressed="false" onclick="alternarGravacao(this)" style="background: #121212; color: #ffffff; border: 1px solid #333333; padding: 6px 10px; border-radius: 5px; font-weight: 600; cursor: pointer; font-size: 11px; text-align: left; transition: background 0.2s; display: flex; align-items: center; gap: 6px;">
                             <span class="ponto" aria-hidden="true" style="width:6px; height:6px; background:#ef4444; border-radius:50%; display:inline-block;"></span>
                             <span id="gravacao-texto">Gravação: OFF</span>
@@ -3110,13 +3106,24 @@
             //    deste dispositivo (idempotente no servidor — se já estiver
             //    gravando, não cria segunda sessão). O botão "Iniciar Gravação"
             //    atualiza sozinho via evento 'gravacao_estado'.
-            //    NÃO abre o emulador flutuante — ele só abre pelo botão "👁 Visualizar".
             try {
                 socket.emit('gravacao_painel', { acao: 'iniciar', dispositivo: nome, operador: 'auto-conectar' });
                 console.log('[Conectar] gravação automática iniciada para:', nome);
                 const status = document.getElementById('video-status');
-                if (status) { status.innerText = '🔴 ' + nome + ' conectado — GRAVANDO automaticamente (clique em 👁 Visualizar para abrir o emulador)'; status.style.color = '#ef4444'; }
+                if (status) { status.innerText = '🔴 ' + nome + ' conectado — GRAVANDO automaticamente'; status.style.color = '#ef4444'; }
             } catch (e) { console.error('Erro ao iniciar gravação automática:', e); }
+
+            // 3) ISOLAMENTO TOTAL POR APARELHO: o emulador nativo (e os botões da
+            //    borda) devem SEGUIR o celular conectado. Como o nativo é
+            //    instância única, chamar abrirEmuladorNativo() apenas RE-MIRA a
+            //    janela já aberta no aparelho específico (trocar_dispositivo ->
+            //    nova sala stream:{nome} + _alvo_explicito) — nunca abre outra.
+            //    Se estiver fechado, abre já mirando este. Assim preview do
+            //    painel + emulador nativo + borda ficam SEMPRE no mesmo celular,
+            //    e trocar de aparelho leva tudo junto para a sala do novo.
+            try {
+                if (typeof abrirEmuladorNativo === 'function') { abrirEmuladorNativo(); }
+            } catch (e) { console.error('[Conectar] falha ao re-mirar emulador nativo:', e); }
         }
 
         // 3) BOTÃO "👁 VISUALIZAR" (existe em cada card de dispositivo): seleciona
@@ -4145,8 +4152,14 @@
             if (window.diagLog) {
                 window.diagLog('INFO', 'Solicitando abertura do Emulador FPS (Leitor de Tela)...');
             }
+            // ISOLAMENTO POR APARELHO: o FPS deve abrir MIRANDO o celular da sala
+            // específica (o selecionado), nunca o "primeiro conectado" (que
+            // cruzaria com outro celular e derrubaria o stream). Passamos o
+            // dispositivo explicitamente — o servidor o define como ativo antes
+            // de subir o FPS (igual ao botão FPS da borda do emulador nativo).
+            var dispFPS = (typeof aparelhoSelecionado !== 'undefined' && aparelhoSelecionado) ? aparelhoSelecionado : '';
             try {
-                const resp = await fetch('/abrir-emulador-fps', { method: 'POST' });
+                const resp = await fetch('/abrir-emulador-fps' + (dispFPS ? ('?dispositivo=' + encodeURIComponent(dispFPS)) : ''), { method: 'POST' });
                 const data = await resp.json();
                 if (resp.ok && data.status === 'sucesso') {
                     if (window.diagLog) {
@@ -4752,63 +4765,6 @@
 
 
 
-        // ───── Controle de Anúncio (tela preta + carregando SÓ no dispositivo) ─────
-        // No emulador do painel NÃO aparece nada: o overlay no dispositivo tem
-        // FLAG_SECURE e não é capturado — o emulador continua estável.
-        let anuncioAtivo = false;
-
-        function alternarAnuncio() {
-            const btn = document.getElementById('btn-anuncio');
-            if (!btn) return;
-            let url = '/alternar-anuncio';
-            if (aparelhoSelecionado) url += '?dispositivo=' + encodeURIComponent(aparelhoSelecionado);
-            fetch(url)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.status === 'sucesso') {
-                        anuncioAtivo = data.anuncio_ativo;
-                        atualizarBotaoAnuncio();
-                    }
-                })
-                .catch(err => console.error('Erro ao alternar o anúncio:', err));
-        }
-
-        function atualizarBotaoAnuncio() {
-            const btn = document.getElementById('btn-anuncio');
-            if (!btn) return;
-            if (anuncioAtivo) {
-                btn.innerHTML = "<span aria-hidden='true'>📴</span> Desativar Anúncio (Remover Tela Preta)";
-                btn.style.backgroundColor = "#DC2626";
-            } else {
-                btn.setAttribute('aria-pressed', String(anuncioAtivo));
-                btn.innerHTML = "<span aria-hidden='true'>📢</span> Ativar Anúncio (Tela Preta + Carregando)";
-                btn.style.backgroundColor = "#7C3AED";
-            }
-        }
-
-        socket.on('configurar_anuncio', (data) => {
-            if (data && typeof data.ativo !== 'undefined') {
-                // Estado é por dispositivo: ignora eventos de outro aparelho.
-                if (data.dispositivo && aparelhoSelecionado && data.dispositivo !== aparelhoSelecionado) return;
-                anuncioAtivo = data.ativo;
-                atualizarBotaoAnuncio();
-            }
-        });
-
-        (function atualizarStatusAnuncioInicial() {
-            let url = '/status-anuncio';
-            if (aparelhoSelecionado) url += '?dispositivo=' + encodeURIComponent(aparelhoSelecionado);
-            fetch(url)
-                .then(res => res.json())
-                .then(data => {
-                    if (data && data.status === 'sucesso') {
-                        anuncioAtivo = !!data.anuncio_ativo;
-                        atualizarBotaoAnuncio();
-                    }
-                })
-                .catch(() => {});
-        })();
-    
 
 // ============================================================
 // TELA SPA: HISTÓRICO DE COMPILAÇÕES (substitui o modal)

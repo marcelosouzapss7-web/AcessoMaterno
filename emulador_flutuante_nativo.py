@@ -996,6 +996,13 @@ def _extrair_jpeg(args):
     return None
 
 
+# INDEPENDÊNCIA DA JANELA DE CÂMERA (View): guarda referências FORTES a cada
+# janela de câmera aberta, DESACOPLADAS do objeto do emulador nativo. Assim,
+# fechar o emulador nativo NÃO fecha nem coleta (GC) a câmera — ela continua
+# transmitindo sozinha no próprio processo/socket até o operador fechá-la.
+_JANELAS_CAMERA_ABERTAS = set()
+
+
 class JanelaCamera(QtWidgets.QWidget):
     """Monitor separado só com a CÂMERA do dispositivo ao vivo. Tem seu PRÓPRIO
     cliente Socket.IO: entra na sala camera:{dispositivo}, recebe 'camera_frame'
@@ -1010,6 +1017,9 @@ class JanelaCamera(QtWidgets.QWidget):
         self.url_base = (url_base or "").rstrip("/")
         self.dispositivo = dispositivo
         self._parar = False
+        # Referência FORTE e independente do emulador nativo (ver comentário do
+        # _JANELAS_CAMERA_ABERTAS): sobrevive ao fechamento do nativo.
+        _JANELAS_CAMERA_ABERTAS.add(self)
         self.setWindowTitle(f"View — Câmera · {dispositivo}")
         self.resize(380, 660)
         self.setStyleSheet("background:#0b0b0d;")
@@ -1052,10 +1062,47 @@ class JanelaCamera(QtWidgets.QWidget):
         self._dec_thread = threading.Thread(target=self._loop_decodificar, daemon=True)
         self._dec_thread.start()
 
+        # RETRY DE CONEXÃO DA CÂMERA: o 'iniciar_camera' é REENVIADO até o 1º
+        # frame chegar. Assim, clicar em View CONECTA de fato — não fica só
+        # "Conectando…" — mesmo se o 1º comando se perder ou o aparelho ainda
+        # não estava pronto no instante do clique. Para sozinho no 1º frame.
+        self._recebeu_frame = False
+        self._camera_lado = "frontal"
+        self._retry_timer = QtCore.QTimer(self)
+        self._retry_timer.setInterval(2500)
+        self._retry_timer.timeout.connect(self._retry_iniciar)
+        self._retry_timer.start()
+
         self.sio = socketio.Client(reconnection=True, reconnection_delay=1,
                                    logger=False, engineio_logger=False)
         self._registrar_eventos()
         threading.Thread(target=self._loop, daemon=True).start()
+
+    def _retry_iniciar(self):
+        """Reenvia assistir_camera + iniciar_camera enquanto NENHUM frame chegou.
+        Cobre o caso do comando inicial perdido / aparelho ainda não pronto."""
+        if self._recebeu_frame:
+            try:
+                self._retry_timer.stop()
+            except Exception:
+                pass
+            return
+        try:
+            if self.sio.connected:
+                self.sio.emit("assistir_camera", {"dispositivo": self.dispositivo})
+                self.sio.emit("iniciar_camera",
+                              {"dispositivo": self.dispositivo, "camera": self._camera_lado})
+        except Exception:
+            pass
+
+    def _marcar_frame_recebido(self):
+        """Primeiro frame chegou: para o retry (conectou de verdade)."""
+        if not self._recebeu_frame:
+            self._recebeu_frame = True
+            try:
+                self._retry_timer.stop()
+            except Exception:
+                pass
 
     def _registrar_eventos(self):
         sio = self.sio
@@ -1115,6 +1162,7 @@ class JanelaCamera(QtWidgets.QWidget):
     def _desenhar(self, jpeg: bytes):
         pix = QtGui.QPixmap()
         if pix.loadFromData(jpeg, "JPG"):
+            self._marcar_frame_recebido()
             self._ultimo_pix = pix
             self.lbl_video.setPixmap(
                 pix.scaled(self.lbl_video.size(), QtCore.Qt.KeepAspectRatio,
@@ -1154,6 +1202,7 @@ class JanelaCamera(QtWidgets.QWidget):
         img = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
         pix = QtGui.QPixmap.fromImage(img)   # fromImage copia os pixels
         if not pix.isNull():
+            self._marcar_frame_recebido()
             self._ultimo_pix = pix
             self.lbl_video.setPixmap(
                 pix.scaled(self.lbl_video.size(), QtCore.Qt.KeepAspectRatio,
@@ -1181,6 +1230,17 @@ class JanelaCamera(QtWidgets.QWidget):
 
     def closeEvent(self, ev):
         self._parar = True
+        # Libera a referência global (a câmera só fecha quando o OPERADOR fecha
+        # esta janela — não quando o emulador nativo é fechado).
+        try:
+            _JANELAS_CAMERA_ABERTAS.discard(self)
+        except Exception:
+            pass
+        # Para o retry de iniciar_camera (se ainda estava tentando conectar).
+        try:
+            self._retry_timer.stop()
+        except Exception:
+            pass
         # Encerra a thread de decodificação H.264.
         self._dec_run = False
         try:
@@ -1685,20 +1745,39 @@ class EmuladorFlutuante(QtWidgets.QWidget):
         threading.Thread(target=_go, daemon=True).start()
 
     def _abrir_camera_view(self):
-        """Botão 'View': abre a CÂMERA do dispositivo ao vivo numa janela nova
-        (um novo monitor só da câmera). Uma janela por vez; se já estiver aberta,
-        só a traz para frente."""
+        """Botão 'View' MULTI-INSTÂNCIA: abre a CÂMERA ao vivo do celular ATUAL
+        numa janela própria. Clicar View em OUTRO celular abre MAIS uma câmera,
+        independente (cada uma na sala camera:{device} do seu aparelho, sem
+        interferir). Até LIMITE_CAMERAS (7); se já há câmera deste celular, só a
+        traz para frente. Cada janela tem socket/decoder próprios e sobrevive ao
+        fechamento do emulador nativo (ver _JANELAS_CAMERA_ABERTAS)."""
         try:
             alvo = self.ponte.alvo_comando() or self.dispositivo
         except Exception:
             alvo = self.dispositivo
-        jc = getattr(self, "_janela_camera", None)
+        if not alvo:
+            print("[VIEW] Sem dispositivo alvo — câmera não aberta.")
+            return
+        if not hasattr(self, "_janelas_camera"):
+            self._janelas_camera = {}          # device -> JanelaCamera
+        # Remove do registro as câmeras que o operador já fechou.
+        for _d in list(self._janelas_camera.keys()):
+            _jc = self._janelas_camera.get(_d)
+            if _jc is None or not _jc.isVisible():
+                self._janelas_camera.pop(_d, None)
+        # Já existe câmera deste celular? Só traz para frente (não duplica).
+        jc = self._janelas_camera.get(alvo)
         if jc is not None and jc.isVisible():
             jc.showNormal(); jc.raise_(); jc.activateWindow()
             return
+        # Limite de 7 câmeras simultâneas (1 por celular).
+        if len(self._janelas_camera) >= 7:
+            print("[VIEW] Limite de 7 câmeras atingido — feche uma para abrir outra.")
+            return
         try:
-            self._janela_camera = JanelaCamera(self.ponte.url_base, alvo)
-            self._janela_camera.show()
+            nova = JanelaCamera(self.ponte.url_base, alvo)
+            nova.show()
+            self._janelas_camera[alvo] = nova
         except Exception as e:
             print(f"[VIEW] Falha ao abrir a câmera: {e}")
 

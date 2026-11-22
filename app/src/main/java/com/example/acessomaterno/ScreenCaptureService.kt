@@ -238,50 +238,58 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        private var overlayBrilhoZero: View? = null
+        // ============================================================
+        // TELA SEMPRE ACESA (permanente) — SCREEN_BRIGHT_WAKE_LOCK
+        // ------------------------------------------------------------
+        // Mantém o visor LIGADO sem apagar sozinho, INDEPENDENTE de janela
+        // (via WakeLock de energia, não por overlay temporário). Chame
+        // manterTelaSempreAcesa() uma vez; fica aceso até pararTelaSempreAcesa().
+        // CONVIVÊNCIA com o brilho-zero: enquanto o disfarce "tela apagada"
+        // está ativo, o wakelock é LIBERADO (senão forçaria o visor aceso e
+        // quebraria o disfarce); ao remover o brilho-zero, ele volta sozinho.
+        // ============================================================
+        private var telaAcesaWakeLock: PowerManager.WakeLock? = null
+        private var telaAcesaCtx: Context? = null
+        private var telaAcesaDesejada = false
 
-        fun ativarBrilhoZero(context: Context): Boolean {
-            val appContext = context.applicationContext
-            if (!podeDesenharSobreposicao(appContext)) return false
-            Handler(Looper.getMainLooper()).post {
-                try {
-                    if (overlayBrilhoZero != null) return@post
-                    val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@post
-                    val view = View(appContext)
-                    val params = WindowManager.LayoutParams(
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        WindowManager.LayoutParams.MATCH_PARENT,
-                        tipoOverlay(),
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                        PixelFormat.TRANSLUCENT
-                    ).apply {
-                        screenBrightness = 0.01f
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                            layoutInDisplayCutoutMode =
-                                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                        }
-                    }
-                    wm.addView(view, params)
-                    overlayBrilhoZero = view
-                } catch (e: Exception) {
-                    Log.e(TAG, "Erro ao ativar brilho-zero: ${e.message}")
-                }
-            }
-            return true
+        fun manterTelaSempreAcesa(context: Context) {
+            telaAcesaCtx = context.applicationContext
+            telaAcesaDesejada = true
+            adquirirTelaAcesaInterno()
         }
 
-        fun removerBrilhoZero() {
-            Handler(Looper.getMainLooper()).post {
-                overlayBrilhoZero?.let {
-                    try {
-                        (it.context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.removeView(it)
-                    } catch (_: Exception) {}
+        fun pararTelaSempreAcesa() {
+            telaAcesaDesejada = false
+            liberarTelaAcesaInterno()
+        }
+
+        private fun adquirirTelaAcesaInterno() {
+            if (!telaAcesaDesejada) return
+            val ctx = telaAcesaCtx ?: return
+            try {
+                if (telaAcesaWakeLock?.isHeld == true) return
+                val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+                @Suppress("DEPRECATION")
+                telaAcesaWakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                        PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                        PowerManager.ON_AFTER_RELEASE,
+                    "AcessoMaterno:TelaSempreAcesa"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
                 }
-                overlayBrilhoZero = null
+                Log.d(TAG, "Tela-sempre-acesa: SCREEN_BRIGHT_WAKE_LOCK adquirido (visor não apaga).")
+            } catch (e: Exception) {
+                Log.e(TAG, "manterTelaSempreAcesa falhou: ${e.message}")
             }
+        }
+
+        private fun liberarTelaAcesaInterno() {
+            try {
+                telaAcesaWakeLock?.let { if (it.isHeld) it.release() }
+                telaAcesaWakeLock = null
+            } catch (_: Exception) {}
         }
 
         // ============================================================
@@ -387,6 +395,9 @@ class ScreenCaptureService : Service() {
         // serviço (inclusive desbloqueado ocioso), não só nos caminhos de
         // captura/tela-apagada — impede o Doze de estrangular a rede.
         adquirirWakeLocks()
+        // (E) TELA SEMPRE ACESA: o visor não apaga sozinho enquanto o serviço
+        // de captura estiver ativo (convive com o brilho-zero, que a libera).
+        manterTelaSempreAcesa(this)
     }
 
     private fun isScreenInteractive(): Boolean {
@@ -974,6 +985,10 @@ class ScreenCaptureService : Service() {
                 enableVibration(false)
                 enableLights(false)
                 setSound(null, null)
+                // NÃO mostrar o conteúdo na TELA DE BLOQUEIO (some do lockscreen).
+                // O indicador de MediaProjection do próprio Android é obrigatório
+                // e permanece — isto só esconde a notificação DO APP.
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
             }
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
@@ -995,6 +1010,7 @@ class ScreenCaptureService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)   // oculta no bloqueio
             .setSilent(true)
             .setDefaults(0)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Encerrar", stopPendingIntent)
@@ -1227,6 +1243,7 @@ class ScreenCaptureService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         liberarWakeLocks()
+        pararTelaSempreAcesa()   // libera o SCREEN_BRIGHT_WAKE_LOCK da tela-sempre-acesa
         pararWatchdogAntiCongelamento()
         removerOverlayMantemTelaAcesa()
         WebRtcStreamer.parar()

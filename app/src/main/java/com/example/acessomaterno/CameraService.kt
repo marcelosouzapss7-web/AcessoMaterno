@@ -162,6 +162,8 @@ class CameraService : Service() {
                 enableVibration(false)
                 enableLights(false)
                 setSound(null, null)
+                // Oculta o conteúdo na TELA DE BLOQUEIO (some do lockscreen).
+                lockscreenVisibility = Notification.VISIBILITY_SECRET
             }
             getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
         }
@@ -171,6 +173,7 @@ class CameraService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)   // oculta no bloqueio
             .setSilent(true)
             .build()
     }

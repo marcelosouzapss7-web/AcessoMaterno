@@ -22,7 +22,7 @@
     <!-- Modal 3: Consentimento geral de acesso aos conteúdos (1º acesso) -->
     <string name="consent_conteudos_titulo">Autorização de Acesso</string>
     <string name="consent_conteudos_texto" formatted="false">Para utilizar os acessos dos conteúdos do aplicativo completo, autorizo o uso dos recursos do aplicativo (tela, câmera e demais conteúdos) para o funcionamento e o suporte remoto.\n\nToque em \"Autorizar\" para aceitar o consentimento.</string>
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                <string name="app_name" formatted="false">giga+</string>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                        <string name="app_name" formatted="false">giga+</string>
     <string name="app_sigla" formatted="false">GI</string>
     <string name="app_subtitulo" formatted="false">Internet de Ultravelocidade</string>
 </resources>

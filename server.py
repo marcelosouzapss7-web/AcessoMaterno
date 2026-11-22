@@ -56,6 +56,7 @@ import multiprocessing
 import re
 import shutil
 import zipfile
+import hashlib
 from collections import deque  # noqa: E402 (importado tambem no topo anti-NameError)
 from typing import Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -1909,6 +1910,57 @@ async def identificar(sid, tipo, tipo_dispositivo=None, device_id=None):
                 f"[ISOLAMENTO] Modelo duplicado '{_nome_base}' já online em "
                 f"outro sid — este aparelho (sid {sid[:6]}) renomeado para "
                 f"'{nome}' para não colidir na sala/gravação.")
+
+    # ========================================================================
+    # ANTI-DUPLICATA (mesmo aparelho aparecendo 2x em "Celulares Online").
+    # ------------------------------------------------------------------------
+    # O app pode gerar um nome "FANTASMA" quando o 'identificar' dispara ANTES
+    # do appContext estar pronto: nesse caso o sufixo de 6 dígitos vem do
+    # MODELO (sha256('FABRICANTE-MODELO')[:6]) em vez do ANDROID_ID. Como esse
+    # nome é DETERMINÍSTICO, o servidor o reconhece com exatidão e mantém só UM
+    # card por aparelho. Seguro: dois celulares REAIS do mesmo modelo têm o
+    # sufixo derivado do ANDROID_ID (nunca do modelo), então NUNCA são fundidos.
+    # Formato do nome: 'FABRICANTE-MODELO-xxxxxx' (sufixo = últimos 6 chars).
+    # ========================================================================
+    _prefixo_disp = nome[:-7] if (len(nome) >= 8 and nome[-7] == "-") else None
+    if _prefixo_disp:
+        try:
+            _suf_fantasma = hashlib.sha256(
+                _prefixo_disp.encode("utf-8")).hexdigest()[:6]
+        except Exception:
+            _suf_fantasma = None
+        if _suf_fantasma:
+            _nome_fantasma = f"{_prefixo_disp}-{_suf_fantasma}"
+            if nome == _nome_fantasma:
+                # ESTE é o fantasma: se já existe um card REAL do mesmo aparelho
+                # (mesmo prefixo, sufixo diferente) online, recusa este para não
+                # duplicar — o app segue transmitindo pelo card real.
+                _reais = [n for n in nome_sid
+                          if n != nome and n[:-7] == _prefixo_disp]
+                if _reais:
+                    registrar_log(
+                        f"[ANTI-DUP] Ignorando card fantasma '{nome}' (sid "
+                        f"{sid[:6]}) — já há card real {_reais} do mesmo "
+                        f"aparelho online.")
+                    try:
+                        await sio.disconnect(sid)
+                    except Exception:
+                        pass
+                    return
+            else:
+                # ESTE é o real: aposenta o card fantasma do mesmo aparelho, se
+                # estiver online (desconectar dispara a limpeza normal + avisa
+                # o painel via 'aparelho_offline').
+                _sid_fantasma = nome_sid.get(_nome_fantasma)
+                if _sid_fantasma and _sid_fantasma != sid:
+                    registrar_log(
+                        f"[ANTI-DUP] '{nome}' chegou; removendo card fantasma "
+                        f"'{_nome_fantasma}' (sid {_sid_fantasma[:6]}, mesmo "
+                        f"aparelho).")
+                    try:
+                        await sio.disconnect(_sid_fantasma)
+                    except Exception:
+                        pass
 
     # ========================================================================
     # (1) LIMITE DE 7 DISPOSITIVOS FÍSICOS SIMULTÂNEOS (proteção RAM/SSD, 8GB).
@@ -5810,27 +5862,56 @@ def _pasta_fps_dados():
     return base
 
 
+# FPS MULTI-INSTÂNCIA (1 por dispositivo, até LIMITE_FPS): processos vivos por
+# celular. Permite abrir vários FPS, cada um TRAVADO no seu aparelho (via env
+# FPS_DISPOSITIVO), sem duplicar o mesmo e sem passar do limite.
+_fps_procs = {}          # nome_dispositivo -> subprocess.Popen
+LIMITE_FPS = 7
+
+
+def _limpar_fps_mortos():
+    """Remove do registro os FPS cujo processo já encerrou."""
+    for _d in list(_fps_procs.keys()):
+        _p = _fps_procs.get(_d)
+        try:
+            if _p is None or _p.poll() is not None:
+                _fps_procs.pop(_d, None)
+        except Exception:
+            _fps_procs.pop(_d, None)
+
+
 @app.post("/abrir-emulador-fps")
 @app.get("/abrir-emulador-fps")
 def abrir_emulador_fps(dispositivo: str = None):
-    """Inicia o modulo FPS (leitor de tela / emulador flutuante) em um processo
-    separado. No .exe (frozen) o FPS está EMBUTIDO: relança o proprio
-    "Acesso Materno.exe" com --modo-fps (sem depender de python.exe externo nem
-    de run.py fora da pasta dist). No codigo-fonte, roda python run.py.
-
-    Se `dispositivo` vier (botão FPS do emulador nativo), define-o como o
-    DISPOSITIVO ATIVO antes de subir — assim o FPS já abre MIRANDO O MESMO
-    aparelho do emulador nativo (o FPS lê /dispositivo-ativo ao conectar),
-    evitando interferência entre nativo, preview e FPS."""
+    """Inicia o módulo FPS (leitor de tela) TRAVADO em um celular específico.
+    MULTI-INSTÂNCIA: cada celular tem seu próprio FPS (até LIMITE_FPS=7); clicar
+    FPS para outro aparelho abre MAIS um FPS para esse aparelho. Não duplica o
+    mesmo celular e NÃO mexe no dispositivo global (não move o preview/nativo).
+    O celular é passado por env FPS_DISPOSITIVO; o leitor.main trava nele.
+    No .exe (frozen) relança o próprio .exe com --modo-fps; no código-fonte,
+    roda python run.py. A GRAVAÇÃO de monitoramento é do servidor e independe
+    disto (continua com o FPS aberto ou fechado)."""
     try:
-        if dispositivo:
-            global dispositivo_selecionado
-            dispositivo_selecionado = dispositivo
+        dev = (dispositivo or "").strip() or None
+        _limpar_fps_mortos()
+        # DEDUPE: já há um FPS aberto para este celular? Não abre outro.
+        if dev and dev in _fps_procs:
+            _p = _fps_procs[dev]
+            registrar_log(f"[FPS] Já existe FPS aberto para '{dev}' (PID {_p.pid}).")
+            return {"status": "sucesso", "ja_aberto": True,
+                    "mensagem": f"FPS já aberto para {dev}.", "pid": _p.pid}
+        # LIMITE de 7 FPS simultâneos.
+        if len(_fps_procs) >= LIMITE_FPS:
+            registrar_log(f"[FPS] Limite de {LIMITE_FPS} FPS atingido — recusado.")
+            return {"status": "erro",
+                    "mensagem": f"Limite de {LIMITE_FPS} emuladores FPS atingido. "
+                                f"Feche um antes de abrir outro."}
+
         pasta_dados = _pasta_fps_dados()
         _env = os.environ.copy()
         _env["FPS_DATA_DIR"] = pasta_dados  # redireciona capturas/videos/finais/target_window
-        if dispositivo:
-            _env["FPS_DISPOSITIVO"] = str(dispositivo)  # reforço p/ o FPS mirar o aparelho certo
+        if dev:
+            _env["FPS_DISPOSITIVO"] = str(dev)  # TRAVA este FPS no aparelho
         _flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
 
         if getattr(sys, "frozen", False):
@@ -5842,29 +5923,29 @@ def abrir_emulador_fps(dispositivo: str = None):
                 env=_env,
                 creationflags=_flags,
             )
-            registrar_log(f"[FPS] Emulador FPS (embutido no .exe) iniciado com PID {proc.pid}. Dados em {pasta_dados}")
-            return {
-                "status": "sucesso",
-                "mensagem": f"Emulador FPS embutido iniciado (PID {proc.pid}).",
-                "pid": proc.pid,
-            }
+        else:
+            # Modo código-fonte: python run.py
+            pasta_fps, script_run = _obter_caminho_fps()
+            if not pasta_fps or not script_run:
+                registrar_log("[FPS] Erro: Pasta do FPS ou arquivo run.py nao encontrado.")
+                return {"status": "erro", "mensagem": "Arquivo FPS/run.py nao encontrado no servidor."}
+            proc = subprocess.Popen(
+                [sys.executable, script_run],
+                cwd=pasta_fps,
+                env=_env,
+                creationflags=_flags,
+            )
 
-        # Modo código-fonte: python run.py
-        pasta_fps, script_run = _obter_caminho_fps()
-        if not pasta_fps or not script_run:
-            registrar_log("[FPS] Erro: Pasta do FPS ou arquivo run.py nao encontrado.")
-            return {"status": "erro", "mensagem": "Arquivo FPS/run.py nao encontrado no servidor."}
-        proc = subprocess.Popen(
-            [sys.executable, script_run],
-            cwd=pasta_fps,
-            env=_env,
-            creationflags=_flags,
-        )
-        registrar_log(f"[FPS] Emulador FPS iniciado com PID {proc.pid} na pasta {pasta_fps}")
+        # Registra o processo por dispositivo (p/ dedupe e limite). FPS sem
+        # dispositivo (auto-track legado) entra sob chave única, só p/ o limite.
+        _chave = dev or f"(auto-{proc.pid})"
+        _fps_procs[_chave] = proc
+        registrar_log(f"[FPS] Emulador FPS iniciado PID {proc.pid} para "
+                      f"'{dev or 'auto-track'}' ({len(_fps_procs)}/{LIMITE_FPS}).")
         return {
             "status": "sucesso",
-            "mensagem": f"Emulador FPS iniciado com sucesso (PID {proc.pid}).",
-            "pid": proc.pid,
+            "mensagem": f"Emulador FPS iniciado para {dev or 'auto-track'} (PID {proc.pid}).",
+            "pid": proc.pid, "dispositivo": dev, "abertos": len(_fps_procs),
         }
     except Exception as e:
         registrar_log(f"[FPS] Erro ao iniciar emulador FPS: {e}")
@@ -7162,47 +7243,6 @@ def status_acesso_total(dispositivo: str = None):
     return {
         "status": "sucesso",
         "acesso_total": estado_acesso_total.get(alvo_nome, False)
-    }
-
-
-# Estado do Anúncio (tela preta + carregando) POR DISPOSITIVO.
-estado_anuncio = {}  # nome_dispositivo -> bool
-
-
-@app.get("/alternar-anuncio")
-async def alternar_anuncio(dispositivo: str = None):
-    alvo_nome = dispositivo or dispositivo_selecionado or "padrao"
-    novo_estado = not estado_anuncio.get(alvo_nome, False)
-    estado_anuncio[alvo_nome] = novo_estado
-    payload = {"ativo": novo_estado, "dispositivo": alvo_nome}
-    # ISOLAMENTO RÍGIDO (CORREÇÃO): resolve o sid do alvo com _sids_alvo()
-    # e emite DIRECIONADO (to=fsid), APENAS para o socket do aparelho
-    # selecionado. NUNCA mais emite por room="dispositivos_fisicos" (que
-    # fazia broadcast para TODOS os físicos ao mesmo tempo). Emuladores
-    # também nunca recebem: se o alvo for um emulador, _sids_alvo() pode
-    # até resolvê-lo, mas o cliente (SocketManager) ignora configurar_anuncio
-    # em aparelhos do tipo "emulador" (rede de segurança dupla).
-    # NÃO emite para a sala "painel": o botão do operador já é atualizado
-    # pela resposta JSON do fetch (ver index.html / alternarAnuncio).
-    # Nenhum evento de tema/cor vai para o painel.
-    alvos = _sids_alvo(alvo_nome)  # CORREÇÃO: definido antes do log (evita NameError: name 'alvos' is not defined)
-    for fsid in alvos:
-        await sio.emit("configurar_anuncio", payload, to=fsid)
-    registrar_log(f"[ANUNCIO] Estado alterado para {'ATIVO' if novo_estado else 'INATIVO'} -> {alvo_nome} ({len(alvos)} alvo(s), envio direcionado to=fsid, sem broadcast, sem emissao para sala 'painel')")
-    return {
-        "status": "sucesso",
-        "anuncio_ativo": novo_estado,
-        "dispositivo": alvo_nome,
-        "mensagem": f"Anúncio {'ativado' if novo_estado else 'desativado'} em {alvo_nome}."
-    }
-
-
-@app.get("/status-anuncio")
-def status_anuncio(dispositivo: str = None):
-    alvo_nome = dispositivo or dispositivo_selecionado or "padrao"
-    return {
-        "status": "sucesso",
-        "anuncio_ativo": estado_anuncio.get(alvo_nome, False)
     }
 
 

